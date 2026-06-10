@@ -1,0 +1,15 @@
+/target
+
+.DS_store
+/tmp
+
+# 测试结果
+/coverage/
+
+# 运行时生成
+/config.toml
+*.db
+*.db-shm
+*.db-wal
+data/
+crash.log

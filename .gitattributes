@@ -1,0 +1,15 @@
+# Keep GitHub language stats focused on application/source code.
+
+# Documentation
+docs/** linguist-documentation
+developer-docs/** linguist-documentation
+README.md linguist-documentation
+README.zh.md linguist-documentation
+CHANGELOG.md linguist-documentation
+CONTRIBUTING.md linguist-documentation
+LICENSE linguist-documentation
+
+# Tests
+# Use vendored here so they are excluded from language stats
+# without being hidden by default in diffs.
+tests/**/* linguist-vendored

@@ -1,0 +1,54 @@
+[package]
+name = "aster_drive_migration"
+version = "0.0.0-alpha.0"
+description = "Migration tool for AsterDrive, from other self-hosted drive solutions to AsterDrive."
+authors = [
+    "AptS-1547 <apts-1547@esaps.net>",
+]
+repository = "https://github.com/AptS-1547/AsterDriveMigration"
+license = "MIT"
+edition = "2024"
+rust-version = "1.94.0"
+
+# 优化配置
+[profile.dev]
+opt-level = 1
+lto = false
+codegen-units = 16
+panic = "unwind"
+strip = false
+incremental = true
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
+members = [
+    ".",
+    "crates/asterdrive-entities",
+    "crates/cloudreve-entities",
+]
+
+[features]
+default = ["cli", "tui"]
+cli = ["dep:clap"]
+tui = ["cli", "dep:ratatui"]
+full = ["cli", "tui"]
+
+[dependencies]
+argon2 = "0.5.3"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+color-eyre = "0.6.5"
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", optional = true, features = ["serde"] }
+sea-orm = { version = "2.0.0-rc.42", features = ["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite", "macros", "runtime-tokio-rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lib]
+doctest = false
