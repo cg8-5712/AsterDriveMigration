@@ -1,2 +1,1 @@
-mod entities;
-mod interfaces;
+pub mod migration;

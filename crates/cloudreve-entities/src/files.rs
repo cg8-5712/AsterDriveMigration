@@ -4,13 +4,12 @@ use sea_orm::entity::prelude::*;
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(schema_name = "public", table_name = "files")]
+#[sea_orm(table_name = "files")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    pub deleted_at: Option<DateTimeWithTimeZone>,
     pub r#type: i64,
     #[sea_orm(unique_key = "file_file_children_name")]
     pub name: String,

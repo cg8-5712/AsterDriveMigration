@@ -4,7 +4,7 @@ use sea_orm::entity::prelude::*;
 
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(schema_name = "public", table_name = "file_entities")]
+#[sea_orm(table_name = "file_entities")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub file_id: i64,
