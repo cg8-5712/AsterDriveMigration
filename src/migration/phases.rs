@@ -415,19 +415,90 @@ pub(super) async fn migrate_metadata(
     context: &MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
+    let source_files: HashMap<i64, &cr::files::Model> =
+        source.files.iter().map(|file| (file.id, file)).collect();
+    let mut tags: HashMap<(i64, String), i64> = HashMap::new();
     for metadata in &source.metadata {
-        let Some(file_id) = context.files.get(&metadata.file_id).copied() else {
+        let Some(source_file) = source_files.get(&metadata.file_id).copied() else {
             report.skipped += 1;
             continue;
         };
+        let target_entity = if source_file.r#type == 0 {
+            context
+                .files
+                .get(&metadata.file_id)
+                .copied()
+                .map(|id| ("file", id))
+        } else {
+            context
+                .folders
+                .get(&metadata.file_id)
+                .copied()
+                .map(|id| ("folder", id))
+        };
+        let Some((entity_type, entity_id)) = target_entity else {
+            report.skipped += 1;
+            continue;
+        };
+
+        if let Some(source_tag_name) = tag_name(&metadata.name) {
+            let Some(owner_user_id) = context.users.get(&source_file.owner_id).copied() else {
+                report.skipped += 1;
+                continue;
+            };
+            let name = target_tag_name(source_tag_name);
+            if name.is_empty() {
+                report.skipped += 1;
+                continue;
+            }
+            let normalized_name = normalize_tag_name(&name);
+            let tag_id = match tags.get(&(owner_user_id, normalized_name.clone())) {
+                Some(tag_id) => *tag_id,
+                None => {
+                    let tag = ad::tags::ActiveModel {
+                        scope_type: Set("personal".to_string()),
+                        owner_user_id: Set(Some(owner_user_id)),
+                        team_id: Set(None),
+                        name: Set(name),
+                        normalized_name: Set(normalized_name.clone()),
+                        color: Set(target_tag_color(&metadata.value)),
+                        sort_order: Set(0),
+                        created_at: Set(metadata.created_at),
+                        updated_at: Set(metadata.updated_at),
+                        ..Default::default()
+                    }
+                    .insert(transaction)
+                    .await
+                    .wrap_err_with(|| format!("migrate tag metadata {}", metadata.id))?;
+                    tags.insert((owner_user_id, normalized_name), tag.id);
+                    report.migrated_tags += 1;
+                    tag.id
+                }
+            };
+            ad::entity_properties::ActiveModel {
+                entity_type: Set(entity_type.to_string()),
+                entity_id: Set(entity_id),
+                namespace: Set("system.tags".to_string()),
+                name: Set(tag_id.to_string()),
+                value: Set(None),
+                ..Default::default()
+            }
+            .insert(transaction)
+            .await
+            .wrap_err_with(|| format!("attach migrated tag for metadata {}", metadata.id))?;
+            report.migrated_properties += 1;
+            report.migrated_tag_assignments += 1;
+            continue;
+        }
+
         let namespace = if metadata.is_public {
             "cloudreve.public"
         } else {
             "cloudreve.private"
         };
         ad::entity_properties::ActiveModel {
-            entity_type: Set("file".to_string()),
-            entity_id: Set(file_id),
+            entity_type: Set(entity_type.to_string()),
+            entity_id: Set(entity_id),
             namespace: Set(namespace.to_string()),
             name: Set(metadata.name.clone()),
             value: Set(Some(metadata.value.clone())),
@@ -437,6 +508,163 @@ pub(super) async fn migrate_metadata(
         .await
         .wrap_err_with(|| format!("migrate metadata {}", metadata.id))?;
         report.migrated_properties += 1;
+    }
+    Ok(())
+}
+
+pub(super) async fn migrate_direct_links(
+    transaction: &DatabaseTransaction,
+    source: &SourceData,
+    context: &MigrationContext,
+    direct_link_secret: Option<&str>,
+    report: &mut MigrationReport,
+) -> Result<()> {
+    if source.direct_links.is_empty() {
+        return Ok(());
+    }
+    let Some(secret) = direct_link_secret else {
+        report.skipped += source.direct_links.len();
+        report.warnings.push(format!(
+            "{} Cloudreve direct links were not regenerated because --direct-link-secret was not supplied",
+            source.direct_links.len()
+        ));
+        return Ok(());
+    };
+    let source_files: HashMap<i64, &cr::files::Model> =
+        source.files.iter().map(|file| (file.id, file)).collect();
+    for link in &source.direct_links {
+        if link.deleted_at.is_some() {
+            report.skipped += 1;
+            continue;
+        }
+        let Some(source_file) = source_files.get(&link.file_id).copied() else {
+            report.skipped += 1;
+            continue;
+        };
+        let Some(file_id) = context.files.get(&link.file_id).copied() else {
+            report.skipped += 1;
+            continue;
+        };
+        let Some(owner_user_id) = context.users.get(&source_file.owner_id).copied() else {
+            report.skipped += 1;
+            continue;
+        };
+        let url = direct_link_url(file_id, owner_user_id, &source_file.name, secret)?;
+        ad::entity_properties::ActiveModel {
+            entity_type: Set("file".to_string()),
+            entity_id: Set(file_id),
+            namespace: Set("cloudreve.direct_links".to_string()),
+            name: Set(link.id.to_string()),
+            value: Set(Some(
+                json!({
+                    "url": url,
+                    "source_direct_link_id": link.id,
+                    "source_file_id": link.file_id,
+                    "source_name": link.name,
+                    "source_downloads": link.downloads,
+                    "source_speed_limit": link.speed,
+                })
+                .to_string(),
+            )),
+            ..Default::default()
+        }
+        .insert(transaction)
+        .await
+        .wrap_err_with(|| format!("archive direct link {} mapping", link.id))?;
+        report.migrated_properties += 1;
+        report.migrated_direct_links += 1;
+    }
+    Ok(())
+}
+
+pub(super) async fn migrate_tasks(
+    transaction: &DatabaseTransaction,
+    source: &SourceData,
+    context: &MigrationContext,
+    report: &mut MigrationReport,
+) -> Result<()> {
+    let active_count = source
+        .tasks
+        .iter()
+        .filter(|task| source_task_was_active(&task.status))
+        .count();
+    if active_count > 0 {
+        report.warnings.push(format!(
+            "{active_count} active Cloudreve tasks were archived as canceled terminal records and were not resumed"
+        ));
+    }
+
+    for task in &source.tasks {
+        let status = archived_task_status(&task.status);
+        let duration_ms = (task.updated_at - task.created_at)
+            .num_milliseconds()
+            .max(0);
+        let task_name = format!(
+            "cloudreve-legacy-{}",
+            task.r#type
+                .replace(|character: char| !character.is_ascii_alphanumeric(), "-")
+        );
+        let result = json!({
+            "duration_ms": duration_ms,
+            "summary": format!("Archived Cloudreve {} task with source status {}", task.r#type, task.status),
+        });
+        let runtime = json!({
+            "source": "cloudreve",
+            "source_task_id": task.id,
+            "source_type": task.r#type,
+            "source_status": task.status,
+            "source_public_state": task.public_state,
+            "source_private_state": task.private_state,
+            "source_correlation_id": task.correlation_id,
+            "source_deleted_at": task.deleted_at,
+            "archived_without_resume": true,
+        });
+        let started_at = (!matches!(task.status.as_str(), "queued")).then_some(task.created_at);
+        let expires_at = task
+            .updated_at
+            .checked_add_signed(chrono::Duration::days(36_500))
+            .unwrap_or(task.updated_at);
+        ad::background_tasks::ActiveModel {
+            kind: Set("system_runtime".to_string()),
+            status: Set(status.to_string()),
+            creator_user_id: Set(task
+                .user_tasks
+                .and_then(|user_id| context.users.get(&user_id).copied())),
+            team_id: Set(None),
+            share_id: Set(None),
+            display_name: Set(format!("Cloudreve task: {}", task.r#type)),
+            payload_json: Set(json!({"task_name": task_name}).to_string()),
+            result_json: Set(Some(result.to_string())),
+            steps_json: Set(Some("[]".to_string())),
+            progress_current: Set(i64::from(status == "succeeded")),
+            progress_total: Set(1),
+            status_text: Set(Some(format!(
+                "Archived from Cloudreve with source status {}; execution was not resumed",
+                task.status
+            ))),
+            attempt_count: Set(0),
+            max_attempts: Set(1),
+            next_run_at: Set(task.updated_at),
+            processing_token: Set(0),
+            processing_started_at: Set(None),
+            last_heartbeat_at: Set(None),
+            lease_expires_at: Set(None),
+            started_at: Set(started_at),
+            finished_at: Set(Some(task.updated_at)),
+            last_error: Set(
+                (status == "failed").then(|| "Cloudreve task ended with status error".to_string())
+            ),
+            failure_can_retry: Set(Some(false)),
+            expires_at: Set(expires_at),
+            created_at: Set(task.created_at),
+            updated_at: Set(task.updated_at),
+            runtime_json: Set(Some(runtime.to_string())),
+            ..Default::default()
+        }
+        .insert(transaction)
+        .await
+        .wrap_err_with(|| format!("archive Cloudreve task {}", task.id))?;
+        report.migrated_tasks += 1;
     }
     Ok(())
 }

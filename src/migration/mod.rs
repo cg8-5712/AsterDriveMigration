@@ -3,7 +3,9 @@ use std::fmt::{self, Write};
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};
+use base64::Engine;
 use color_eyre::eyre::{Result, WrapErr, bail};
+use hmac::{Hmac, Mac};
 use sea_orm::{
     ActiveModelTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait, Set,
     TransactionTrait,
@@ -20,6 +22,7 @@ pub struct MigrationOptions {
     pub target_url: String,
     pub default_password: String,
     pub local_base_path: String,
+    pub direct_link_secret: Option<String>,
     pub include_deleted: bool,
     pub allow_non_empty_target: bool,
     pub skip_unsupported_policies: bool,
@@ -35,6 +38,9 @@ pub struct MigrationReport {
     pub source_files: u64,
     pub source_entities: u64,
     pub source_shares: u64,
+    pub source_direct_links: u64,
+    pub source_tag_assignments: u64,
+    pub source_tasks: u64,
     pub migrated_users: usize,
     pub migrated_policy_groups: usize,
     pub migrated_policies: usize,
@@ -44,6 +50,10 @@ pub struct MigrationReport {
     pub migrated_versions: usize,
     pub migrated_shares: usize,
     pub migrated_properties: usize,
+    pub migrated_tags: usize,
+    pub migrated_tag_assignments: usize,
+    pub migrated_direct_links: usize,
+    pub migrated_tasks: usize,
     pub skipped: usize,
     pub dry_run: bool,
     pub warnings: Vec<String>,
@@ -55,21 +65,24 @@ impl fmt::Display for MigrationReport {
         writeln!(output, "Cloudreve -> AsterDrive migration report")?;
         writeln!(
             output,
-            "source: users={}, groups={}, policies={}, folders={}, files={}, entities={}, shares={}",
+            "source: users={}, groups={}, policies={}, folders={}, files={}, entities={}, shares={}, direct_links={}, tag_assignments={}, tasks={}",
             self.source_users,
             self.source_groups,
             self.source_policies,
             self.source_folders,
             self.source_files,
             self.source_entities,
-            self.source_shares
+            self.source_shares,
+            self.source_direct_links,
+            self.source_tag_assignments,
+            self.source_tasks
         )?;
         if self.dry_run {
             writeln!(output, "mode: dry-run (target was not modified)")?;
         } else {
             writeln!(
                 output,
-                "migrated: users={}, policy_groups={}, policies={}, folders={}, files={}, blobs={}, versions={}, shares={}, properties={}",
+                "migrated: users={}, policy_groups={}, policies={}, folders={}, files={}, blobs={}, versions={}, shares={}, properties={}, tags={}, tag_assignments={}, direct_links={}, archived_tasks={}",
                 self.migrated_users,
                 self.migrated_policy_groups,
                 self.migrated_policies,
@@ -78,7 +91,11 @@ impl fmt::Display for MigrationReport {
                 self.migrated_blobs,
                 self.migrated_versions,
                 self.migrated_shares,
-                self.migrated_properties
+                self.migrated_properties,
+                self.migrated_tags,
+                self.migrated_tag_assignments,
+                self.migrated_direct_links,
+                self.migrated_tasks
             )?;
             writeln!(output, "skipped: {}", self.skipped)?;
         }
@@ -110,6 +127,13 @@ pub async fn inspect(
 pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     if options.default_password.chars().count() < 8 {
         bail!("--default-password must contain at least 8 characters");
+    }
+    if options
+        .direct_link_secret
+        .as_deref()
+        .is_some_and(|secret| secret.chars().count() < 16)
+    {
+        bail!("--direct-link-secret must contain at least 16 characters");
     }
 
     let source = connect(&options.source_url, "Cloudreve").await?;
@@ -162,6 +186,15 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     migrate_files(&transaction, &source_data, &mut context, &mut report).await?;
     migrate_metadata(&transaction, &source_data, &context, &mut report).await?;
     migrate_shares(&transaction, &source_data, &context, &mut report).await?;
+    migrate_direct_links(
+        &transaction,
+        &source_data,
+        &context,
+        options.direct_link_secret.as_deref(),
+        &mut report,
+    )
+    .await?;
+    migrate_tasks(&transaction, &source_data, &context, &mut report).await?;
 
     transaction
         .commit()
@@ -189,6 +222,18 @@ async fn validate_target_schema(db: &DatabaseConnection) -> Result<()> {
         .count(db)
         .await
         .wrap_err("AsterDrive files table is unavailable")?;
+    ad::entity_properties::Entity::find()
+        .count(db)
+        .await
+        .wrap_err("AsterDrive entity_properties table is unavailable")?;
+    ad::tags::Entity::find()
+        .count(db)
+        .await
+        .wrap_err("AsterDrive tags table is unavailable")?;
+    ad::background_tasks::Entity::find()
+        .count(db)
+        .await
+        .wrap_err("AsterDrive background_tasks table is unavailable")?;
     Ok(())
 }
 
@@ -205,6 +250,15 @@ async fn ensure_target_safe(db: &DatabaseConnection, allow_non_empty: bool) -> R
             ad::file_blobs::Entity::find().count(db).await?,
         ),
         ("shares", ad::shares::Entity::find().count(db).await?),
+        (
+            "entity_properties",
+            ad::entity_properties::Entity::find().count(db).await?,
+        ),
+        ("tags", ad::tags::Entity::find().count(db).await?),
+        (
+            "background_tasks",
+            ad::background_tasks::Entity::find().count(db).await?,
+        ),
     ];
     let occupied: Vec<String> = counts
         .into_iter()
@@ -249,6 +303,8 @@ struct SourceData {
     file_entities: Vec<cr::file_entities::Model>,
     shares: Vec<cr::shares::Model>,
     metadata: Vec<cr::metadata::Model>,
+    direct_links: Vec<cr::direct_links::Model>,
+    tasks: Vec<cr::tasks::Model>,
 }
 
 impl SourceData {
@@ -261,6 +317,8 @@ impl SourceData {
         let file_entities = cr::file_entities::Entity::find().all(db).await?;
         let shares = cr::shares::Entity::find().all(db).await?;
         let metadata = cr::metadata::Entity::find().all(db).await?;
+        let direct_links = cr::direct_links::Entity::find().all(db).await?;
+        let tasks = cr::tasks::Entity::find().all(db).await?;
 
         Ok(Self {
             groups: filter_deleted(groups, include_deleted, |model| model.deleted_at.is_some()),
@@ -277,6 +335,10 @@ impl SourceData {
             metadata: filter_deleted(metadata, include_deleted, |model| {
                 model.deleted_at.is_some()
             }),
+            direct_links: filter_deleted(direct_links, include_deleted, |model| {
+                model.deleted_at.is_some()
+            }),
+            tasks: filter_deleted(tasks, include_deleted, |model| model.deleted_at.is_some()),
         })
     }
 
@@ -289,6 +351,13 @@ impl SourceData {
             source_files: self.files.iter().filter(|file| file.r#type == 0).count() as u64,
             source_entities: self.entities.len() as u64,
             source_shares: self.shares.len() as u64,
+            source_direct_links: self.direct_links.len() as u64,
+            source_tag_assignments: self
+                .metadata
+                .iter()
+                .filter(|metadata| tag_name(&metadata.name).is_some())
+                .count() as u64,
+            source_tasks: self.tasks.len() as u64,
             ..Default::default()
         }
     }
@@ -307,9 +376,10 @@ impl SourceData {
     fn compatibility_warnings(&self) -> Vec<String> {
         let mut warnings = vec![
             "Cloudreve user passwords use SHA/legacy MD5 formats and are replaced by the supplied temporary Argon2 password; every migrated user is marked must_change_password".to_string(),
-            "OAuth grants, login sessions, background tasks and Cloudreve filesystem events are intentionally not migrated".to_string(),
+            "OAuth grants, login sessions and Cloudreve filesystem events are intentionally not migrated".to_string(),
             "Cloudreve Passkeys, WebDAV credentials and two-factor secrets are not portable to AD and must be enrolled again".to_string(),
             "file objects are reused in their existing local/object-storage locations; the migration does not duplicate object bytes".to_string(),
+            "Cloudreve tasks are archived as terminal AD system_runtime records; queued, processing and suspending tasks are canceled instead of resumed".to_string(),
         ];
         let symbolic = self.files.iter().filter(|file| file.is_symbolic).count();
         if symbolic > 0 {
@@ -323,6 +393,9 @@ impl SourceData {
                 "unsupported storage policy types detected: {}",
                 unsupported.join(", ")
             ));
+        }
+        if !self.direct_links.is_empty() {
+            warnings.push("Cloudreve direct links require --direct-link-secret to regenerate AD v2 URLs; old /f/... URLs, per-link counters, speed limits and revocation semantics cannot be preserved".to_string());
         }
         warnings
     }
@@ -411,6 +484,93 @@ fn opaque_blob_key(entity_id: i64) -> String {
 fn share_token(share_id: i64) -> String {
     let digest = Sha256::digest(format!("cloudreve-share-{share_id}").as_bytes());
     format!("cr-{share_id}-{}", &format!("{digest:x}")[..16])
+}
+
+fn tag_name(metadata_name: &str) -> Option<&str> {
+    metadata_name
+        .strip_prefix("tag:")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn normalize_tag_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+fn target_tag_name(name: &str) -> String {
+    name.trim().chars().take(64).collect()
+}
+
+fn target_tag_color(color: &str) -> String {
+    let color = color.trim().to_ascii_lowercase();
+    if color.len() == 7
+        && color.starts_with('#')
+        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return color;
+    }
+    if color.len() == 4
+        && color.starts_with('#')
+        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        let mut expanded = String::with_capacity(7);
+        expanded.push('#');
+        for character in color[1..].chars() {
+            expanded.push(character);
+            expanded.push(character);
+        }
+        return expanded;
+    }
+    "#3b82f6".to_string()
+}
+
+fn encode_base62(mut value: u64) -> String {
+    const BASE62: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    if value == 0 {
+        return "a".to_string();
+    }
+    let mut encoded = Vec::new();
+    while value > 0 {
+        encoded.push(char::from(BASE62[(value % 62) as usize]));
+        value /= 62;
+    }
+    encoded.iter().rev().collect()
+}
+
+fn direct_link_url(
+    file_id: i64,
+    owner_user_id: i64,
+    file_name: &str,
+    secret: &str,
+) -> Result<String> {
+    let file_id = u64::try_from(file_id).wrap_err("AD direct link file ID must be non-negative")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|error| color_eyre::eyre::eyre!("initialize direct link HMAC: {error}"))?;
+    mac.update(b"direct_link:v2:");
+    mac.update(format!("user:{owner_user_id}").as_bytes());
+    mac.update(b":");
+    mac.update(file_id.to_string().as_bytes());
+    let signature =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!(
+        "/d/v2.{}.{}/{}",
+        encode_base62(file_id),
+        signature,
+        urlencoding::encode(file_name)
+    ))
+}
+
+fn archived_task_status(source_status: &str) -> &'static str {
+    match source_status {
+        "completed" => "succeeded",
+        "error" => "failed",
+        "canceled" | "queued" | "processing" | "suspending" => "canceled",
+        _ => "canceled",
+    }
+}
+
+fn source_task_was_active(source_status: &str) -> bool {
+    matches!(source_status, "queued" | "processing" | "suspending")
 }
 
 fn unique_username(source: &str, source_id: i64, used: &mut HashSet<String>) -> String {
@@ -511,6 +671,46 @@ mod tests {
         assert_eq!(map_driver_type("qiniu"), None);
     }
 
+    #[test]
+    fn parses_and_normalizes_cloudreve_tags_for_ad() {
+        assert_eq!(tag_name("tag:Important"), Some("Important"));
+        assert_eq!(tag_name("tag:  Project A  "), Some("Project A"));
+        assert_eq!(tag_name("author"), None);
+        assert_eq!(normalize_tag_name(" Important "), "important");
+        assert_eq!(target_tag_color("#AbC"), "#aabbcc");
+        assert_eq!(target_tag_color("#3B82F6"), "#3b82f6");
+        assert_eq!(target_tag_color(""), "#3b82f6");
+        assert_eq!(target_tag_name(&"x".repeat(80)).chars().count(), 64);
+    }
+
+    #[test]
+    fn builds_asterdrive_v2_direct_link_urls() -> Result<()> {
+        let url = direct_link_url(1, 7, "hello world.txt", "test-direct-link-secret")?;
+        assert!(url.starts_with("/d/v2.b."));
+        assert!(url.ends_with("/hello%20world.txt"));
+        assert_eq!(
+            url,
+            direct_link_url(1, 7, "hello world.txt", "test-direct-link-secret")?
+        );
+        assert_ne!(
+            url,
+            direct_link_url(1, 8, "hello world.txt", "test-direct-link-secret")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maps_cloudreve_tasks_to_non_executable_terminal_statuses() {
+        assert_eq!(archived_task_status("completed"), "succeeded");
+        assert_eq!(archived_task_status("error"), "failed");
+        assert_eq!(archived_task_status("canceled"), "canceled");
+        for status in ["queued", "processing", "suspending"] {
+            assert!(source_task_was_active(status));
+            assert_eq!(archived_task_status(status), "canceled");
+        }
+        assert_eq!(archived_task_status("unknown"), "canceled");
+    }
+
     #[tokio::test]
     async fn migrates_minimal_cloudreve_database() -> Result<()> {
         let suffix = uuid::Uuid::new_v4();
@@ -533,6 +733,7 @@ mod tests {
             target_url: target_url.clone(),
             default_password: "temporary-password".to_string(),
             local_base_path: "C:/cloudreve".to_string(),
+            direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
             skip_unsupported_policies: false,
@@ -545,7 +746,11 @@ mod tests {
         assert_eq!(report.migrated_files, 1);
         assert_eq!(report.migrated_blobs, 1);
         assert_eq!(report.migrated_shares, 1);
-        assert_eq!(report.migrated_properties, 1);
+        assert_eq!(report.migrated_properties, 3);
+        assert_eq!(report.migrated_tags, 1);
+        assert_eq!(report.migrated_tag_assignments, 1);
+        assert_eq!(report.migrated_direct_links, 1);
+        assert_eq!(report.migrated_tasks, 2);
 
         let target = Database::connect(&target_url).await?;
         assert_eq!(ad::users::Entity::find().count(&target).await?, 1);
@@ -553,10 +758,35 @@ mod tests {
         assert_eq!(ad::files::Entity::find().count(&target).await?, 1);
         assert_eq!(ad::file_blobs::Entity::find().count(&target).await?, 1);
         assert_eq!(ad::shares::Entity::find().count(&target).await?, 1);
+        assert_eq!(ad::tags::Entity::find().count(&target).await?, 1);
+        assert_eq!(
+            ad::background_tasks::Entity::find().count(&target).await?,
+            2
+        );
         assert_eq!(
             ad::entity_properties::Entity::find().count(&target).await?,
-            1
+            3
         );
+        let properties = ad::entity_properties::Entity::find().all(&target).await?;
+        assert!(
+            properties.iter().any(|property| {
+                property.namespace == "system.tags" && property.value.is_none()
+            })
+        );
+        let direct_link = properties
+            .iter()
+            .find(|property| property.namespace == "cloudreve.direct_links")
+            .and_then(|property| property.value.as_deref())
+            .expect("migrated direct link mapping");
+        assert!(direct_link.contains("/d/v2."));
+        let tasks = ad::background_tasks::Entity::find().all(&target).await?;
+        assert!(tasks.iter().all(|task| {
+            matches!(task.status.as_str(), "succeeded" | "failed" | "canceled")
+                && task.kind == "system_runtime"
+                && task.lease_expires_at.is_none()
+        }));
+        assert!(tasks.iter().any(|task| task.status == "succeeded"));
+        assert!(tasks.iter().any(|task| task.status == "canceled"));
         let blob = ad::file_blobs::Entity::find().one(&target).await?.unwrap();
         assert_eq!(blob.storage_path, "uploads/object.bin");
         let user = ad::users::Entity::find().one(&target).await?.unwrap();
@@ -592,6 +822,8 @@ mod tests {
         create_table(db, cr::file_entities::Entity).await?;
         create_table(db, cr::shares::Entity).await?;
         create_table(db, cr::metadata::Entity).await?;
+        create_table(db, cr::direct_links::Entity).await?;
+        create_table(db, cr::tasks::Entity).await?;
         Ok(())
     }
 
@@ -608,6 +840,9 @@ mod tests {
         create_table(db, ad::file_versions::Entity).await?;
         create_table(db, ad::entity_properties::Entity).await?;
         create_table(db, ad::shares::Entity).await?;
+        create_table(db, ad::teams::Entity).await?;
+        create_table(db, ad::tags::Entity).await?;
+        create_table(db, ad::background_tasks::Entity).await?;
         Ok(())
     }
 
@@ -730,6 +965,18 @@ mod tests {
         }
         .insert(db)
         .await?;
+        cr::metadata::ActiveModel {
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            name: Set("tag:Important".to_string()),
+            value: Set("#abc".to_string()),
+            is_public: Set(true),
+            file_id: Set(file.id),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
         cr::shares::ActiveModel {
             created_at: Set(now),
             updated_at: Set(now),
@@ -746,6 +993,34 @@ mod tests {
         }
         .insert(db)
         .await?;
+        cr::direct_links::ActiveModel {
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            name: Set("legacy-name.txt".to_string()),
+            downloads: Set(7),
+            speed: Set(1024),
+            file_id: Set(file.id),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        for status in ["completed", "processing"] {
+            cr::tasks::ActiveModel {
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                r#type: Set("remote_download".to_string()),
+                status: Set(status.to_string()),
+                public_state: Set(json!({"progress": 50})),
+                private_state: Set(Some("legacy-private-state".to_string())),
+                correlation_id: Set(None),
+                user_tasks: Set(Some(user.id)),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
+        }
         Ok(())
     }
 }

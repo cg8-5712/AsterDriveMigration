@@ -33,6 +33,8 @@ struct MigrateArgs {
     default_password: String,
     #[arg(long, default_value = ".")]
     local_base_path: String,
+    #[arg(long, env = "ASTER_DIRECT_LINK_SECRET", hide_env_values = true)]
+    direct_link_secret: Option<String>,
     #[arg(long)]
     allow_non_empty_target: bool,
     #[arg(long)]
@@ -55,6 +57,7 @@ async fn main() -> Result<()> {
                 target_url: args.connection.target_url,
                 default_password: args.default_password,
                 local_base_path: args.local_base_path,
+                direct_link_secret: args.direct_link_secret,
                 include_deleted: args.connection.include_deleted,
                 allow_non_empty_target: args.allow_non_empty_target,
                 skip_unsupported_policies: args.skip_unsupported_policies,
