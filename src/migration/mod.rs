@@ -11,7 +11,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
     QueryFilter, Set, TransactionTrait,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -29,9 +29,11 @@ pub struct MigrationOptions {
     pub allow_non_empty_target: bool,
     pub skip_unsupported_policies: bool,
     pub dry_run: bool,
+    pub run_id: Option<String>,
+    pub resume: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationReport {
     pub schema_version: u32,
     pub generated_at: chrono::DateTime<chrono::Utc>,
@@ -67,6 +69,9 @@ pub struct MigrationReport {
     pub direct_links: Vec<DirectLinkReport>,
     pub tag_assignments: Vec<TagAssignmentReport>,
     pub validation: MigrationValidation,
+    pub run_id: Option<String>,
+    pub resumed: bool,
+    pub completed_stages: Vec<String>,
 }
 
 impl Default for MigrationReport {
@@ -106,18 +111,21 @@ impl Default for MigrationReport {
             direct_links: Vec::new(),
             tag_assignments: Vec::new(),
             validation: MigrationValidation::default(),
+            run_id: None,
+            resumed: false,
+            completed_stages: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedObject {
     pub object_type: String,
     pub source_id: Option<i64>,
     pub reason: String,
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MigrationMappings {
     pub policies: Vec<IdMapping>,
     pub policy_groups: Vec<IdMapping>,
@@ -129,13 +137,13 @@ pub struct MigrationMappings {
     pub tasks: Vec<IdMapping>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdMapping {
     pub source_id: i64,
     pub target_id: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectLinkReport {
     pub source_direct_link_id: i64,
     pub source_file_id: i64,
@@ -146,7 +154,7 @@ pub struct DirectLinkReport {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagAssignmentReport {
     pub source_metadata_id: i64,
     pub source_entity_id: i64,
@@ -156,7 +164,7 @@ pub struct TagAssignmentReport {
     pub tag_name: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationValidation {
     pub performed: bool,
     pub passed: bool,
@@ -173,7 +181,7 @@ impl Default for MigrationValidation {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationCheck {
     pub name: String,
     pub passed: bool,
@@ -219,6 +227,13 @@ impl fmt::Display for MigrationReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut output = String::new();
         writeln!(output, "Cloudreve -> AsterDrive migration report")?;
+        if let Some(run_id) = &self.run_id {
+            writeln!(
+                output,
+                "run: {run_id}{}",
+                if self.resumed { " (resumed)" } else { "" }
+            )?;
+        }
         writeln!(
             output,
             "source: users={}, groups={}, policies={}, folders={}, files={}, entities={}, shares={}, direct_links={}, tag_assignments={}, tasks={}",
@@ -275,6 +290,13 @@ impl fmt::Display for MigrationReport {
                     self.validation.checks.len()
                 )?;
             }
+            if !self.completed_stages.is_empty() {
+                writeln!(
+                    output,
+                    "completed_stages: {}",
+                    self.completed_stages.join(",")
+                )?;
+            }
         }
         if !self.warnings.is_empty() {
             writeln!(output, "warnings:")?;
@@ -315,6 +337,67 @@ pub async fn inspect(
     Ok(report)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationStage {
+    Policies,
+    PolicyGroups,
+    Users,
+    Folders,
+    Blobs,
+    Files,
+    Metadata,
+    Shares,
+    DirectLinks,
+    Tasks,
+}
+
+impl MigrationStage {
+    const ALL: [Self; 10] = [
+        Self::Policies,
+        Self::PolicyGroups,
+        Self::Users,
+        Self::Folders,
+        Self::Blobs,
+        Self::Files,
+        Self::Metadata,
+        Self::Shares,
+        Self::DirectLinks,
+        Self::Tasks,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Policies => "policies",
+            Self::PolicyGroups => "policy_groups",
+            Self::Users => "users",
+            Self::Folders => "folders",
+            Self::Blobs => "blobs",
+            Self::Files => "files",
+            Self::Metadata => "metadata",
+            Self::Shares => "shares",
+            Self::DirectLinks => "direct_links",
+            Self::Tasks => "tasks",
+        }
+    }
+
+    fn should_run_after(self, last_completed_stage: Option<&str>) -> Result<bool> {
+        let Some(last_completed_stage) = last_completed_stage else {
+            return Ok(true);
+        };
+        let last_index = Self::ALL
+            .iter()
+            .position(|stage| stage.as_str() == last_completed_stage)
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("checkpoint contains unknown stage {last_completed_stage}")
+            })?;
+        let current_index = Self::ALL
+            .iter()
+            .position(|stage| *stage == self)
+            .expect("migration stage must exist in ALL");
+        Ok(current_index > last_index)
+    }
+}
+
 pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     if options.default_password.chars().count() < 8 {
         bail!("--default-password must contain at least 8 characters");
@@ -326,13 +409,20 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     {
         bail!("--direct-link-secret must contain at least 16 characters");
     }
+    if options.resume && options.run_id.is_none() {
+        bail!("--resume requires --run-id");
+    }
+    if options.resume && options.dry_run {
+        bail!("--resume cannot be combined with --dry-run");
+    }
+    if let Some(run_id) = options.run_id.as_deref() {
+        validate_run_id(run_id)?;
+    }
 
     let source = connect(&options.source_url, "Cloudreve").await?;
     let target = connect(&options.target_url, "AsterDrive").await?;
     let source_data = SourceData::load(&source, options.include_deleted).await?;
     validate_target_schema(&target).await?;
-    ensure_target_safe(&target, options.allow_non_empty_target).await?;
-    let target_before = TargetCounts::load(&target).await?;
 
     let unsupported = source_data.unsupported_policy_types();
     if !unsupported.is_empty() && !options.skip_unsupported_policies {
@@ -346,56 +436,223 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     report.dry_run = options.dry_run;
     report.warnings.extend(source_data.compatibility_warnings());
     if options.dry_run {
+        report.run_id = options.run_id.clone();
         return Ok(report);
     }
 
+    checkpoint::ensure_table(&target).await?;
+    let run_id = options
+        .run_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let source_fingerprint = source_fingerprint(&options.source_url, &source_data);
+    let target_fingerprint = hash_fingerprint(&options.target_url);
+    let plan_fingerprint = plan_fingerprint(&options);
+
+    let (mut context, target_before, mut last_completed_stage) = if options.resume {
+        let loaded = checkpoint::load(
+            &target,
+            &run_id,
+            &source_fingerprint,
+            &target_fingerprint,
+            &plan_fingerprint,
+        )
+        .await?;
+        if !matches!(
+            loaded.status.as_str(),
+            "running" | "failed" | "validation_failed" | "completed"
+        ) {
+            bail!(
+                "migration run {run_id} has unsupported status {}",
+                loaded.status
+            );
+        }
+        report = loaded.report;
+        report.resumed = true;
+        report.run_id = Some(run_id.clone());
+        (loaded.context, loaded.baseline, loaded.last_completed_stage)
+    } else {
+        ensure_target_safe(&target, options.allow_non_empty_target).await?;
+        let baseline = TargetCounts::load(&target).await?;
+        report.run_id = Some(run_id.clone());
+        let context = MigrationContext::default();
+        checkpoint::create(
+            &target,
+            checkpoint::NewCheckpoint {
+                run_id: &run_id,
+                source_fingerprint: &source_fingerprint,
+                target_fingerprint: &target_fingerprint,
+                plan_fingerprint: &plan_fingerprint,
+                context: &context,
+                report: &report,
+                baseline: &baseline,
+            },
+        )
+        .await?;
+        (context, baseline, None)
+    };
+
     let password_hash = hash_password(&options.default_password)?;
-    let transaction = target
-        .begin()
-        .await
-        .wrap_err("begin AsterDrive transaction")?;
-    let mut context = MigrationContext::default();
 
-    migrate_policies(
-        &transaction,
-        &source_data,
-        &options,
-        &mut context,
-        &mut report,
-    )
-    .await?;
-    migrate_policy_groups(&transaction, &source_data, &mut context, &mut report).await?;
-    migrate_users(
-        &transaction,
-        &source_data,
-        &password_hash,
-        &mut context,
-        &mut report,
-    )
-    .await?;
-    migrate_folders(&transaction, &source_data, &mut context, &mut report).await?;
-    migrate_blobs(&transaction, &source_data, &mut context, &mut report).await?;
-    migrate_files(&transaction, &source_data, &mut context, &mut report).await?;
-    migrate_metadata(&transaction, &source_data, &context, &mut report).await?;
-    migrate_shares(&transaction, &source_data, &mut context, &mut report).await?;
-    migrate_direct_links(
-        &transaction,
-        &source_data,
-        &context,
-        options.direct_link_secret.as_deref(),
-        &mut report,
-    )
-    .await?;
-    migrate_tasks(&transaction, &source_data, &mut context, &mut report).await?;
+    for stage in MigrationStage::ALL {
+        if !stage.should_run_after(last_completed_stage.as_deref())? {
+            continue;
+        }
+        let transaction = target
+            .begin()
+            .await
+            .wrap_err_with(|| format!("begin migration stage {}", stage.as_str()))?;
+        let stage_result: Result<()> = async {
+            execute_stage(
+                stage,
+                &transaction,
+                &source_data,
+                &options,
+                &password_hash,
+                &mut context,
+                &mut report,
+            )
+            .await?;
+            report.set_mappings(&context);
+            if !report
+                .completed_stages
+                .iter()
+                .any(|completed| completed == stage.as_str())
+            {
+                report.completed_stages.push(stage.as_str().to_string());
+            }
+            checkpoint::save_stage(&transaction, &run_id, stage.as_str(), &context, &report).await
+        }
+        .await;
+        if let Err(error) = stage_result {
+            drop(transaction);
+            let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "migration run {run_id} failed at stage {}; rerun with --resume --run-id {run_id}",
+                    stage.as_str()
+                )
+            });
+        }
+        if let Err(error) = transaction.commit().await {
+            let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "commit migration run {run_id} stage {}; resume with the same run ID",
+                    stage.as_str()
+                )
+            });
+        }
+        last_completed_stage = Some(stage.as_str().to_string());
+    }
 
-    transaction
-        .commit()
-        .await
-        .wrap_err("commit AsterDrive migration transaction")?;
     report.set_mappings(&context);
-    report.validation = validate_migration_result(&target, &target_before, &report).await?;
+    report.validation = match validate_migration_result(&target, &target_before, &report).await {
+        Ok(validation) => validation,
+        Err(error) => {
+            let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+            return Err(error)
+                .wrap_err_with(|| format!("validate completed migration run {run_id}"));
+        }
+    };
     report.generated_at = chrono::Utc::now();
+    checkpoint::finish(
+        &target,
+        &run_id,
+        if report.validation.passed {
+            "completed"
+        } else {
+            "validation_failed"
+        },
+        &context,
+        &report,
+    )
+    .await?;
     Ok(report)
+}
+
+async fn execute_stage(
+    stage: MigrationStage,
+    transaction: &sea_orm::DatabaseTransaction,
+    source_data: &SourceData,
+    options: &MigrationOptions,
+    password_hash: &str,
+    context: &mut MigrationContext,
+    report: &mut MigrationReport,
+) -> Result<()> {
+    match stage {
+        MigrationStage::Policies => {
+            migrate_policies(transaction, source_data, options, context, report).await
+        }
+        MigrationStage::PolicyGroups => {
+            migrate_policy_groups(transaction, source_data, context, report).await
+        }
+        MigrationStage::Users => {
+            migrate_users(transaction, source_data, password_hash, context, report).await
+        }
+        MigrationStage::Folders => migrate_folders(transaction, source_data, context, report).await,
+        MigrationStage::Blobs => migrate_blobs(transaction, source_data, context, report).await,
+        MigrationStage::Files => migrate_files(transaction, source_data, context, report).await,
+        MigrationStage::Metadata => {
+            migrate_metadata(transaction, source_data, context, report).await
+        }
+        MigrationStage::Shares => migrate_shares(transaction, source_data, context, report).await,
+        MigrationStage::DirectLinks => {
+            migrate_direct_links(
+                transaction,
+                source_data,
+                context,
+                options.direct_link_secret.as_deref(),
+                report,
+            )
+            .await
+        }
+        MigrationStage::Tasks => migrate_tasks(transaction, source_data, context, report).await,
+    }
+}
+
+fn validate_run_id(run_id: &str) -> Result<()> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() || run_id.chars().count() > 128 || run_id.chars().any(char::is_control) {
+        bail!("--run-id must contain 1-128 non-control characters");
+    }
+    Ok(())
+}
+
+fn hash_fingerprint(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn source_fingerprint(source_url: &str, source: &SourceData) -> String {
+    hash_fingerprint(&format!(
+        "{source_url}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        source.users.len(),
+        source.groups.len(),
+        source.policies.len(),
+        source.files.len(),
+        source.entities.len(),
+        source.file_entities.len(),
+        source.shares.len(),
+        source.metadata.len(),
+        source.direct_links.len(),
+        source.tasks.len(),
+    ))
+}
+
+fn plan_fingerprint(options: &MigrationOptions) -> String {
+    hash_fingerprint(&format!(
+        "{}|{}|{}|{}|{}|{}",
+        options.local_base_path,
+        options.include_deleted,
+        options.allow_non_empty_target,
+        options.skip_unsupported_policies,
+        hash_fingerprint(&options.default_password),
+        options
+            .direct_link_secret
+            .as_deref()
+            .map(hash_fingerprint)
+            .unwrap_or_default(),
+    ))
 }
 
 async fn connect(url: &str, label: &str) -> Result<DatabaseConnection> {
@@ -437,12 +694,28 @@ async fn ensure_target_safe(db: &DatabaseConnection, allow_non_empty: bool) -> R
         return Ok(());
     }
     let counts = [
+        (
+            "storage_policies",
+            ad::storage_policies::Entity::find().count(db).await?,
+        ),
+        (
+            "storage_policy_groups",
+            ad::storage_policy_groups::Entity::find().count(db).await?,
+        ),
         ("users", ad::users::Entity::find().count(db).await?),
+        (
+            "user_profiles",
+            ad::user_profiles::Entity::find().count(db).await?,
+        ),
         ("folders", ad::folders::Entity::find().count(db).await?),
         ("files", ad::files::Entity::find().count(db).await?),
         (
             "file_blobs",
             ad::file_blobs::Entity::find().count(db).await?,
+        ),
+        (
+            "file_versions",
+            ad::file_versions::Entity::find().count(db).await?,
         ),
         ("shares", ad::shares::Entity::find().count(db).await?),
         (
@@ -469,7 +742,7 @@ async fn ensure_target_safe(db: &DatabaseConnection, allow_non_empty: bool) -> R
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TargetCounts {
     policies: u64,
     policy_groups: u64,
@@ -755,7 +1028,7 @@ fn hash_password(password: &str) -> Result<String> {
         .map_err(|error| color_eyre::eyre::eyre!("hash temporary AD password: {error}"))
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct MigrationContext {
     policies: HashMap<i64, i64>,
     policy_groups: HashMap<i64, i64>,
@@ -1130,6 +1403,7 @@ fn file_classification(name: &str) -> (String, Option<String>, String, String) {
     (mime, compound_extension, extension, category.to_string())
 }
 
+mod checkpoint;
 mod phases;
 use phases::*;
 
@@ -1276,6 +1550,8 @@ mod tests {
             allow_non_empty_target: false,
             skip_unsupported_policies: false,
             dry_run: false,
+            run_id: None,
+            resume: false,
         })
         .await?;
 
@@ -1343,6 +1619,99 @@ mod tests {
         let user = ad::users::Entity::find().one(&target).await?.unwrap();
         assert!(user.must_change_password);
         assert_eq!(user.role, "admin");
+        target.close().await?;
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumes_from_last_completed_stage() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let run_id = format!("resume-test-{suffix}");
+        let source_path = std::env::temp_dir().join(format!("cloudreve-resume-{suffix}.db"));
+        let target_path = std::env::temp_dir().join(format!("asterdrive-resume-{suffix}.db"));
+        let source_url = sqlite_url(&source_path);
+        let target_url = sqlite_url(&target_path);
+
+        let source = Database::connect(&source_url).await?;
+        create_source_schema(&source).await?;
+        seed_source(&source).await?;
+        source.close().await?;
+
+        let target = Database::connect(&target_url).await?;
+        create_target_schema(&target).await?;
+        target
+            .execute_unprepared(
+                "CREATE TRIGGER fail_folder_insert BEFORE INSERT ON folders \
+                 BEGIN SELECT RAISE(ABORT, 'forced folder stage failure'); END",
+            )
+            .await?;
+        target.close().await?;
+
+        let options = MigrationOptions {
+            source_url: source_url.clone(),
+            target_url: target_url.clone(),
+            default_password: "temporary-password".to_string(),
+            local_base_path: "C:/cloudreve".to_string(),
+            direct_link_secret: Some("test-direct-link-secret".to_string()),
+            include_deleted: false,
+            allow_non_empty_target: false,
+            skip_unsupported_policies: false,
+            dry_run: false,
+            run_id: Some(run_id.clone()),
+            resume: false,
+        };
+
+        let error = migrate(options.clone()).await.unwrap_err();
+        assert!(error.to_string().contains(&run_id));
+
+        let target = Database::connect(&target_url).await?;
+        assert_eq!(
+            ad::storage_policies::Entity::find().count(&target).await?,
+            1
+        );
+        assert_eq!(ad::users::Entity::find().count(&target).await?, 1);
+        assert_eq!(ad::folders::Entity::find().count(&target).await?, 0);
+        let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
+            .one(&target)
+            .await?
+            .expect("failed migration checkpoint");
+        assert_eq!(failed_checkpoint.status, "failed");
+        assert_eq!(
+            failed_checkpoint.last_completed_stage.as_deref(),
+            Some("users")
+        );
+        target
+            .execute_unprepared("DROP TRIGGER fail_folder_insert")
+            .await?;
+        target.close().await?;
+
+        let report = migrate(MigrationOptions {
+            resume: true,
+            ..options
+        })
+        .await?;
+        assert!(report.resumed);
+        assert_eq!(report.run_id.as_deref(), Some(run_id.as_str()));
+        assert!(report.validation.passed);
+        assert_eq!(report.migrated_users, 1);
+        assert_eq!(report.migrated_folders, 1);
+
+        let target = Database::connect(&target_url).await?;
+        assert_eq!(ad::users::Entity::find().count(&target).await?, 1);
+        assert_eq!(ad::folders::Entity::find().count(&target).await?, 1);
+        assert_eq!(ad::files::Entity::find().count(&target).await?, 1);
+        let completed_checkpoint = checkpoint::Entity::find_by_id(run_id)
+            .one(&target)
+            .await?
+            .expect("completed migration checkpoint");
+        assert_eq!(completed_checkpoint.status, "completed");
+        assert_eq!(
+            completed_checkpoint.last_completed_stage.as_deref(),
+            Some("tasks")
+        );
         target.close().await?;
 
         let _ = std::fs::remove_file(source_path);

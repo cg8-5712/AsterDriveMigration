@@ -50,6 +50,7 @@ cargo run -- migrate `
   --source-url "sqlite://C:/cloudreve/cloudreve.db?mode=ro" `
   --target-url "sqlite://C:/asterdrive/asterdrive.db" `
   --local-base-path "C:/cloudreve" `
+  --run-id "cloudreve-cutover-2026-07-13" `
   --report-path "C:/migration/cloudreve-to-ad.json"
 ```
 
@@ -58,6 +59,26 @@ cargo run -- migrate `
 Use `--dry-run` to perform preflight checks without writing the target. The target core tables must be empty by default. `--allow-non-empty-target` disables that guard but may still fail on unique values or conflicting data.
 
 Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files.
+
+## Limited stage resume
+
+Migration stages are committed independently in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. The target database stores the run state in `aster_external_migration_runs`. Each stage writes its target records and advances the checkpoint in the same database transaction.
+
+Use a stable run ID for an operational migration. If a stage fails, fix the external cause and rerun the same command with `--resume`:
+
+```powershell
+cargo run -- migrate `
+  --source-url "sqlite://C:/cloudreve/cloudreve.db?mode=ro" `
+  --target-url "sqlite://C:/asterdrive/asterdrive.db" `
+  --local-base-path "C:/cloudreve" `
+  --run-id "cloudreve-cutover-2026-07-13" `
+  --resume `
+  --report-path "C:/migration/cloudreve-to-ad.json"
+```
+
+Resume verifies the source URL/count fingerprint, target URL fingerprint and migration-plan fingerprint. Repeat the same password, direct-link secret and migration flags used by the original run. Completed stages are skipped and their source-to-target mappings are restored from the checkpoint.
+
+This is stage-level resume only. A failed stage rolls back and restarts from the beginning of that stage; there is no page/batch cursor inside a large files or blobs stage yet. The source inventory is still loaded into memory, so very large installations still need the future paginated runner.
 
 ## JSON migration report
 
@@ -69,6 +90,7 @@ Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies can
 - every Cloudreve tag metadata assignment and its AD tag/entity IDs
 - every regenerated direct-link URL and its Cloudreve/AD file IDs
 - post-commit database count checks, imported-task terminal-state checks, tag-binding checks and direct-link property checks
+- run ID, whether the execution resumed, and the list of completed stages
 
 The CLI writes the JSON report before returning a validation error. A failed post-migration check therefore produces a usable report and exits with a non-zero status. Direct-link URLs are bearer-style public capabilities, so the report file must be stored with restricted access.
 

@@ -531,5 +531,27 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | `tag_assignments` | Cloudreve metadata ID、源 file/folder ID、AD entity ID、AD tag ID 和标签名 |
 | `direct_links` | Cloudreve direct-link/file ID、AD file ID、新 URL、原名称、下载次数和限速 |
 | `validation` | 是否执行/通过，以及每项检查的 expected、actual 和失败信息 |
+| `run_id` | checkpoint run ID；未指定时由迁移工具生成 UUID |
+| `resumed` | 本次执行是否从已有 checkpoint 恢复 |
+| `completed_stages` | 已原子提交完成的迁移阶段列表 |
 
 当前提交后校验覆盖核心表增量数量、导入任务是否全为终态且无 lease、`system.tags` 关联是否存在、`cloudreve.direct_links` 属性中的 URL 是否与报告一致。报告不会保存数据库密码、存储密钥或 Cloudreve task private state，但会包含新 direct-link URL，因此必须限制报告文件访问权限。
+
+## 17. 有限断点续传语义
+
+迁移工具会在 AD 数据库自动创建 `aster_external_migration_runs`。首次迁移建议显式指定 `--run-id`；失败后使用相同参数和 `--resume --run-id <id>`。
+
+| 行为 | 当前实现 |
+|---|---|
+| checkpoint 粒度 | stage 级 |
+| 原子性 | stage 的目标记录、context、report 和 last completed stage 在同一事务提交 |
+| 已完成 stage | resume 时跳过，不重复插入 |
+| 失败 stage | 整个 stage 回滚，resume 时从该 stage 开头重新执行 |
+| ID mapping | 序列化保存在 run 的 `context_json` |
+| 初始目标计数 | 保存在 `baseline_json`，恢复完成后仍可执行正确的增量数量校验 |
+| 源校验 | URL 摘要 + 源表数量指纹 |
+| 计划校验 | local path、迁移 flags、临时密码摘要和 direct-link secret 摘要 |
+| stage 内分页 cursor | 尚未实现 |
+| 对象上传断点 | 尚未实现 |
+
+由于源指纹不能检测数量不变的内容修改，断点恢复期间仍必须冻结 Cloudreve 写入。对于单个 stage 内拥有大量文件或 blob 的实例，当前恢复会从该 stage 起点重跑；后续需要增加 page cursor 和独立 object mapping 表。

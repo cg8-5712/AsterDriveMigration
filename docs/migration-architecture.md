@@ -532,26 +532,32 @@ trait TargetWriter {
 
 ### Checkpoint Tables
 
-建议 checkpoint 表保存在 AD 数据库中，以便迁移进程重启后恢复。
+checkpoint 表保存在 AD 数据库中，以便迁移进程重启后恢复。当前实现先提供阶段级有限恢复。
 
 #### `aster_external_migration_runs`
 
-| 字段 | 建议类型 | 说明 |
+| 字段 | 当前类型 | 说明 |
 |---|---|---|
 | `id` | UUID/String PK | Run ID |
-| `source_type` | String | `cloudreve`、`nextcloud` 等 |
 | `source_fingerprint` | String | 源数据库/实例指纹，避免连错源 |
 | `target_fingerprint` | String | 目标 AD 实例指纹 |
-| `status` | String | planned/running/verifying/completed/failed/cancelled |
-| `started_at` | DateTime | 开始时间 |
+| `plan_fingerprint` | String | local path、flags 和 secret/password 摘要组成的计划指纹 |
+| `status` | String | running/failed/completed/validation_failed |
+| `last_completed_stage` | String nullable | 最后一个与数据一起原子提交的阶段 |
+| `context_json` | JSON/JSONB | 当前内存 ID mapping 和 username mapping 的持久化快照 |
+| `report_json` | JSON/JSONB | 已完成阶段的完整结构化报告 |
+| `baseline_json` | JSON/JSONB | 新 run 开始前的目标表计数，用于恢复后的最终增量校验 |
+| `last_error` | Text nullable | 最近一次阶段失败摘要，不包含 migration secret |
+| `created_at` | DateTime | 创建时间 |
 | `updated_at` | DateTime | 最后更新时间 |
-| `finished_at` | DateTime nullable | 完成时间 |
-| `plan_json` | Text | MigrationPlan |
-| `stats_json` | Text | 数量、字节和阶段统计 |
-| `summary_json` | Text nullable | 最终摘要 |
-| `last_error` | Text nullable | 最后错误，不包含 secret |
+
+当前阶段顺序为 policies、policy_groups、users、folders、blobs、files、metadata、shares、direct_links、tasks。每个阶段使用独立目标事务；目标数据和 `last_completed_stage/context_json/report_json` 在同一事务中提交。失败阶段整体回滚，恢复时从下一个未完成阶段开始。
+
+当前 source fingerprint 使用数据库 URL 摘要和各源表记录数量，只能防止明显连错源或数量变化，不能检测“数量不变但内容变化”。生产迁移仍应冻结 Cloudreve 写入。
 
 #### `aster_external_migration_stage_cursors`
+
+尚未实现。它是下一步批内分页恢复所需的表。
 
 | 字段 | 建议类型 | 说明 |
 |---|---|---|
@@ -566,6 +572,8 @@ trait TargetWriter {
 建议 `(run_id, stage)` 为联合主键或唯一键。
 
 #### `aster_external_migration_object_map`
+
+尚未实现独立行式映射表。当前有限实现将完整 HashMap 序列化到 `aster_external_migration_runs.context_json`；这能跨进程恢复阶段依赖，但不能高效查询单个对象，也不适合超大数据集。
 
 | 字段 | 建议类型 | 说明 |
 |---|---|---|
@@ -755,10 +763,10 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | Cloudreve v4 标签 | 已从 `tag:*` metadata 生成 AD `tags` 和 `system.tags` 文件/目录关联 | 增加跨批次持久化去重和冲突报告 |
 | Direct links | 提供 AD `direct_link_secret` 时生成 v2 URL，并以 `cloudreve.direct_links` property 保存源 ID 映射 | 增加独立 JSON/CSV 报告和可选旧 URL 重定向层 |
 | Cloudreve 任务 | 已全部写成 AD `system_runtime` 终态历史；活动任务归档为 canceled | 后续可增加独立 legacy task archive 表，避免占用运维任务列表 |
-| 目标事务 | 已实现单次全局事务 | 每 batch 事务 + checkpoint，适合大数据集 |
-| ID mapping | 已实现内存 HashMap，并在 JSON 报告中导出排序后的核心对象映射 | 持久化 object mapping table，支持跨进程 resume |
-| 断点续传 | 未实现 | stage cursor + resume |
-| 幂等重复运行 | 未完整实现 | mapping 驱动 upsert/reuse |
+| 目标事务 | 已改为每 stage 独立事务，stage 数据和 checkpoint 原子提交 | 每 page/batch 事务，降低单个 files/blobs stage 的事务规模 |
+| ID mapping | 内存 HashMap 同时持久化到 run `context_json`，并导出到 JSON 报告 | 独立 object mapping table，支持单对象查询和超大数据集 |
+| 断点续传 | 已支持 `--run-id` + `--resume` 的阶段级恢复 | stage 内 page cursor、对象存储上传恢复和并行 worker checkpoint |
+| 幂等重复运行 | 同一 run 会跳过已完成 stage；失败 stage 因事务回滚可安全重跑 | 不依赖 run checkpoint 的对象级 upsert/reuse 和完整重复运行 |
 | 冲突策略 | 仅 username 自动后缀，其他冲突依赖 DB 报错 | fail/rename/skip/reuse/update 可配置 |
 | 物理对象复制 | 未实现，当前复用源 storage path | 流式 copy、SHA-256、目标路径和校验 |
 | 真正内容去重 | 未实现 | hash + policy 去重 |

@@ -47,6 +47,10 @@ struct MigrateArgs {
     skip_unsupported_policies: bool,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long, value_name = "ID")]
+    run_id: Option<String>,
+    #[arg(long, requires = "run_id")]
+    resume: bool,
 }
 
 #[tokio::main]
@@ -69,6 +73,8 @@ async fn main() -> Result<()> {
                 allow_non_empty_target: args.allow_non_empty_target,
                 skip_unsupported_policies: args.skip_unsupported_policies,
                 dry_run: args.dry_run,
+                run_id: args.run_id,
+                resume: args.resume,
             })
             .await?;
             emit_report(report_path.as_deref(), &report)?;
