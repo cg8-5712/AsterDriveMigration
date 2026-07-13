@@ -34,7 +34,8 @@ The tool reuses existing storage objects. For local storage, pass the directory 
 ```powershell
 cargo run -- check `
   --source-url "sqlite://C:/cloudreve/cloudreve.db?mode=ro" `
-  --target-url "sqlite://C:/asterdrive/asterdrive.db"
+  --target-url "sqlite://C:/asterdrive/asterdrive.db" `
+  --report-path "C:/migration/cloudreve-preflight.json"
 ```
 
 The URLs can also be provided through `CLOUDREVE_DATABASE_URL` and `ASTERDRIVE_DATABASE_URL`. SQLite, MySQL and PostgreSQL URLs supported by SeaORM can be used.
@@ -48,7 +49,8 @@ $env:ASTER_DIRECT_LINK_SECRET = "use-the-same-auth.direct_link_secret-as-ad"
 cargo run -- migrate `
   --source-url "sqlite://C:/cloudreve/cloudreve.db?mode=ro" `
   --target-url "sqlite://C:/asterdrive/asterdrive.db" `
-  --local-base-path "C:/cloudreve"
+  --local-base-path "C:/cloudreve" `
+  --report-path "C:/migration/cloudreve-to-ad.json"
 ```
 
 `ASTER_DIRECT_LINK_SECRET` is optional only when there are no direct links to regenerate. When supplied, each active Cloudreve `direct_links` row is mapped to a newly signed AD `/d/v2...` URL and stored under the target file's `cloudreve.direct_links` properties. Existing Cloudreve `/f/...` URLs cannot remain valid because the URL path, ID and signing algorithms differ.
@@ -56,6 +58,19 @@ cargo run -- migrate `
 Use `--dry-run` to perform preflight checks without writing the target. The target core tables must be empty by default. `--allow-non-empty-target` disables that guard but may still fail on unique values or conflicting data.
 
 Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files.
+
+## JSON migration report
+
+`--report-path` writes a pretty-printed JSON report for both `check` and `migrate`. A completed migration report contains:
+
+- source and migrated counts for every supported object type
+- skipped counts grouped by type, plus source ID and reason for every skipped object
+- sorted source-to-target ID mappings for policies, groups, users, folders, blobs, files, shares and archived tasks
+- every Cloudreve tag metadata assignment and its AD tag/entity IDs
+- every regenerated direct-link URL and its Cloudreve/AD file IDs
+- post-commit database count checks, imported-task terminal-state checks, tag-binding checks and direct-link property checks
+
+The CLI writes the JSON report before returning a validation error. A failed post-migration check therefore produces a usable report and exits with a non-zero status. Direct-link URLs are bearer-style public capabilities, so the report file must be stored with restricted access.
 
 ## Verification before push
 

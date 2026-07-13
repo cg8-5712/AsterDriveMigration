@@ -1,6 +1,10 @@
-use aster_drive_migration::migration::{MigrationOptions, inspect, migrate};
+use std::path::{Path, PathBuf};
+
+use aster_drive_migration::migration::{
+    MigrationOptions, MigrationReport, inspect, migrate, write_json_report,
+};
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail};
 
 #[derive(Debug, Parser)]
 #[command(name = "aster-drive-migration", version, about)]
@@ -23,6 +27,8 @@ struct ConnectionArgs {
     target_url: String,
     #[arg(long)]
     include_deleted: bool,
+    #[arg(long, value_name = "PATH")]
+    report_path: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -49,9 +55,10 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Check(args) => {
             let report = inspect(&args.source_url, &args.target_url, args.include_deleted).await?;
-            println!("{report}");
+            emit_report(args.report_path.as_deref(), &report)?;
         }
         Command::Migrate(args) => {
+            let report_path = args.connection.report_path.clone();
             let report = migrate(MigrationOptions {
                 source_url: args.connection.source_url,
                 target_url: args.connection.target_url,
@@ -64,8 +71,19 @@ async fn main() -> Result<()> {
                 dry_run: args.dry_run,
             })
             .await?;
-            println!("{report}");
+            emit_report(report_path.as_deref(), &report)?;
         }
+    }
+    Ok(())
+}
+
+fn emit_report(report_path: Option<&Path>, report: &MigrationReport) -> Result<()> {
+    if let Some(path) = report_path {
+        write_json_report(path, report)?;
+    }
+    println!("{report}");
+    if report.validation.performed && !report.validation.passed {
+        bail!("migration committed but post-migration validation failed; inspect the JSON report");
     }
     Ok(())
 }

@@ -121,7 +121,7 @@ TUI 只订阅 engine progress event，不直接访问数据库或实现迁移逻
 - source 和 target 存储连接
 - 冲突处理、并发、重试和验证选项
 
-敏感字段不得出现在普通日志、迁移报告或 TUI 中。
+密码、数据库凭据、OAuth token、存储 secret 和任务 private state 不得出现在普通日志、迁移报告或 TUI 中。JSON 报告按需求包含重新签发的 direct-link URL；该 URL 本身是公开访问能力，报告文件必须按敏感文件保护。
 
 ### Output Renderer
 
@@ -264,15 +264,22 @@ checkpoint 必须在目标记录成功提交后更新，不能先推进 cursor �
 
 ### Report Builder
 
-报告内容：
+当前实现通过 `--report-path` 为 `check` 和 `migrate` 输出 `schema_version=1` 的 pretty JSON，同时保留终端摘要。报告内容：
 
 - 源和目标对象统计
-- 成功、复用、跳过、重命名、失败数量
-- 已迁移字节数和吞吐量
+- 各对象类型迁移数量
+- 按对象类型聚合的跳过数量
+- 每个跳过对象的 source ID 和原因
+- policy、policy group、user、folder、blob、file、share、task 的 source ID -> target ID
+- Cloudreve tag metadata -> AD tag/entity 关联
+- Cloudreve direct-link ID -> AD file ID/new URL
 - 不兼容能力和人工处理项
-- 校验结果
+- 提交后重新查询 AD 得到的数量校验
+- 导入任务终态/lease 校验
+- `system.tags` 和 `cloudreve.direct_links` property 校验
 - 错误和警告摘要
-- 可选对象级错误明细
+
+校验失败时 CLI 必须先写报告和终端摘要，再以非零状态退出。当前报告只覆盖成功提交后的校验；事务提交前发生的致命错误仍直接返回错误，后续可引入 migration run 持久化来保存失败中间态。
 
 ## 3.3 Layer 3：Source Adapter Layer
 
@@ -749,7 +756,7 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | Direct links | 提供 AD `direct_link_secret` 时生成 v2 URL，并以 `cloudreve.direct_links` property 保存源 ID 映射 | 增加独立 JSON/CSV 报告和可选旧 URL 重定向层 |
 | Cloudreve 任务 | 已全部写成 AD `system_runtime` 终态历史；活动任务归档为 canceled | 后续可增加独立 legacy task archive 表，避免占用运维任务列表 |
 | 目标事务 | 已实现单次全局事务 | 每 batch 事务 + checkpoint，适合大数据集 |
-| ID mapping | 已实现内存 HashMap | 持久化 object mapping table |
+| ID mapping | 已实现内存 HashMap，并在 JSON 报告中导出排序后的核心对象映射 | 持久化 object mapping table，支持跨进程 resume |
 | 断点续传 | 未实现 | stage cursor + resume |
 | 幂等重复运行 | 未完整实现 | mapping 驱动 upsert/reuse |
 | 冲突策略 | 仅 username 自动后缀，其他冲突依赖 DB 报错 | fail/rename/skip/reuse/update 可配置 |
@@ -757,8 +764,8 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | 真正内容去重 | 未实现 | hash + policy 去重 |
 | ref_count 重算 | 基于源关联计算初值 | 迁移后从 AD 关系统一重算 |
 | storage_used 重算 | 当前复制 Cloudreve 用户统计 | 迁移后按 AD 语义统一重算 |
-| 验证编排 | 有标签、直链、任务独立规则测试和 SQLite 端到端测试 | 对实际运行执行 inventory/关系/存储一致性验证 |
-| 报告 | 当前输出基础统计和警告 | run/stage/object 级报告，Human + JSON |
+| 验证编排 | 提交后重查核心表数量、导入任务终态、标签绑定和直链 property；有 SQLite 端到端测试 | 增加 parent/owner/blob/ref_count/storage_used 和真实对象可读性验证 |
+| 报告 | 已支持终端摘要和 `--report-path` JSON，包含分类跳过原因、核心 ID 映射、标签/直链记录和校验结果 | 增加失败中间态、stage 进度、吞吐量、字节数和独立 CSV 导出 |
 | TUI | 未接入新迁移核心 | 可选进度视图 |
 | 多源系统插件 | 未实现 | SourceAdapter 插件化 |
 

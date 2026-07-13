@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write};
+use std::path::Path;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};
@@ -7,9 +8,10 @@ use base64::Engine;
 use color_eyre::eyre::{Result, WrapErr, bail};
 use hmac::{Hmac, Mac};
 use sea_orm::{
-    ActiveModelTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, Set, TransactionTrait,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -29,8 +31,10 @@ pub struct MigrationOptions {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MigrationReport {
+    pub schema_version: u32,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
     pub source_users: u64,
     pub source_groups: u64,
     pub source_policies: u64,
@@ -57,6 +61,158 @@ pub struct MigrationReport {
     pub skipped: usize,
     pub dry_run: bool,
     pub warnings: Vec<String>,
+    pub skipped_by_type: BTreeMap<String, usize>,
+    pub skipped_objects: Vec<SkippedObject>,
+    pub mappings: MigrationMappings,
+    pub direct_links: Vec<DirectLinkReport>,
+    pub tag_assignments: Vec<TagAssignmentReport>,
+    pub validation: MigrationValidation,
+}
+
+impl Default for MigrationReport {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            generated_at: chrono::Utc::now(),
+            source_users: 0,
+            source_groups: 0,
+            source_policies: 0,
+            source_folders: 0,
+            source_files: 0,
+            source_entities: 0,
+            source_shares: 0,
+            source_direct_links: 0,
+            source_tag_assignments: 0,
+            source_tasks: 0,
+            migrated_users: 0,
+            migrated_policy_groups: 0,
+            migrated_policies: 0,
+            migrated_folders: 0,
+            migrated_files: 0,
+            migrated_blobs: 0,
+            migrated_versions: 0,
+            migrated_shares: 0,
+            migrated_properties: 0,
+            migrated_tags: 0,
+            migrated_tag_assignments: 0,
+            migrated_direct_links: 0,
+            migrated_tasks: 0,
+            skipped: 0,
+            dry_run: false,
+            warnings: Vec::new(),
+            skipped_by_type: BTreeMap::new(),
+            skipped_objects: Vec::new(),
+            mappings: MigrationMappings::default(),
+            direct_links: Vec::new(),
+            tag_assignments: Vec::new(),
+            validation: MigrationValidation::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedObject {
+    pub object_type: String,
+    pub source_id: Option<i64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct MigrationMappings {
+    pub policies: Vec<IdMapping>,
+    pub policy_groups: Vec<IdMapping>,
+    pub users: Vec<IdMapping>,
+    pub folders: Vec<IdMapping>,
+    pub blobs: Vec<IdMapping>,
+    pub files: Vec<IdMapping>,
+    pub shares: Vec<IdMapping>,
+    pub tasks: Vec<IdMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IdMapping {
+    pub source_id: i64,
+    pub target_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectLinkReport {
+    pub source_direct_link_id: i64,
+    pub source_file_id: i64,
+    pub target_file_id: i64,
+    pub source_name: String,
+    pub source_downloads: i64,
+    pub source_speed_limit: i64,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TagAssignmentReport {
+    pub source_metadata_id: i64,
+    pub source_entity_id: i64,
+    pub target_entity_type: String,
+    pub target_entity_id: i64,
+    pub target_tag_id: i64,
+    pub tag_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrationValidation {
+    pub performed: bool,
+    pub passed: bool,
+    pub checks: Vec<ValidationCheck>,
+}
+
+impl Default for MigrationValidation {
+    fn default() -> Self {
+        Self {
+            performed: false,
+            passed: true,
+            checks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ValidationCheck {
+    pub name: String,
+    pub passed: bool,
+    pub expected: String,
+    pub actual: String,
+    pub message: Option<String>,
+}
+
+impl MigrationReport {
+    fn record_skip(
+        &mut self,
+        object_type: &str,
+        source_id: Option<i64>,
+        reason: impl Into<String>,
+    ) {
+        self.skipped += 1;
+        *self
+            .skipped_by_type
+            .entry(object_type.to_string())
+            .or_default() += 1;
+        self.skipped_objects.push(SkippedObject {
+            object_type: object_type.to_string(),
+            source_id,
+            reason: reason.into(),
+        });
+    }
+
+    fn set_mappings(&mut self, context: &MigrationContext) {
+        self.mappings = MigrationMappings {
+            policies: sorted_id_mappings(&context.policies),
+            policy_groups: sorted_id_mappings(&context.policy_groups),
+            users: sorted_id_mappings(&context.users),
+            folders: sorted_id_mappings(&context.folders),
+            blobs: sorted_id_mappings(&context.blobs),
+            files: sorted_id_mappings(&context.files),
+            shares: sorted_id_mappings(&context.shares),
+            tasks: sorted_id_mappings(&context.tasks),
+        };
+    }
 }
 
 impl fmt::Display for MigrationReport {
@@ -98,6 +254,27 @@ impl fmt::Display for MigrationReport {
                 self.migrated_tasks
             )?;
             writeln!(output, "skipped: {}", self.skipped)?;
+            if !self.skipped_by_type.is_empty() {
+                let categories = self
+                    .skipped_by_type
+                    .iter()
+                    .map(|(object_type, count)| format!("{object_type}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(output, "skipped_by_type: {categories}")?;
+            }
+            if self.validation.performed {
+                writeln!(
+                    output,
+                    "validation: {} ({} checks)",
+                    if self.validation.passed {
+                        "passed"
+                    } else {
+                        "failed"
+                    },
+                    self.validation.checks.len()
+                )?;
+            }
         }
         if !self.warnings.is_empty() {
             writeln!(output, "warnings:")?;
@@ -107,6 +284,20 @@ impl fmt::Display for MigrationReport {
         }
         formatter.write_str(output.trim_end())
     }
+}
+
+pub fn write_json_report(path: impl AsRef<Path>, report: &MigrationReport) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("create report directory {}", parent.display()))?;
+    }
+    let contents = serde_json::to_vec_pretty(report).wrap_err("serialize migration report")?;
+    std::fs::write(path, contents)
+        .wrap_err_with(|| format!("write migration report {}", path.display()))
 }
 
 pub async fn inspect(
@@ -141,6 +332,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     let source_data = SourceData::load(&source, options.include_deleted).await?;
     validate_target_schema(&target).await?;
     ensure_target_safe(&target, options.allow_non_empty_target).await?;
+    let target_before = TargetCounts::load(&target).await?;
 
     let unsupported = source_data.unsupported_policy_types();
     if !unsupported.is_empty() && !options.skip_unsupported_policies {
@@ -185,7 +377,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     migrate_blobs(&transaction, &source_data, &mut context, &mut report).await?;
     migrate_files(&transaction, &source_data, &mut context, &mut report).await?;
     migrate_metadata(&transaction, &source_data, &context, &mut report).await?;
-    migrate_shares(&transaction, &source_data, &context, &mut report).await?;
+    migrate_shares(&transaction, &source_data, &mut context, &mut report).await?;
     migrate_direct_links(
         &transaction,
         &source_data,
@@ -194,12 +386,15 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
         &mut report,
     )
     .await?;
-    migrate_tasks(&transaction, &source_data, &context, &mut report).await?;
+    migrate_tasks(&transaction, &source_data, &mut context, &mut report).await?;
 
     transaction
         .commit()
         .await
         .wrap_err("commit AsterDrive migration transaction")?;
+    report.set_mappings(&context);
+    report.validation = validate_migration_result(&target, &target_before, &report).await?;
+    report.generated_at = chrono::Utc::now();
     Ok(report)
 }
 
@@ -274,6 +469,283 @@ async fn ensure_target_safe(db: &DatabaseConnection, allow_non_empty: bool) -> R
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct TargetCounts {
+    policies: u64,
+    policy_groups: u64,
+    users: u64,
+    user_profiles: u64,
+    folders: u64,
+    blobs: u64,
+    files: u64,
+    versions: u64,
+    shares: u64,
+    properties: u64,
+    tags: u64,
+    tasks: u64,
+}
+
+impl TargetCounts {
+    async fn load(db: &DatabaseConnection) -> Result<Self> {
+        Ok(Self {
+            policies: ad::storage_policies::Entity::find().count(db).await?,
+            policy_groups: ad::storage_policy_groups::Entity::find().count(db).await?,
+            users: ad::users::Entity::find().count(db).await?,
+            user_profiles: ad::user_profiles::Entity::find().count(db).await?,
+            folders: ad::folders::Entity::find().count(db).await?,
+            blobs: ad::file_blobs::Entity::find().count(db).await?,
+            files: ad::files::Entity::find().count(db).await?,
+            versions: ad::file_versions::Entity::find().count(db).await?,
+            shares: ad::shares::Entity::find().count(db).await?,
+            properties: ad::entity_properties::Entity::find().count(db).await?,
+            tags: ad::tags::Entity::find().count(db).await?,
+            tasks: ad::background_tasks::Entity::find().count(db).await?,
+        })
+    }
+}
+
+fn count_check(name: &str, before: u64, migrated: usize, actual: u64) -> ValidationCheck {
+    let migrated = u64::try_from(migrated).unwrap_or(u64::MAX);
+    let expected = before.saturating_add(migrated);
+    ValidationCheck {
+        name: name.to_string(),
+        passed: actual == expected,
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+        message: (actual != expected)
+            .then(|| format!("expected baseline {before} plus {migrated} migrated records")),
+    }
+}
+
+fn invariant_check(name: &str, expected: usize, actual: usize, message: &str) -> ValidationCheck {
+    ValidationCheck {
+        name: name.to_string(),
+        passed: actual == expected,
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+        message: (actual != expected).then(|| message.to_string()),
+    }
+}
+
+async fn validate_migration_result(
+    db: &DatabaseConnection,
+    before: &TargetCounts,
+    report: &MigrationReport,
+) -> Result<MigrationValidation> {
+    let after = TargetCounts::load(db).await?;
+    let mut checks = vec![
+        count_check(
+            "storage_policies_count",
+            before.policies,
+            report.migrated_policies,
+            after.policies,
+        ),
+        count_check(
+            "storage_policy_groups_count",
+            before.policy_groups,
+            report.migrated_policy_groups,
+            after.policy_groups,
+        ),
+        count_check(
+            "users_count",
+            before.users,
+            report.migrated_users,
+            after.users,
+        ),
+        count_check(
+            "user_profiles_count",
+            before.user_profiles,
+            report.migrated_users,
+            after.user_profiles,
+        ),
+        count_check(
+            "folders_count",
+            before.folders,
+            report.migrated_folders,
+            after.folders,
+        ),
+        count_check(
+            "file_blobs_count",
+            before.blobs,
+            report.migrated_blobs,
+            after.blobs,
+        ),
+        count_check(
+            "files_count",
+            before.files,
+            report.migrated_files,
+            after.files,
+        ),
+        count_check(
+            "file_versions_count",
+            before.versions,
+            report.migrated_versions,
+            after.versions,
+        ),
+        count_check(
+            "shares_count",
+            before.shares,
+            report.migrated_shares,
+            after.shares,
+        ),
+        count_check(
+            "entity_properties_count",
+            before.properties,
+            report.migrated_properties,
+            after.properties,
+        ),
+        count_check("tags_count", before.tags, report.migrated_tags, after.tags),
+        count_check(
+            "background_tasks_count",
+            before.tasks,
+            report.migrated_tasks,
+            after.tasks,
+        ),
+        invariant_check(
+            "policy_mappings_count",
+            report.migrated_policies,
+            report.mappings.policies.len(),
+            "storage policy source-to-target mappings are incomplete",
+        ),
+        invariant_check(
+            "policy_group_mappings_count",
+            report.migrated_policy_groups,
+            report.mappings.policy_groups.len(),
+            "policy group source-to-target mappings are incomplete",
+        ),
+        invariant_check(
+            "user_mappings_count",
+            report.migrated_users,
+            report.mappings.users.len(),
+            "user source-to-target mappings are incomplete",
+        ),
+        invariant_check(
+            "folder_mappings_count",
+            report.migrated_folders,
+            report.mappings.folders.len(),
+            "folder source-to-target mappings are incomplete",
+        ),
+        invariant_check(
+            "blob_mappings_count",
+            report.migrated_blobs,
+            report.mappings.blobs.len(),
+            "blob source-to-target mappings are incomplete",
+        ),
+        invariant_check(
+            "file_mappings_count",
+            report.migrated_files,
+            report.mappings.files.len(),
+            "file source-to-target mappings are incomplete",
+        ),
+        invariant_check(
+            "share_mappings_count",
+            report.migrated_shares,
+            report.mappings.shares.len(),
+            "share source-to-target mappings are incomplete",
+        ),
+        invariant_check(
+            "task_mappings_count",
+            report.migrated_tasks,
+            report.mappings.tasks.len(),
+            "task source-to-target mappings are incomplete",
+        ),
+    ];
+
+    let task_ids = report
+        .mappings
+        .tasks
+        .iter()
+        .map(|mapping| mapping.target_id)
+        .collect::<Vec<_>>();
+    let mut imported_tasks = Vec::new();
+    for chunk in task_ids.chunks(500) {
+        imported_tasks.extend(
+            ad::background_tasks::Entity::find()
+                .filter(ad::background_tasks::Column::Id.is_in(chunk.iter().copied()))
+                .all(db)
+                .await?,
+        );
+    }
+    checks.push(invariant_check(
+        "imported_tasks_exist",
+        task_ids.len(),
+        imported_tasks.len(),
+        "one or more imported task IDs are missing",
+    ));
+    let terminal_tasks = imported_tasks
+        .iter()
+        .filter(|task| {
+            matches!(task.status.as_str(), "succeeded" | "failed" | "canceled")
+                && task.lease_expires_at.is_none()
+        })
+        .count();
+    checks.push(invariant_check(
+        "imported_tasks_are_terminal",
+        imported_tasks.len(),
+        terminal_tasks,
+        "imported tasks must be terminal and have no active lease",
+    ));
+
+    let tag_properties = ad::entity_properties::Entity::find()
+        .filter(ad::entity_properties::Column::Namespace.eq("system.tags"))
+        .all(db)
+        .await?;
+    let tag_binding_keys = tag_properties
+        .into_iter()
+        .map(|property| (property.entity_type, property.entity_id, property.name))
+        .collect::<HashSet<_>>();
+    let valid_tag_assignments = report
+        .tag_assignments
+        .iter()
+        .filter(|assignment| {
+            tag_binding_keys.contains(&(
+                assignment.target_entity_type.clone(),
+                assignment.target_entity_id,
+                assignment.target_tag_id.to_string(),
+            ))
+        })
+        .count();
+    checks.push(invariant_check(
+        "tag_assignments_exist",
+        report.tag_assignments.len(),
+        valid_tag_assignments,
+        "one or more system.tags bindings are missing",
+    ));
+
+    let direct_link_properties = ad::entity_properties::Entity::find()
+        .filter(ad::entity_properties::Column::Namespace.eq("cloudreve.direct_links"))
+        .all(db)
+        .await?;
+    let direct_link_values = direct_link_properties
+        .into_iter()
+        .map(|property| ((property.entity_id, property.name), property.value))
+        .collect::<HashMap<_, _>>();
+    let valid_direct_links = report
+        .direct_links
+        .iter()
+        .filter(|link| {
+            direct_link_values
+                .get(&(link.target_file_id, link.source_direct_link_id.to_string()))
+                .and_then(|value| value.as_deref())
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .and_then(|value| value.get("url").and_then(Value::as_str).map(str::to_string))
+                .is_some_and(|url| url == link.url)
+        })
+        .count();
+    checks.push(invariant_check(
+        "direct_link_mappings_exist",
+        report.direct_links.len(),
+        valid_direct_links,
+        "one or more cloudreve.direct_links properties are missing or changed",
+    ));
+
+    Ok(MigrationValidation {
+        performed: true,
+        passed: checks.iter().all(|check| check.passed),
+        checks,
+    })
+}
+
 fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::encode_b64(uuid::Uuid::new_v4().as_bytes())
         .map_err(|error| color_eyre::eyre::eyre!("create password salt: {error}"))?;
@@ -292,6 +764,20 @@ struct MigrationContext {
     folders: HashMap<i64, i64>,
     blobs: HashMap<i64, i64>,
     files: HashMap<i64, i64>,
+    shares: HashMap<i64, i64>,
+    tasks: HashMap<i64, i64>,
+}
+
+fn sorted_id_mappings(values: &HashMap<i64, i64>) -> Vec<IdMapping> {
+    let mut mappings = values
+        .iter()
+        .map(|(source_id, target_id)| IdMapping {
+            source_id: *source_id,
+            target_id: *target_id,
+        })
+        .collect::<Vec<_>>();
+    mappings.sort_by_key(|mapping| mapping.source_id);
+    mappings
 }
 
 struct SourceData {
@@ -711,6 +1197,58 @@ mod tests {
         assert_eq!(archived_task_status("unknown"), "canceled");
     }
 
+    #[test]
+    fn records_skipped_objects_by_type() {
+        let mut report = MigrationReport::default();
+        report.record_skip("file", Some(42), "missing blob");
+        report.record_skip("file", Some(43), "symbolic file");
+        report.record_skip("share", None, "missing target");
+
+        assert_eq!(report.skipped, 3);
+        assert_eq!(report.skipped_by_type.get("file"), Some(&2));
+        assert_eq!(report.skipped_by_type.get("share"), Some(&1));
+        assert_eq!(report.skipped_objects[0].source_id, Some(42));
+        assert_eq!(report.skipped_objects[0].reason, "missing blob");
+    }
+
+    #[test]
+    fn writes_structured_json_report() -> Result<()> {
+        let report_path = std::env::temp_dir().join(format!(
+            "asterdrive-migration-report-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut report = MigrationReport {
+            migrated_users: 1,
+            validation: MigrationValidation {
+                performed: true,
+                passed: true,
+                checks: vec![ValidationCheck {
+                    name: "users_count".to_string(),
+                    passed: true,
+                    expected: "1".to_string(),
+                    actual: "1".to_string(),
+                    message: None,
+                }],
+            },
+            ..Default::default()
+        };
+        report.mappings.users.push(IdMapping {
+            source_id: 7,
+            target_id: 11,
+        });
+
+        write_json_report(&report_path, &report)?;
+        let value: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["migrated_users"], 1);
+        assert_eq!(value["mappings"]["users"][0]["source_id"], 7);
+        assert_eq!(value["mappings"]["users"][0]["target_id"], 11);
+        assert_eq!(value["validation"]["passed"], true);
+
+        let _ = std::fs::remove_file(report_path);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn migrates_minimal_cloudreve_database() -> Result<()> {
         let suffix = uuid::Uuid::new_v4();
@@ -751,6 +1289,19 @@ mod tests {
         assert_eq!(report.migrated_tag_assignments, 1);
         assert_eq!(report.migrated_direct_links, 1);
         assert_eq!(report.migrated_tasks, 2);
+        assert!(report.validation.performed);
+        assert!(report.validation.passed);
+        assert!(report.validation.checks.iter().all(|check| check.passed));
+        assert_eq!(report.mappings.users.len(), 1);
+        assert_eq!(report.mappings.folders.len(), 1);
+        assert_eq!(report.mappings.files.len(), 1);
+        assert_eq!(report.mappings.blobs.len(), 1);
+        assert_eq!(report.mappings.shares.len(), 1);
+        assert_eq!(report.mappings.tasks.len(), 2);
+        assert_eq!(report.direct_links.len(), 1);
+        assert!(report.direct_links[0].url.starts_with("/d/v2."));
+        assert_eq!(report.tag_assignments.len(), 1);
+        assert_eq!(report.tag_assignments[0].target_entity_type, "file");
 
         let target = Database::connect(&target_url).await?;
         assert_eq!(ad::users::Entity::find().count(&target).await?, 1);

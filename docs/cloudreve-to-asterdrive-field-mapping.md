@@ -516,3 +516,20 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | 任务验证 | 所有导入任务均为 `succeeded/failed/canceled`，无 `pending/retry/processing`，`lease_expires_at` 为空 |
 | AD 启动后 | 重新生成媒体元数据、缩略图和搜索索引；检查 storage_used 汇总 |
 | 切换前 | 冻结 Cloudreve 写入，再跑最终迁移或增量校验，备份目标库 |
+
+## 16. JSON 报告字段
+
+通过 `--report-path <path>` 可为 `check` 或 `migrate` 输出 `schema_version=1` 的 JSON 报告。
+
+| 报告字段 | 内容 |
+|---|---|
+| `source_*` | Cloudreve 各类源对象数量 |
+| `migrated_*` | 本次写入 AD 的各类对象数量 |
+| `skipped_by_type` | 按 `file`、`blob`、`share`、`direct_link` 等类型聚合的跳过数量 |
+| `skipped_objects` | 每条跳过记录的对象类型、Cloudreve source ID 和明确原因 |
+| `mappings` | policy、policy group、user、folder、blob、file、share、task 的排序 source ID -> target ID |
+| `tag_assignments` | Cloudreve metadata ID、源 file/folder ID、AD entity ID、AD tag ID 和标签名 |
+| `direct_links` | Cloudreve direct-link/file ID、AD file ID、新 URL、原名称、下载次数和限速 |
+| `validation` | 是否执行/通过，以及每项检查的 expected、actual 和失败信息 |
+
+当前提交后校验覆盖核心表增量数量、导入任务是否全为终态且无 lease、`system.tags` 关联是否存在、`cloudreve.direct_links` 属性中的 URL 是否与报告一致。报告不会保存数据库密码、存储密钥或 Cloudreve task private state，但会包含新 direct-link URL，因此必须限制报告文件访问权限。

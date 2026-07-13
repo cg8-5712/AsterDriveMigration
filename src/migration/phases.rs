@@ -16,7 +16,12 @@ pub(super) async fn migrate_policies(
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         }) else {
-            report.skipped += 1;
+            report.record_skip(
+                "storage_policy",
+                Some(policy.id),
+                unsupported_policy_reason(policy)
+                    .unwrap_or_else(|| "storage policy is not compatible with AD".to_string()),
+            );
             continue;
         };
         let base_path = if policy.r#type == "local" {
@@ -201,7 +206,11 @@ pub(super) async fn migrate_folders(
                 continue;
             }
             let Some(owner_id) = context.users.get(&folder.owner_id).copied() else {
-                report.skipped += 1;
+                report.record_skip(
+                    "folder",
+                    Some(folder.id),
+                    format!("owner user {} was not migrated", folder.owner_id),
+                );
                 continue;
             };
             let target = ad::folders::ActiveModel {
@@ -280,7 +289,14 @@ pub(super) async fn migrate_blobs(
             .get(&entity.storage_policy_entities)
             .copied()
         else {
-            report.skipped += 1;
+            report.record_skip(
+                "blob",
+                Some(entity.id),
+                format!(
+                    "storage policy {} was not migrated",
+                    entity.storage_policy_entities
+                ),
+            );
             continue;
         };
         let reference_count = reference_counts.get(&entity.id).copied().unwrap_or(1);
@@ -328,11 +344,19 @@ pub(super) async fn migrate_files(
 
     for file in files {
         if file.is_symbolic {
-            report.skipped += 1;
+            report.record_skip(
+                "file",
+                Some(file.id),
+                "symbolic/placeholder files are not representable in AD",
+            );
             continue;
         }
         let Some(owner_id) = context.users.get(&file.owner_id).copied() else {
-            report.skipped += 1;
+            report.record_skip(
+                "file",
+                Some(file.id),
+                format!("owner user {} was not migrated", file.owner_id),
+            );
             continue;
         };
         let mut version_entities: Vec<&cr::entities::Model> = associations
@@ -348,7 +372,11 @@ pub(super) async fn migrate_files(
             .filter(|id| context.blobs.contains_key(id))
             .or_else(|| version_entities.last().map(|entity| entity.id));
         let Some(primary_entity_id) = primary_entity_id else {
-            report.skipped += 1;
+            report.record_skip(
+                "file",
+                Some(file.id),
+                "file has no migratable version entity",
+            );
             report
                 .warnings
                 .push(format!("file {} has no migratable version entity", file.id));
@@ -420,7 +448,11 @@ pub(super) async fn migrate_metadata(
     let mut tags: HashMap<(i64, String), i64> = HashMap::new();
     for metadata in &source.metadata {
         let Some(source_file) = source_files.get(&metadata.file_id).copied() else {
-            report.skipped += 1;
+            report.record_skip(
+                "metadata",
+                Some(metadata.id),
+                format!("source file {} does not exist", metadata.file_id),
+            );
             continue;
         };
         let target_entity = if source_file.r#type == 0 {
@@ -437,18 +469,30 @@ pub(super) async fn migrate_metadata(
                 .map(|id| ("folder", id))
         };
         let Some((entity_type, entity_id)) = target_entity else {
-            report.skipped += 1;
+            report.record_skip(
+                "metadata",
+                Some(metadata.id),
+                format!("source entity {} was not migrated", metadata.file_id),
+            );
             continue;
         };
 
         if let Some(source_tag_name) = tag_name(&metadata.name) {
             let Some(owner_user_id) = context.users.get(&source_file.owner_id).copied() else {
-                report.skipped += 1;
+                report.record_skip(
+                    "tag_assignment",
+                    Some(metadata.id),
+                    format!("owner user {} was not migrated", source_file.owner_id),
+                );
                 continue;
             };
             let name = target_tag_name(source_tag_name);
             if name.is_empty() {
-                report.skipped += 1;
+                report.record_skip(
+                    "tag_assignment",
+                    Some(metadata.id),
+                    "tag name is empty after normalization",
+                );
                 continue;
             }
             let normalized_name = normalize_tag_name(&name);
@@ -488,6 +532,14 @@ pub(super) async fn migrate_metadata(
             .wrap_err_with(|| format!("attach migrated tag for metadata {}", metadata.id))?;
             report.migrated_properties += 1;
             report.migrated_tag_assignments += 1;
+            report.tag_assignments.push(TagAssignmentReport {
+                source_metadata_id: metadata.id,
+                source_entity_id: metadata.file_id,
+                target_entity_type: entity_type.to_string(),
+                target_entity_id: entity_id,
+                target_tag_id: tag_id,
+                tag_name: source_tag_name.to_string(),
+            });
             continue;
         }
 
@@ -523,7 +575,17 @@ pub(super) async fn migrate_direct_links(
         return Ok(());
     }
     let Some(secret) = direct_link_secret else {
-        report.skipped += source.direct_links.len();
+        for link in &source.direct_links {
+            report.record_skip(
+                "direct_link",
+                Some(link.id),
+                if link.deleted_at.is_some() {
+                    "source direct link is deleted and must not be reactivated"
+                } else {
+                    "AD direct_link_secret was not supplied"
+                },
+            );
+        }
         report.warnings.push(format!(
             "{} Cloudreve direct links were not regenerated because --direct-link-secret was not supplied",
             source.direct_links.len()
@@ -534,19 +596,35 @@ pub(super) async fn migrate_direct_links(
         source.files.iter().map(|file| (file.id, file)).collect();
     for link in &source.direct_links {
         if link.deleted_at.is_some() {
-            report.skipped += 1;
+            report.record_skip(
+                "direct_link",
+                Some(link.id),
+                "source direct link is deleted and must not be reactivated",
+            );
             continue;
         }
         let Some(source_file) = source_files.get(&link.file_id).copied() else {
-            report.skipped += 1;
+            report.record_skip(
+                "direct_link",
+                Some(link.id),
+                format!("source file {} does not exist", link.file_id),
+            );
             continue;
         };
         let Some(file_id) = context.files.get(&link.file_id).copied() else {
-            report.skipped += 1;
+            report.record_skip(
+                "direct_link",
+                Some(link.id),
+                format!("source file {} was not migrated", link.file_id),
+            );
             continue;
         };
         let Some(owner_user_id) = context.users.get(&source_file.owner_id).copied() else {
-            report.skipped += 1;
+            report.record_skip(
+                "direct_link",
+                Some(link.id),
+                format!("owner user {} was not migrated", source_file.owner_id),
+            );
             continue;
         };
         let url = direct_link_url(file_id, owner_user_id, &source_file.name, secret)?;
@@ -557,7 +635,7 @@ pub(super) async fn migrate_direct_links(
             name: Set(link.id.to_string()),
             value: Set(Some(
                 json!({
-                    "url": url,
+                    "url": url.clone(),
                     "source_direct_link_id": link.id,
                     "source_file_id": link.file_id,
                     "source_name": link.name,
@@ -573,6 +651,15 @@ pub(super) async fn migrate_direct_links(
         .wrap_err_with(|| format!("archive direct link {} mapping", link.id))?;
         report.migrated_properties += 1;
         report.migrated_direct_links += 1;
+        report.direct_links.push(DirectLinkReport {
+            source_direct_link_id: link.id,
+            source_file_id: link.file_id,
+            target_file_id: file_id,
+            source_name: link.name.clone(),
+            source_downloads: link.downloads,
+            source_speed_limit: link.speed,
+            url,
+        });
     }
     Ok(())
 }
@@ -580,7 +667,7 @@ pub(super) async fn migrate_direct_links(
 pub(super) async fn migrate_tasks(
     transaction: &DatabaseTransaction,
     source: &SourceData,
-    context: &MigrationContext,
+    context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
     let active_count = source
@@ -624,7 +711,7 @@ pub(super) async fn migrate_tasks(
             .updated_at
             .checked_add_signed(chrono::Duration::days(36_500))
             .unwrap_or(task.updated_at);
-        ad::background_tasks::ActiveModel {
+        let target = ad::background_tasks::ActiveModel {
             kind: Set("system_runtime".to_string()),
             status: Set(status.to_string()),
             creator_user_id: Set(task
@@ -664,6 +751,7 @@ pub(super) async fn migrate_tasks(
         .insert(transaction)
         .await
         .wrap_err_with(|| format!("archive Cloudreve task {}", task.id))?;
+        context.tasks.insert(task.id, target.id);
         report.migrated_tasks += 1;
     }
     Ok(())
@@ -672,22 +760,26 @@ pub(super) async fn migrate_tasks(
 pub(super) async fn migrate_shares(
     transaction: &DatabaseTransaction,
     source: &SourceData,
-    context: &MigrationContext,
+    context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
     let source_files: HashMap<i64, &cr::files::Model> =
         source.files.iter().map(|file| (file.id, file)).collect();
     for share in &source.shares {
         let Some(source_user_id) = share.user_shares else {
-            report.skipped += 1;
+            report.record_skip("share", Some(share.id), "share has no owner user");
             continue;
         };
         let Some(user_id) = context.users.get(&source_user_id).copied() else {
-            report.skipped += 1;
+            report.record_skip(
+                "share",
+                Some(share.id),
+                format!("owner user {source_user_id} was not migrated"),
+            );
             continue;
         };
         let Some(source_file_id) = share.file_shares else {
-            report.skipped += 1;
+            report.record_skip("share", Some(share.id), "share has no file/folder target");
             continue;
         };
         let source_file = source_files.get(&source_file_id).copied();
@@ -698,7 +790,11 @@ pub(super) async fn migrate_shares(
             .filter(|file| file.r#type == 1)
             .and_then(|_| context.folders.get(&source_file_id).copied());
         if file_id.is_none() && folder_id.is_none() {
-            report.skipped += 1;
+            report.record_skip(
+                "share",
+                Some(share.id),
+                format!("source target {source_file_id} was not migrated"),
+            );
             continue;
         }
         let password = match share.password.as_deref().filter(|value| !value.is_empty()) {
@@ -709,7 +805,7 @@ pub(super) async fn migrate_shares(
             .remain_downloads
             .map(|remaining| share.downloads.saturating_add(remaining))
             .unwrap_or(0);
-        ad::shares::ActiveModel {
+        let target = ad::shares::ActiveModel {
             token: Set(share_token(share.id)),
             user_id: Set(user_id),
             team_id: Set(None),
@@ -727,6 +823,7 @@ pub(super) async fn migrate_shares(
         .insert(transaction)
         .await
         .wrap_err_with(|| format!("migrate share {}", share.id))?;
+        context.shares.insert(share.id, target.id);
         report.migrated_shares += 1;
     }
     Ok(())
