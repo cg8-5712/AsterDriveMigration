@@ -51,6 +51,8 @@ struct MigrateArgs {
     run_id: Option<String>,
     #[arg(long, requires = "run_id")]
     resume: bool,
+    #[arg(long, default_value_t = 500, value_name = "COUNT")]
+    blob_batch_size: usize,
 }
 
 #[tokio::main]
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
                 dry_run: args.dry_run,
                 run_id: args.run_id,
                 resume: args.resume,
+                blob_batch_size: args.blob_batch_size,
             })
             .await?;
             emit_report(report_path.as_deref(), &report)?;

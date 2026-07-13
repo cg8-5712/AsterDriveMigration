@@ -60,9 +60,9 @@ Use `--dry-run` to perform preflight checks without writing the target. The targ
 
 Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files.
 
-## Limited stage resume
+## Limited resume
 
-Migration stages are committed independently in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. The target database stores the run state in `aster_external_migration_runs`. Each stage writes its target records and advances the checkpoint in the same database transaction.
+Migration stages run in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. Most stages are committed as one transaction. The blobs stage uses keyset pages ordered by Cloudreve `entities.id`; each page writes AD `file_blobs`, object mappings, its cursor and report progress in one target transaction.
 
 Use a stable run ID for an operational migration. If a stage fails, fix the external cause and rerun the same command with `--resume`:
 
@@ -72,13 +72,16 @@ cargo run -- migrate `
   --target-url "sqlite://C:/asterdrive/asterdrive.db" `
   --local-base-path "C:/cloudreve" `
   --run-id "cloudreve-cutover-2026-07-13" `
+  --blob-batch-size 500 `
   --resume `
   --report-path "C:/migration/cloudreve-to-ad.json"
 ```
 
-Resume verifies the source URL/count fingerprint, target URL fingerprint and migration-plan fingerprint. Repeat the same password, direct-link secret and migration flags used by the original run. Completed stages are skipped and their source-to-target mappings are restored from the checkpoint.
+Resume verifies the source URL/count fingerprint, target URL fingerprint and migration-plan fingerprint. Repeat the same password, direct-link secret and migration flags used by the original run. Completed stages are skipped and their source-to-target mappings are restored from the checkpoint. Blob batch size is operational only and may be adjusted when resuming.
 
-This is stage-level resume only. A failed stage rolls back and restarts from the beginning of that stage; there is no page/batch cursor inside a large files or blobs stage yet. The source inventory is still loaded into memory, so very large installations still need the future paginated runner.
+`--blob-batch-size` defaults to 500 and accepts 1-10000. A failed blob page rolls back only that page; resume continues after the last committed entity ID. Blob source rows are no longer loaded into memory as one complete collection, and blob mappings are stored row-by-row in `aster_external_migration_object_map`.
+
+Other stages, including files, are still stage-level only: a failure restarts that entire stage. The files stage currently loads entity/version relationships into memory, and physical object bytes are still reused in place rather than copied or uploaded.
 
 ## JSON migration report
 

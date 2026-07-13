@@ -4,6 +4,45 @@ use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Schema, Set, Uncha
 
 use super::{MigrationContext, MigrationReport, TargetCounts};
 
+pub(super) mod stage_cursor {
+    use sea_orm::entity::prelude::*;
+
+    #[sea_orm::model]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "aster_external_migration_stage_cursors")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub run_id: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub stage: String,
+        pub cursor_value: i64,
+        pub processed_count: i64,
+        pub updated_at: DateTimeWithTimeZone,
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub(super) mod object_map {
+    use sea_orm::entity::prelude::*;
+
+    #[sea_orm::model]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "aster_external_migration_object_map")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub run_id: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub object_type: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub source_id: i64,
+        pub target_id: i64,
+        pub created_at: DateTimeWithTimeZone,
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 #[sea_orm::model]
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "aster_external_migration_runs")]
@@ -54,7 +93,102 @@ pub(super) async fn ensure_table<C: ConnectionTrait>(db: &C) -> Result<()> {
     db.execute(&statement)
         .await
         .wrap_err("create external migration checkpoint table")?;
+    let mut statement = schema.create_table_from_entity(stage_cursor::Entity);
+    statement.if_not_exists();
+    db.execute(&statement)
+        .await
+        .wrap_err("create external migration stage cursor table")?;
+    let mut statement = schema.create_table_from_entity(object_map::Entity);
+    statement.if_not_exists();
+    db.execute(&statement)
+        .await
+        .wrap_err("create external migration object map table")?;
     Ok(())
+}
+
+pub(super) async fn load_stage_cursor<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    stage: &str,
+) -> Result<Option<stage_cursor::Model>> {
+    Ok(
+        stage_cursor::Entity::find_by_id((run_id.to_string(), stage.to_string()))
+            .one(db)
+            .await?,
+    )
+}
+
+pub(super) async fn save_stage_cursor<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    stage: &str,
+    cursor_value: i64,
+    processed_count: i64,
+) -> Result<()> {
+    use sea_orm::sea_query::OnConflict;
+
+    stage_cursor::Entity::insert(stage_cursor::ActiveModel {
+        run_id: Set(run_id.to_string()),
+        stage: Set(stage.to_string()),
+        cursor_value: Set(cursor_value),
+        processed_count: Set(processed_count),
+        updated_at: Set(chrono::Utc::now().fixed_offset()),
+    })
+    .on_conflict(
+        OnConflict::columns([stage_cursor::Column::RunId, stage_cursor::Column::Stage])
+            .update_columns([
+                stage_cursor::Column::CursorValue,
+                stage_cursor::Column::ProcessedCount,
+                stage_cursor::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec(db)
+    .await
+    .wrap_err_with(|| format!("save migration run {run_id} stage {stage} cursor"))?;
+    Ok(())
+}
+
+pub(super) async fn save_object_mappings<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    object_type: &str,
+    mappings: &[(i64, i64)],
+) -> Result<()> {
+    if mappings.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().fixed_offset();
+    object_map::Entity::insert_many(mappings.iter().map(|(source_id, target_id)| {
+        object_map::ActiveModel {
+            run_id: Set(run_id.to_string()),
+            object_type: Set(object_type.to_string()),
+            source_id: Set(*source_id),
+            target_id: Set(*target_id),
+            created_at: Set(now),
+        }
+    }))
+    .exec(db)
+    .await
+    .wrap_err_with(|| format!("save migration run {run_id} {object_type} mappings"))?;
+    Ok(())
+}
+
+pub(super) async fn load_object_mappings<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    object_type: &str,
+) -> Result<std::collections::HashMap<i64, i64>> {
+    use sea_orm::{ColumnTrait, QueryFilter};
+
+    Ok(object_map::Entity::find()
+        .filter(object_map::Column::RunId.eq(run_id))
+        .filter(object_map::Column::ObjectType.eq(object_type))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|mapping| (mapping.source_id, mapping.target_id))
+        .collect())
 }
 
 pub(super) async fn create<C: ConnectionTrait>(
@@ -150,6 +284,27 @@ pub(super) async fn save_stage<C: ConnectionTrait>(
     .update(db)
     .await
     .wrap_err_with(|| format!("save migration run {run_id} stage {stage}"))?;
+    Ok(())
+}
+
+pub(super) async fn save_progress<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    context: &MigrationContext,
+    report: &MigrationReport,
+) -> Result<()> {
+    ActiveModel {
+        id: Unchanged(run_id.to_string()),
+        status: Set("running".to_string()),
+        context_json: Set(serde_json::to_value(context).wrap_err("serialize migration context")?),
+        report_json: Set(serde_json::to_value(report).wrap_err("serialize migration report")?),
+        last_error: Set(None),
+        updated_at: Set(chrono::Utc::now().fixed_offset()),
+        ..Default::default()
+    }
+    .update(db)
+    .await
+    .wrap_err_with(|| format!("save migration run {run_id} progress"))?;
     Ok(())
 }
 

@@ -543,15 +543,15 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 
 | 行为 | 当前实现 |
 |---|---|
-| checkpoint 粒度 | stage 级 |
-| 原子性 | stage 的目标记录、context、report 和 last completed stage 在同一事务提交 |
+| checkpoint 粒度 | blobs 为 batch 级；其他 stage 为 stage 级 |
+| 原子性 | blob page 的目标记录、object mapping、cursor 和 report 同事务；其他 stage 的目标记录、context、report 和 last completed stage 同事务 |
 | 已完成 stage | resume 时跳过，不重复插入 |
 | 失败 stage | 整个 stage 回滚，resume 时从该 stage 开头重新执行 |
-| ID mapping | 序列化保存在 run 的 `context_json` |
+| ID mapping | blob 映射逐行保存在 `aster_external_migration_object_map`；其他映射仍在 `context_json` |
 | 初始目标计数 | 保存在 `baseline_json`，恢复完成后仍可执行正确的增量数量校验 |
 | 源校验 | URL 摘要 + 源表数量指纹 |
 | 计划校验 | local path、迁移 flags、临时密码摘要和 direct-link secret 摘要 |
-| stage 内分页 cursor | 尚未实现 |
+| stage 内分页 cursor | blobs 已使用 `entities.id` keyset cursor；其他 stage 尚未实现 |
 | 对象上传断点 | 尚未实现 |
 
-由于源指纹不能检测数量不变的内容修改，断点恢复期间仍必须冻结 Cloudreve 写入。对于单个 stage 内拥有大量文件或 blob 的实例，当前恢复会从该 stage 起点重跑；后续需要增加 page cursor 和独立 object mapping 表。
+由于源指纹不能检测数量不变的内容修改，断点恢复期间仍必须冻结 Cloudreve 写入。blobs 可从最后提交的 entity ID 继续，批大小由 `--blob-batch-size` 控制，默认 500；files 等其他 stage 仍会从 stage 起点重跑。对象字节复制/上传仍未实现，因此也没有对象存储分片上传续传。
