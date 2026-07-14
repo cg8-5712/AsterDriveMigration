@@ -551,34 +551,34 @@ checkpoint 表保存在 AD 数据库中，以便迁移进程重启后恢复。�
 | `created_at` | DateTime | 创建时间 |
 | `updated_at` | DateTime | 最后更新时间 |
 
-当前阶段顺序为 policies、policy_groups、users、folders、blobs、files、metadata、shares、direct_links、tasks。除 blobs 外，每个阶段使用独立目标事务；目标数据和 `last_completed_stage/context_json/report_json` 在同一事务中提交。blobs 按 Cloudreve `entities.id` keyset 分页，每页独立事务提交目标 blob、逐行 mapping、cursor 和报告进度。
+当前阶段顺序为 policies、policy_groups、users、folders、blobs、files、metadata、shares、direct_links、tasks。除 blobs/files 外，每个阶段使用独立目标事务；目标数据和 `last_completed_stage/context_json/report_json` 在同一事务中提交。blobs 按 Cloudreve `entities.id`、files 按 Cloudreve `files.id` keyset 分页；每页独立事务提交目标记录、逐行 mapping、cursor 和报告进度。
 
 当前 source fingerprint 使用数据库 URL 摘要和各源表记录数量，只能防止明显连错源或数量变化，不能检测“数量不变但内容变化”。生产迁移仍应冻结 Cloudreve 写入。
 
 #### `aster_external_migration_stage_cursors`
 
-已用于 blobs；其他 stage 尚未接入。
+已用于 blobs 和 files；其他 stage 尚未接入。
 
 | 字段 | 当前类型 | 说明 |
 |---|---|---|
 | `run_id` | String PK | 所属 run |
-| `stage` | String PK | 当前为 `blobs` |
-| `cursor_value` | BigInt | 最后提交的 Cloudreve entity ID |
-| `processed_count` | BigInt | 已扫描并提交的 blob entity 数量，包含明确跳过项 |
+| `stage` | String PK | 当前为 `blobs` 或 `files` |
+| `cursor_value` | BigInt | 最后提交的 Cloudreve entity ID 或 file ID |
+| `processed_count` | BigInt | 已扫描并提交的 blob entity 或 file 数量，包含明确跳过项 |
 | `updated_at` | DateTime | checkpoint 时间 |
 
 建议 `(run_id, stage)` 为联合主键或唯一键。
 
 #### `aster_external_migration_object_map`
 
-已用于 blob 映射；其他对象类型仍使用 run `context_json` 中的 HashMap。
+已用于 blob 和 file 映射；其他对象类型仍使用 run `context_json` 中的 HashMap。
 
 | 字段 | 当前类型 | 说明 |
 |---|---|---|
 | `run_id` | String PK | 所属 run |
-| `object_type` | String PK | 当前为 `blob` |
-| `source_id` | BigInt PK | Cloudreve entity ID |
-| `target_id` | BigInt | AD file_blob ID |
+| `object_type` | String PK | 当前为 `blob` 或 `file` |
+| `source_id` | BigInt PK | Cloudreve entity ID 或 file ID |
+| `target_id` | BigInt | AD file_blob 或 file ID |
 | `created_at` | DateTime | 映射创建时间 |
 | `state` | String | created/reused/skipped/renamed/failed |
 | `created_at` | DateTime | 创建时间 |
@@ -757,9 +757,9 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | Cloudreve v4 标签 | 已从 `tag:*` metadata 生成 AD `tags` 和 `system.tags` 文件/目录关联 | 增加跨批次持久化去重和冲突报告 |
 | Direct links | 提供 AD `direct_link_secret` 时生成 v2 URL，并以 `cloudreve.direct_links` property 保存源 ID 映射 | 增加独立 JSON/CSV 报告和可选旧 URL 重定向层 |
 | Cloudreve 任务 | 已全部写成 AD `system_runtime` 终态历史；活动任务归档为 canceled | 后续可增加独立 legacy task archive 表，避免占用运维任务列表 |
-| 目标事务 | blobs 已按 page 提交；其他 stage 独立事务 | files 等 stage 继续分页，增加对象上传事务补偿 |
-| ID mapping | blob 使用独立 object mapping 表；其他映射仍在 `context_json` | 将 files/folders 等映射也迁入独立表 |
-| 断点续传 | blobs 已支持 entity ID cursor；其他 stage 为阶段级恢复 | files cursor、对象存储上传恢复和并行 worker checkpoint |
+| 目标事务 | blobs/files 已按 page 提交；其他 stage 独立事务 | folders、metadata、shares 等 stage 继续分页，增加对象上传事务补偿 |
+| ID mapping | blob/file 使用独立 object mapping 表；其他映射仍在 `context_json` | 将 folders、shares 等映射也迁入独立表 |
+| 断点续传 | blobs/files 已支持 source ID cursor；其他 stage 为阶段级恢复 | folders 等 cursor、对象存储上传恢复和并行 worker checkpoint |
 | 幂等重复运行 | 同一 run 会跳过已完成 stage；失败 stage 因事务回滚可安全重跑 | 不依赖 run checkpoint 的对象级 upsert/reuse 和完整重复运行 |
 | 冲突策略 | 仅 username 自动后缀，其他冲突依赖 DB 报错 | fail/rename/skip/reuse/update 可配置 |
 | 物理对象复制 | 未实现，当前复用源 storage path | 流式 copy、SHA-256、目标路径和校验 |

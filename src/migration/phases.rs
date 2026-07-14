@@ -184,7 +184,7 @@ pub(super) async fn migrate_folders(
     report: &mut MigrationReport,
 ) -> Result<()> {
     let mut pending: Vec<&cr::files::Model> = source
-        .files
+        .folders
         .iter()
         .filter(|file| file.r#type == 1)
         .collect();
@@ -197,7 +197,7 @@ pub(super) async fn migrate_folders(
             let parent = folder.file_children;
             if parent.is_some_and(|parent_id| {
                 source
-                    .files
+                    .folders
                     .iter()
                     .any(|file| file.id == parent_id && file.r#type == 1)
                     && !context.folders.contains_key(&parent_id)
@@ -297,33 +297,16 @@ pub(super) async fn migrate_blob_batch(
     Ok(mappings)
 }
 
-pub(super) async fn migrate_files(
+pub(super) async fn migrate_file_batch(
     transaction: &DatabaseTransaction,
-    source_db: &DatabaseConnection,
-    source: &SourceData,
+    files: &[cr::files::Model],
+    associations: &HashMap<i64, Vec<i64>>,
+    entities: &HashMap<i64, cr::entities::Model>,
     blob_mappings: &HashMap<i64, i64>,
-    context: &mut MigrationContext,
+    context: &MigrationContext,
     report: &mut MigrationReport,
-) -> Result<()> {
-    let entity_query = if source.include_deleted {
-        cr::entities::Entity::find()
-    } else {
-        cr::entities::Entity::find().filter(cr::entities::Column::DeletedAt.is_null())
-    };
-    let source_entities = entity_query.all(source_db).await?;
-    let source_file_entities = cr::file_entities::Entity::find().all(source_db).await?;
-    let associations = associations(&source.files, &source_file_entities);
-    let entities: HashMap<i64, &cr::entities::Model> = source_entities
-        .iter()
-        .map(|entity| (entity.id, entity))
-        .collect();
-    let mut files: Vec<&cr::files::Model> = source
-        .files
-        .iter()
-        .filter(|file| file.r#type == 0)
-        .collect();
-    files.sort_by_key(|file| file.id);
-
+) -> Result<Vec<(i64, i64)>> {
+    let mut mappings = Vec::with_capacity(files.len());
     for file in files {
         if file.is_symbolic {
             report.record_skip(
@@ -345,7 +328,7 @@ pub(super) async fn migrate_files(
             .get(&file.id)
             .into_iter()
             .flatten()
-            .filter_map(|entity_id| entities.get(entity_id).copied())
+            .filter_map(|entity_id| entities.get(entity_id))
             .filter(|entity| entity.r#type == 0 && blob_mappings.contains_key(&entity.id))
             .collect();
         version_entities.sort_by_key(|entity| entity.created_at);
@@ -394,7 +377,7 @@ pub(super) async fn migrate_files(
         .insert(transaction)
         .await
         .wrap_err_with(|| format!("migrate Cloudreve file {}", file.id))?;
-        context.files.insert(file.id, target.id);
+        mappings.push((file.id, target.id));
         report.migrated_files += 1;
 
         let historical: Vec<&cr::entities::Model> = version_entities
@@ -416,20 +399,26 @@ pub(super) async fn migrate_files(
             report.migrated_versions += 1;
         }
     }
-    Ok(())
+    Ok(mappings)
 }
 
 pub(super) async fn migrate_metadata(
     transaction: &DatabaseTransaction,
+    source_db: &DatabaseConnection,
     source: &SourceData,
+    file_mappings: &HashMap<i64, i64>,
     context: &MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
-    let source_files: HashMap<i64, &cr::files::Model> =
-        source.files.iter().map(|file| (file.id, file)).collect();
+    let source_file_ids = source
+        .metadata
+        .iter()
+        .map(|metadata| metadata.file_id)
+        .collect::<Vec<_>>();
+    let source_files = load_source_files(source_db, &source_file_ids).await?;
     let mut tags: HashMap<(i64, String), i64> = HashMap::new();
     for metadata in &source.metadata {
-        let Some(source_file) = source_files.get(&metadata.file_id).copied() else {
+        let Some(source_file) = source_files.get(&metadata.file_id) else {
             report.record_skip(
                 "metadata",
                 Some(metadata.id),
@@ -438,8 +427,7 @@ pub(super) async fn migrate_metadata(
             continue;
         };
         let target_entity = if source_file.r#type == 0 {
-            context
-                .files
+            file_mappings
                 .get(&metadata.file_id)
                 .copied()
                 .map(|id| ("file", id))
@@ -548,7 +536,9 @@ pub(super) async fn migrate_metadata(
 
 pub(super) async fn migrate_direct_links(
     transaction: &DatabaseTransaction,
+    source_db: &DatabaseConnection,
     source: &SourceData,
+    file_mappings: &HashMap<i64, i64>,
     context: &MigrationContext,
     direct_link_secret: Option<&str>,
     report: &mut MigrationReport,
@@ -574,8 +564,12 @@ pub(super) async fn migrate_direct_links(
         ));
         return Ok(());
     };
-    let source_files: HashMap<i64, &cr::files::Model> =
-        source.files.iter().map(|file| (file.id, file)).collect();
+    let source_file_ids = source
+        .direct_links
+        .iter()
+        .map(|link| link.file_id)
+        .collect::<Vec<_>>();
+    let source_files = load_source_files(source_db, &source_file_ids).await?;
     for link in &source.direct_links {
         if link.deleted_at.is_some() {
             report.record_skip(
@@ -585,7 +579,7 @@ pub(super) async fn migrate_direct_links(
             );
             continue;
         }
-        let Some(source_file) = source_files.get(&link.file_id).copied() else {
+        let Some(source_file) = source_files.get(&link.file_id) else {
             report.record_skip(
                 "direct_link",
                 Some(link.id),
@@ -593,7 +587,7 @@ pub(super) async fn migrate_direct_links(
             );
             continue;
         };
-        let Some(file_id) = context.files.get(&link.file_id).copied() else {
+        let Some(file_id) = file_mappings.get(&link.file_id).copied() else {
             report.record_skip(
                 "direct_link",
                 Some(link.id),
@@ -741,12 +735,18 @@ pub(super) async fn migrate_tasks(
 
 pub(super) async fn migrate_shares(
     transaction: &DatabaseTransaction,
+    source_db: &DatabaseConnection,
     source: &SourceData,
+    file_mappings: &HashMap<i64, i64>,
     context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
-    let source_files: HashMap<i64, &cr::files::Model> =
-        source.files.iter().map(|file| (file.id, file)).collect();
+    let source_file_ids = source
+        .shares
+        .iter()
+        .filter_map(|share| share.file_shares)
+        .collect::<Vec<_>>();
+    let source_files = load_source_files(source_db, &source_file_ids).await?;
     for share in &source.shares {
         let Some(source_user_id) = share.user_shares else {
             report.record_skip("share", Some(share.id), "share has no owner user");
@@ -764,10 +764,10 @@ pub(super) async fn migrate_shares(
             report.record_skip("share", Some(share.id), "share has no file/folder target");
             continue;
         };
-        let source_file = source_files.get(&source_file_id).copied();
+        let source_file = source_files.get(&source_file_id);
         let file_id = source_file
             .filter(|file| file.r#type == 0)
-            .and_then(|_| context.files.get(&source_file_id).copied());
+            .and_then(|_| file_mappings.get(&source_file_id).copied());
         let folder_id = source_file
             .filter(|file| file.r#type == 1)
             .and_then(|_| context.folders.get(&source_file_id).copied());
@@ -811,7 +811,28 @@ pub(super) async fn migrate_shares(
     Ok(())
 }
 
-fn associations(
+pub(super) async fn load_source_files(
+    source_db: &DatabaseConnection,
+    source_ids: &[i64],
+) -> Result<HashMap<i64, cr::files::Model>> {
+    const QUERY_ID_BATCH_SIZE: usize = 500;
+
+    let source_ids = source_ids.iter().copied().collect::<HashSet<_>>();
+    let mut files = HashMap::with_capacity(source_ids.len());
+    let source_ids = source_ids.into_iter().collect::<Vec<_>>();
+    for source_ids in source_ids.chunks(QUERY_ID_BATCH_SIZE) {
+        for file in cr::files::Entity::find()
+            .filter(cr::files::Column::Id.is_in(source_ids.iter().copied()))
+            .all(source_db)
+            .await?
+        {
+            files.insert(file.id, file);
+        }
+    }
+    Ok(files)
+}
+
+pub(super) fn associations(
     files: &[cr::files::Model],
     file_entities: &[cr::file_entities::Model],
 ) -> HashMap<i64, Vec<i64>> {

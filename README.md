@@ -62,7 +62,7 @@ Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies can
 
 ## Limited resume
 
-Migration stages run in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. Most stages are committed as one transaction. The blobs stage uses keyset pages ordered by Cloudreve `entities.id`; each page writes AD `file_blobs`, object mappings, its cursor and report progress in one target transaction.
+Migration stages run in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. Most stages are committed as one transaction. Blobs use keyset pages ordered by Cloudreve `entities.id`, while files use keyset pages ordered by Cloudreve `files.id`; each page writes target records, object mappings, its cursor and report progress in one target transaction.
 
 Use a stable run ID for an operational migration. If a stage fails, fix the external cause and rerun the same command with `--resume`:
 
@@ -73,15 +73,16 @@ cargo run -- migrate `
   --local-base-path "C:/cloudreve" `
   --run-id "cloudreve-cutover-2026-07-13" `
   --blob-batch-size 500 `
+  --file-batch-size 500 `
   --resume `
   --report-path "C:/migration/cloudreve-to-ad.json"
 ```
 
 Resume verifies the source URL/count fingerprint, target URL fingerprint and migration-plan fingerprint. Repeat the same password, direct-link secret and migration flags used by the original run. Completed stages are skipped and their source-to-target mappings are restored from the checkpoint. Blob batch size is operational only and may be adjusted when resuming.
 
-`--blob-batch-size` defaults to 500 and accepts 1-10000. A failed blob page rolls back only that page; resume continues after the last committed entity ID. Blob source rows are no longer loaded into memory as one complete collection, and blob mappings are stored row-by-row in `aster_external_migration_object_map`.
+`--blob-batch-size` and `--file-batch-size` default to 500 and accept 1-10000. A failed blob or file page rolls back only that page; resume continues after the last committed entity or file ID. Blob and normal-file source rows are no longer loaded into memory as complete collections, and their mappings are stored row-by-row in `aster_external_migration_object_map`.
 
-Other stages, including files, are still stage-level only: a failure restarts that entire stage. The files stage currently loads entity/version relationships into memory, and physical object bytes are still reused in place rather than copied or uploaded.
+Folders, metadata, shares, direct links and tasks are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. Physical object bytes are still reused in place rather than copied or uploaded.
 
 ## JSON migration report
 

@@ -32,6 +32,7 @@ pub struct MigrationOptions {
     pub run_id: Option<String>,
     pub resume: bool,
     pub blob_batch_size: usize,
+    pub file_batch_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,14 +211,19 @@ impl MigrationReport {
         });
     }
 
-    fn set_mappings(&mut self, context: &MigrationContext, blobs: &HashMap<i64, i64>) {
+    fn set_mappings(
+        &mut self,
+        context: &MigrationContext,
+        blobs: &HashMap<i64, i64>,
+        files: &HashMap<i64, i64>,
+    ) {
         self.mappings = MigrationMappings {
             policies: sorted_id_mappings(&context.policies),
             policy_groups: sorted_id_mappings(&context.policy_groups),
             users: sorted_id_mappings(&context.users),
             folders: sorted_id_mappings(&context.folders),
             blobs: sorted_id_mappings(blobs),
-            files: sorted_id_mappings(&context.files),
+            files: sorted_id_mappings(files),
             shares: sorted_id_mappings(&context.shares),
             tasks: sorted_id_mappings(&context.tasks),
         };
@@ -422,6 +428,9 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     if !(1..=10_000).contains(&options.blob_batch_size) {
         bail!("--blob-batch-size must be between 1 and 10000");
     }
+    if !(1..=10_000).contains(&options.file_batch_size) {
+        bail!("--file-batch-size must be between 1 and 10000");
+    }
 
     let source = connect(&options.source_url, "Cloudreve").await?;
     let target = connect(&options.target_url, "AsterDrive").await?;
@@ -513,6 +522,24 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
             report.migrated_blobs
         );
     }
+    let mut file_mappings = checkpoint::load_object_mappings(&target, &run_id, "file").await?;
+    if file_mappings.is_empty() && !context.files.is_empty() {
+        let legacy_mappings = context
+            .files
+            .iter()
+            .map(|(source_id, target_id)| (*source_id, *target_id))
+            .collect::<Vec<_>>();
+        checkpoint::save_object_mappings(&target, &run_id, "file", &legacy_mappings).await?;
+        file_mappings.extend(legacy_mappings);
+        context.files.clear();
+    }
+    if report.migrated_files != file_mappings.len() {
+        bail!(
+            "migration run {run_id} file mapping count {} does not match migrated file count {}; restore the checkpoint tables before resuming",
+            file_mappings.len(),
+            report.migrated_files
+        );
+    }
 
     let password_hash = hash_password(&options.default_password)?;
 
@@ -528,9 +555,34 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
                 source_data: &source_data,
                 options: &options,
                 context: &context,
+                file_mappings: &file_mappings,
             };
             if let Err(error) =
                 migrate_blobs_batched(&inputs, &mut blob_mappings, &mut report).await
+            {
+                let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+                return Err(error).wrap_err_with(|| {
+                    format!(
+                        "migration run {run_id} failed at stage {}; rerun with --resume --run-id {run_id}",
+                        stage.as_str()
+                    )
+                });
+            }
+            last_completed_stage = Some(stage.as_str().to_string());
+            continue;
+        }
+        if stage == MigrationStage::Files {
+            let inputs = FileBatchInputs {
+                source: &source,
+                target: &target,
+                run_id: &run_id,
+                source_data: &source_data,
+                options: &options,
+                context: &context,
+                blob_mappings: &blob_mappings,
+            };
+            if let Err(error) =
+                migrate_files_batched(&inputs, &mut file_mappings, &mut report).await
             {
                 let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
                 return Err(error).wrap_err_with(|| {
@@ -553,10 +605,10 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
                 source_data: &source_data,
                 options: &options,
                 password_hash: &password_hash,
-                blob_mappings: &blob_mappings,
+                file_mappings: &file_mappings,
             };
             execute_stage(stage, &transaction, &inputs, &mut context, &mut report).await?;
-            report.set_mappings(&context, &blob_mappings);
+            report.set_mappings(&context, &blob_mappings, &file_mappings);
             if !report
                 .completed_stages
                 .iter()
@@ -589,7 +641,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
         last_completed_stage = Some(stage.as_str().to_string());
     }
 
-    report.set_mappings(&context, &blob_mappings);
+    report.set_mappings(&context, &blob_mappings, &file_mappings);
     report.validation = match validate_migration_result(&target, &target_before, &report).await {
         Ok(validation) => validation,
         Err(error) => {
@@ -619,7 +671,7 @@ struct StageInputs<'a> {
     source_data: &'a SourceData,
     options: &'a MigrationOptions,
     password_hash: &'a str,
-    blob_mappings: &'a HashMap<i64, i64>,
+    file_mappings: &'a HashMap<i64, i64>,
 }
 
 async fn execute_stage(
@@ -657,27 +709,35 @@ async fn execute_stage(
             migrate_folders(transaction, inputs.source_data, context, report).await
         }
         MigrationStage::Blobs => bail!("blobs stage must use the batched runner"),
-        MigrationStage::Files => {
-            migrate_files(
+        MigrationStage::Files => bail!("files stage must use the batched runner"),
+        MigrationStage::Metadata => {
+            migrate_metadata(
                 transaction,
                 inputs.source_db,
                 inputs.source_data,
-                inputs.blob_mappings,
+                inputs.file_mappings,
                 context,
                 report,
             )
             .await
         }
-        MigrationStage::Metadata => {
-            migrate_metadata(transaction, inputs.source_data, context, report).await
-        }
         MigrationStage::Shares => {
-            migrate_shares(transaction, inputs.source_data, context, report).await
+            migrate_shares(
+                transaction,
+                inputs.source_db,
+                inputs.source_data,
+                inputs.file_mappings,
+                context,
+                report,
+            )
+            .await
         }
         MigrationStage::DirectLinks => {
             migrate_direct_links(
                 transaction,
+                inputs.source_db,
                 inputs.source_data,
+                inputs.file_mappings,
                 context,
                 inputs.options.direct_link_secret.as_deref(),
                 report,
@@ -697,6 +757,7 @@ struct BlobBatchInputs<'a> {
     source_data: &'a SourceData,
     options: &'a MigrationOptions,
     context: &'a MigrationContext,
+    file_mappings: &'a HashMap<i64, i64>,
 }
 
 async fn migrate_blobs_batched(
@@ -726,7 +787,7 @@ async fn migrate_blobs_batched(
                 .begin()
                 .await
                 .wrap_err("begin blobs completion")?;
-            report.set_mappings(inputs.context, blob_mappings);
+            report.set_mappings(inputs.context, blob_mappings, inputs.file_mappings);
             if !report
                 .completed_stages
                 .iter()
@@ -779,6 +840,135 @@ async fn migrate_blobs_batched(
         blob_mappings.extend(mappings);
         cursor_value = last_entity_id;
     }
+}
+
+struct FileBatchInputs<'a> {
+    source: &'a DatabaseConnection,
+    target: &'a DatabaseConnection,
+    run_id: &'a str,
+    source_data: &'a SourceData,
+    options: &'a MigrationOptions,
+    context: &'a MigrationContext,
+    blob_mappings: &'a HashMap<i64, i64>,
+}
+
+async fn migrate_files_batched(
+    inputs: &FileBatchInputs<'_>,
+    file_mappings: &mut HashMap<i64, i64>,
+    report: &mut MigrationReport,
+) -> Result<()> {
+    let cursor =
+        checkpoint::load_stage_cursor(inputs.target, inputs.run_id, MigrationStage::Files.as_str())
+            .await?;
+    let mut cursor_value = cursor.as_ref().map_or(0, |cursor| cursor.cursor_value);
+    let mut processed_count = cursor.as_ref().map_or(0, |cursor| cursor.processed_count);
+
+    loop {
+        let files = cr::files::Entity::find()
+            .filter(cr::files::Column::Type.eq(0))
+            .filter(cr::files::Column::Id.gt(cursor_value))
+            .order_by_asc(cr::files::Column::Id)
+            .limit(inputs.options.file_batch_size as u64)
+            .all(inputs.source)
+            .await?;
+        if files.is_empty() {
+            let transaction = inputs
+                .target
+                .begin()
+                .await
+                .wrap_err("begin files completion")?;
+            report.set_mappings(inputs.context, inputs.blob_mappings, file_mappings);
+            if !report
+                .completed_stages
+                .iter()
+                .any(|completed| completed == MigrationStage::Files.as_str())
+            {
+                report
+                    .completed_stages
+                    .push(MigrationStage::Files.as_str().to_string());
+            }
+            checkpoint::save_stage(
+                &transaction,
+                inputs.run_id,
+                MigrationStage::Files.as_str(),
+                inputs.context,
+                report,
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .wrap_err("commit files completion")?;
+            return Ok(());
+        }
+
+        let (associations, entities) =
+            load_file_batch_data(inputs.source, inputs.source_data.include_deleted, &files).await?;
+        let last_file_id = files.last().expect("non-empty file batch").id;
+        let transaction = inputs.target.begin().await.wrap_err("begin files batch")?;
+        let mappings = migrate_file_batch(
+            &transaction,
+            &files,
+            &associations,
+            &entities,
+            inputs.blob_mappings,
+            inputs.context,
+            report,
+        )
+        .await?;
+        checkpoint::save_object_mappings(&transaction, inputs.run_id, "file", &mappings).await?;
+        processed_count += files.len() as i64;
+        checkpoint::save_stage_cursor(
+            &transaction,
+            inputs.run_id,
+            MigrationStage::Files.as_str(),
+            last_file_id,
+            processed_count,
+        )
+        .await?;
+        checkpoint::save_progress(&transaction, inputs.run_id, inputs.context, report).await?;
+        transaction.commit().await.wrap_err("commit files batch")?;
+        file_mappings.extend(mappings);
+        cursor_value = last_file_id;
+    }
+}
+
+async fn load_file_batch_data(
+    source: &DatabaseConnection,
+    include_deleted: bool,
+    files: &[cr::files::Model],
+) -> Result<(HashMap<i64, Vec<i64>>, HashMap<i64, cr::entities::Model>)> {
+    const QUERY_ID_BATCH_SIZE: usize = 500;
+
+    let file_ids = files.iter().map(|file| file.id).collect::<Vec<_>>();
+    let mut file_entities = Vec::new();
+    for file_ids in file_ids.chunks(QUERY_ID_BATCH_SIZE) {
+        file_entities.extend(
+            cr::file_entities::Entity::find()
+                .filter(cr::file_entities::Column::FileId.is_in(file_ids.iter().copied()))
+                .all(source)
+                .await?,
+        );
+    }
+    let mut entity_ids = file_entities
+        .iter()
+        .map(|relation| relation.entity_id)
+        .collect::<HashSet<_>>();
+    entity_ids.extend(files.iter().filter_map(|file| file.primary_entity));
+    let entity_ids = entity_ids.into_iter().collect::<Vec<_>>();
+    let mut entities = HashMap::with_capacity(entity_ids.len());
+    for entity_ids in entity_ids.chunks(QUERY_ID_BATCH_SIZE) {
+        let mut query = cr::entities::Entity::find()
+            .filter(cr::entities::Column::Id.is_in(entity_ids.iter().copied()))
+            .filter(cr::entities::Column::Type.eq(0));
+        if !include_deleted {
+            query = query.filter(cr::entities::Column::DeletedAt.is_null());
+        }
+        for entity in query.all(source).await? {
+            entities.insert(entity.id, entity);
+        }
+    }
+    Ok((associations(files, &file_entities), entities))
 }
 
 struct BlobAssociationInfo {
@@ -895,7 +1085,7 @@ fn source_fingerprint(source_url: &str, source: &SourceData) -> String {
         source.users.len(),
         source.groups.len(),
         source.policies.len(),
-        source.files.len(),
+        source.source_file_records,
         source.source_entities,
         source.source_file_entities,
         source.shares.len(),
@@ -1324,7 +1514,10 @@ struct SourceData {
     groups: Vec<cr::groups::Model>,
     users: Vec<cr::users::Model>,
     policies: Vec<cr::storage_policies::Model>,
-    files: Vec<cr::files::Model>,
+    folders: Vec<cr::files::Model>,
+    source_file_records: u64,
+    source_files: u64,
+    symbolic_files: u64,
     source_entities: u64,
     source_file_entities: u64,
     include_deleted: bool,
@@ -1339,7 +1532,20 @@ impl SourceData {
         let groups = cr::groups::Entity::find().all(db).await?;
         let users = cr::users::Entity::find().all(db).await?;
         let policies = cr::storage_policies::Entity::find().all(db).await?;
-        let files = cr::files::Entity::find().all(db).await?;
+        let folders = cr::files::Entity::find()
+            .filter(cr::files::Column::Type.eq(1))
+            .all(db)
+            .await?;
+        let source_file_records = cr::files::Entity::find().count(db).await?;
+        let source_files = cr::files::Entity::find()
+            .filter(cr::files::Column::Type.eq(0))
+            .count(db)
+            .await?;
+        let symbolic_files = cr::files::Entity::find()
+            .filter(cr::files::Column::Type.eq(0))
+            .filter(cr::files::Column::IsSymbolic.eq(true))
+            .count(db)
+            .await?;
         let entity_query = if include_deleted {
             cr::entities::Entity::find()
         } else {
@@ -1358,7 +1564,10 @@ impl SourceData {
             policies: filter_deleted(policies, include_deleted, |model| {
                 model.deleted_at.is_some()
             }),
-            files,
+            folders,
+            source_file_records,
+            source_files,
+            symbolic_files,
             source_entities,
             source_file_entities,
             include_deleted,
@@ -1378,8 +1587,8 @@ impl SourceData {
             source_users: self.users.len() as u64,
             source_groups: self.groups.len() as u64,
             source_policies: self.policies.len() as u64,
-            source_folders: self.files.iter().filter(|file| file.r#type == 1).count() as u64,
-            source_files: self.files.iter().filter(|file| file.r#type == 0).count() as u64,
+            source_folders: self.folders.len() as u64,
+            source_files: self.source_files,
             source_entities: self.source_entities,
             source_shares: self.shares.len() as u64,
             source_direct_links: self.direct_links.len() as u64,
@@ -1412,7 +1621,7 @@ impl SourceData {
             "file objects are reused in their existing local/object-storage locations; the migration does not duplicate object bytes".to_string(),
             "Cloudreve tasks are archived as terminal AD system_runtime records; queued, processing and suspending tasks are canceled instead of resumed".to_string(),
         ];
-        let symbolic = self.files.iter().filter(|file| file.is_symbolic).count();
+        let symbolic = self.symbolic_files;
         if symbolic > 0 {
             warnings.push(format!(
                 "{symbolic} symbolic/placeholder Cloudreve files cannot be represented in AD and will be skipped"
@@ -1825,6 +2034,7 @@ mod tests {
             run_id: None,
             resume: false,
             blob_batch_size: 500,
+            file_batch_size: 500,
         })
         .await?;
 
@@ -1936,6 +2146,7 @@ mod tests {
             run_id: Some(run_id.clone()),
             resume: false,
             blob_batch_size: 500,
+            file_batch_size: 500,
         };
 
         let error = migrate(options.clone()).await.unwrap_err();
@@ -2034,6 +2245,7 @@ mod tests {
             run_id: Some(run_id.clone()),
             resume: false,
             blob_batch_size: 2,
+            file_batch_size: 500,
         };
 
         let error = migrate(options.clone()).await.unwrap_err();
@@ -2094,6 +2306,119 @@ mod tests {
             .await?
             .expect("completed blob cursor");
         assert_eq!(completed_cursor.cursor_value, extra_blob_ids[2]);
+        assert_eq!(completed_cursor.processed_count, 4);
+        target.close().await?;
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumes_files_from_last_committed_batch() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let run_id = format!("file-resume-test-{suffix}");
+        let source_path = std::env::temp_dir().join(format!("cloudreve-file-resume-{suffix}.db"));
+        let target_path = std::env::temp_dir().join(format!("asterdrive-file-resume-{suffix}.db"));
+        let source_url = sqlite_url(&source_path);
+        let target_url = sqlite_url(&target_path);
+
+        let source = Database::connect(&source_url).await?;
+        create_source_schema(&source).await?;
+        seed_source(&source).await?;
+        let extra_blob_ids = seed_extra_blob_entities(&source, 3).await?;
+        let extra_file_ids = seed_extra_files(&source, &extra_blob_ids).await?;
+        source.close().await?;
+
+        let target = Database::connect(&target_url).await?;
+        create_target_schema(&target).await?;
+        target
+            .execute_unprepared(
+                "CREATE TRIGGER fail_file_batch BEFORE INSERT ON files \
+                 WHEN NEW.name = 'extra-1.txt' \
+                 BEGIN SELECT RAISE(ABORT, 'forced file batch failure'); END",
+            )
+            .await?;
+        target.close().await?;
+
+        let options = MigrationOptions {
+            source_url: source_url.clone(),
+            target_url: target_url.clone(),
+            default_password: "temporary-password".to_string(),
+            local_base_path: "C:/cloudreve".to_string(),
+            direct_link_secret: Some("test-direct-link-secret".to_string()),
+            include_deleted: false,
+            allow_non_empty_target: false,
+            skip_unsupported_policies: false,
+            dry_run: false,
+            run_id: Some(run_id.clone()),
+            resume: false,
+            blob_batch_size: 500,
+            file_batch_size: 2,
+        };
+
+        let error = migrate(options.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("files"));
+
+        let target = Database::connect(&target_url).await?;
+        assert_eq!(ad::files::Entity::find().count(&target).await?, 2);
+        assert_eq!(ad::file_versions::Entity::find().count(&target).await?, 1);
+        let cursor = checkpoint::load_stage_cursor(&target, &run_id, "files")
+            .await?
+            .expect("committed file cursor");
+        assert_eq!(cursor.cursor_value, extra_file_ids[0]);
+        assert_eq!(cursor.processed_count, 2);
+        assert_eq!(
+            checkpoint::object_map::Entity::find()
+                .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
+                .filter(checkpoint::object_map::Column::ObjectType.eq("file"))
+                .count(&target)
+                .await?,
+            2
+        );
+        let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
+            .one(&target)
+            .await?
+            .expect("failed file migration checkpoint");
+        assert_eq!(failed_checkpoint.status, "failed");
+        assert_eq!(
+            failed_checkpoint.last_completed_stage.as_deref(),
+            Some("blobs")
+        );
+        let failed_report: MigrationReport = serde_json::from_value(failed_checkpoint.report_json)?;
+        assert_eq!(failed_report.migrated_files, 2);
+        assert_eq!(failed_report.migrated_versions, 1);
+        target
+            .execute_unprepared("DROP TRIGGER fail_file_batch")
+            .await?;
+        target.close().await?;
+
+        let report = migrate(MigrationOptions {
+            resume: true,
+            ..options
+        })
+        .await?;
+        assert!(report.resumed);
+        assert_eq!(report.migrated_files, 4);
+        assert_eq!(report.migrated_versions, 1);
+        assert_eq!(report.mappings.files.len(), 4);
+        assert!(report.validation.passed);
+
+        let target = Database::connect(&target_url).await?;
+        assert_eq!(ad::files::Entity::find().count(&target).await?, 4);
+        assert_eq!(ad::file_versions::Entity::find().count(&target).await?, 1);
+        assert_eq!(
+            checkpoint::object_map::Entity::find()
+                .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
+                .filter(checkpoint::object_map::Column::ObjectType.eq("file"))
+                .count(&target)
+                .await?,
+            4
+        );
+        let completed_cursor = checkpoint::load_stage_cursor(&target, &run_id, "files")
+            .await?
+            .expect("completed file cursor");
+        assert_eq!(completed_cursor.cursor_value, extra_file_ids[2]);
         assert_eq!(completed_cursor.processed_count, 4);
         target.close().await?;
 
@@ -2358,6 +2683,61 @@ mod tests {
             .insert(db)
             .await?;
             ids.push(entity.id);
+        }
+        Ok(ids)
+    }
+
+    async fn seed_extra_files(db: &DatabaseConnection, entity_ids: &[i64]) -> Result<Vec<i64>> {
+        let now = chrono::Utc::now().fixed_offset();
+        let policy_id = cr::storage_policies::Entity::find()
+            .one(db)
+            .await?
+            .expect("seeded storage policy")
+            .id;
+        let user_id = cr::users::Entity::find()
+            .one(db)
+            .await?
+            .expect("seeded user")
+            .id;
+        let folder_id = cr::files::Entity::find()
+            .filter(cr::files::Column::Type.eq(1))
+            .one(db)
+            .await?
+            .expect("seeded folder")
+            .id;
+        let mut ids = Vec::with_capacity(entity_ids.len());
+        for (index, entity_id) in entity_ids.iter().copied().enumerate() {
+            let file = cr::files::ActiveModel {
+                created_at: Set(now),
+                updated_at: Set(now),
+                r#type: Set(0),
+                name: Set(format!("extra-{index}.txt")),
+                size: Set(256 + index as i64),
+                primary_entity: Set(Some(entity_id)),
+                is_symbolic: Set(false),
+                props: Set(None),
+                file_children: Set(Some(folder_id)),
+                storage_policy_files: Set(Some(policy_id)),
+                owner_id: Set(user_id),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
+            cr::file_entities::ActiveModel {
+                file_id: Set(file.id),
+                entity_id: Set(entity_id),
+            }
+            .insert(db)
+            .await?;
+            ids.push(file.id);
+        }
+        if entity_ids.len() >= 2 {
+            cr::file_entities::ActiveModel {
+                file_id: Set(ids[0]),
+                entity_id: Set(entity_ids[1]),
+            }
+            .insert(db)
+            .await?;
         }
         Ok(ids)
     }
