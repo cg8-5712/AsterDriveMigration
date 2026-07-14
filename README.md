@@ -60,6 +60,25 @@ Use `--dry-run` to perform preflight checks without writing the target. The targ
 
 Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files.
 
+## Reuse local storage
+
+For compatible Cloudreve local storage, migration keeps each `entities.source` path unchanged and configures AD to read the same files through the target policy base path. This avoids copying object bytes and therefore does not require a second full data volume.
+
+`--local-base-path` is the fallback root for every local policy. When policies use different volumes, pass one or more explicit source-policy mappings:
+
+```powershell
+cargo run -- migrate `
+  --source-url "sqlite://C:/cloudreve/cloudreve.db?mode=ro" `
+  --target-url "sqlite://C:/asterdrive/asterdrive.db" `
+  --default-password "change-this-password" `
+  --local-base-path "D:/cloudreve-default" `
+  --local-policy-root "1=D:/cloudreve-default" `
+  --local-policy-root "2=E:/cloudreve-archive" `
+  --verify-local-storage
+```
+
+`--verify-local-storage` checks each compatible local policy root and every migrated local blob's resolved path, regular-file status, open permission and byte length. With `--dry-run`, it scans all eligible local blobs before any target writes. It does not verify S3-compatible buckets or prove that a running AD instance can access a Docker mount; validate those separately before cutover.
+
 ## Limited resume
 
 Migration stages run in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. Most stages are committed as one transaction. Blobs use keyset pages ordered by Cloudreve `entities.id`, while files use keyset pages ordered by Cloudreve `files.id`; each page writes target records, object mappings, its cursor and report progress in one target transaction.

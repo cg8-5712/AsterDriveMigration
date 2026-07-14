@@ -555,6 +555,8 @@ checkpoint 表保存在 AD 数据库中，以便迁移进程重启后恢复。�
 
 当前 source fingerprint 使用数据库 URL 摘要和各源表记录数量，只能防止明显连错源或数量变化，不能检测“数量不变但内容变化”。生产迁移仍应冻结 Cloudreve 写入。
 
+对于 `reuse_source_storage` 的 local policy，当前实现支持用全局 `local_base_path` 或按 Cloudreve source policy ID 覆盖的 local root 配置 AD `base_path`。启用 `verify_local_storage` 后，预检会检查 local root；正式 blob batch 会检查每个复用对象解析后的路径、常规文件状态、打开权限和大小。`dry-run` 会在写入前分页扫描所有兼容 local blob。S3/COS 等远程复用策略仍需要后续的 provider-level `HeadObject`/range-read 验证。
+
 #### `aster_external_migration_stage_cursors`
 
 已用于 blobs 和 files；其他 stage 尚未接入。

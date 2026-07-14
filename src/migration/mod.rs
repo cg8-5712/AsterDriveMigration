@@ -24,6 +24,8 @@ pub struct MigrationOptions {
     pub target_url: String,
     pub default_password: String,
     pub local_base_path: String,
+    pub local_policy_roots: BTreeMap<i64, String>,
+    pub verify_local_storage: bool,
     pub direct_link_secret: Option<String>,
     pub include_deleted: bool,
     pub allow_non_empty_target: bool,
@@ -105,7 +107,7 @@ impl Default for MigrationReport {
             migrated_direct_links: 0,
             migrated_tasks: 0,
             skipped: 0,
-            dry_run: false,
+            dry_run: true,
             warnings: Vec::new(),
             skipped_by_type: BTreeMap::new(),
             skipped_objects: Vec::new(),
@@ -443,6 +445,13 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
             "unsupported Cloudreve storage policy types: {}; rerun with --skip-unsupported-policies to omit their files",
             unsupported.join(", ")
         );
+    }
+    validate_local_policy_roots(&source_data, &options)?;
+    if options.verify_local_storage {
+        verify_local_storage_roots(&source_data, &options)?;
+        if options.dry_run {
+            verify_all_local_source_objects(&source, &source_data, &options).await?;
+        }
     }
 
     let mut report = source_data.report();
@@ -812,6 +821,15 @@ async fn migrate_blobs_batched(
             return Ok(());
         }
 
+        if inputs.options.verify_local_storage {
+            verify_local_blob_batch(
+                &entities,
+                inputs.source_data,
+                inputs.options,
+                inputs.context,
+            )?;
+        }
+
         let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
         let association_info = load_blob_association_info(inputs.source, &entity_ids).await?;
         let last_entity_id = entities.last().expect("non-empty blob batch").id;
@@ -1097,8 +1115,15 @@ fn source_fingerprint(source_url: &str, source: &SourceData) -> String {
 
 fn plan_fingerprint(options: &MigrationOptions) -> String {
     hash_fingerprint(&format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         options.local_base_path,
+        options
+            .local_policy_roots
+            .iter()
+            .map(|(policy_id, path)| format!("{policy_id}={path}"))
+            .collect::<Vec<_>>()
+            .join("|"),
+        options.verify_local_storage,
         options.include_deleted,
         options.allow_non_empty_target,
         options.skip_unsupported_policies,
@@ -1109,6 +1134,190 @@ fn plan_fingerprint(options: &MigrationOptions) -> String {
             .map(hash_fingerprint)
             .unwrap_or_default(),
     ))
+}
+
+fn local_policy_root(options: &MigrationOptions, source_policy_id: i64) -> &str {
+    options
+        .local_policy_roots
+        .get(&source_policy_id)
+        .map(String::as_str)
+        .unwrap_or(&options.local_base_path)
+}
+
+fn local_storage_path(root: &str, storage_path: &str) -> std::path::PathBuf {
+    let storage_path = std::path::Path::new(storage_path);
+    if storage_path.is_absolute() {
+        storage_path.to_path_buf()
+    } else {
+        std::path::Path::new(root).join(storage_path)
+    }
+}
+
+fn validate_local_policy_roots(source: &SourceData, options: &MigrationOptions) -> Result<()> {
+    let policies = source
+        .policies
+        .iter()
+        .map(|policy| (policy.id, policy))
+        .collect::<HashMap<_, _>>();
+    for source_policy_id in options.local_policy_roots.keys() {
+        let Some(policy) = policies.get(source_policy_id) else {
+            bail!(
+                "--local-policy-root references Cloudreve policy {source_policy_id}, which was not found"
+            );
+        };
+        if policy.r#type != "local" {
+            bail!(
+                "--local-policy-root references Cloudreve policy {source_policy_id}, which is not a local policy"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_local_storage_roots(source: &SourceData, options: &MigrationOptions) -> Result<()> {
+    for policy in source.policies.iter().filter(|policy| {
+        policy.r#type == "local"
+            && map_driver_type(&policy.r#type).is_some()
+            && !source_settings(&policy.settings)
+                .get("encryption")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }) {
+        let root = local_policy_root(options, policy.id);
+        let metadata = std::fs::metadata(root).wrap_err_with(|| {
+            format!(
+                "read local storage root for Cloudreve policy {}: {root}",
+                policy.id
+            )
+        })?;
+        if !metadata.is_dir() {
+            bail!(
+                "local storage root for Cloudreve policy {} is not a directory: {root}",
+                policy.id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn verify_all_local_source_objects(
+    source_db: &DatabaseConnection,
+    source: &SourceData,
+    options: &MigrationOptions,
+) -> Result<()> {
+    const VERIFY_BATCH_SIZE: u64 = 500;
+
+    let policies = source
+        .policies
+        .iter()
+        .map(|policy| (policy.id, policy))
+        .collect::<HashMap<_, _>>();
+    let mut cursor_value = 0;
+    loop {
+        let mut query = cr::entities::Entity::find()
+            .filter(cr::entities::Column::Type.eq(0))
+            .filter(cr::entities::Column::Id.gt(cursor_value))
+            .order_by_asc(cr::entities::Column::Id)
+            .limit(VERIFY_BATCH_SIZE);
+        if !source.include_deleted {
+            query = query.filter(cr::entities::Column::DeletedAt.is_null());
+        }
+        let entities = query.all(source_db).await?;
+        let Some(last_entity) = entities.last() else {
+            return Ok(());
+        };
+        for entity in &entities {
+            let Some(policy) = policies.get(&entity.storage_policy_entities) else {
+                continue;
+            };
+            if policy.r#type == "local"
+                && map_driver_type(&policy.r#type).is_some()
+                && !source_settings(&policy.settings)
+                    .get("encryption")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            {
+                verify_local_entity(entity, policy, options)?;
+            }
+        }
+        cursor_value = last_entity.id;
+    }
+}
+
+fn verify_local_blob_batch(
+    entities: &[cr::entities::Model],
+    source: &SourceData,
+    options: &MigrationOptions,
+    context: &MigrationContext,
+) -> Result<()> {
+    let policies = source
+        .policies
+        .iter()
+        .map(|policy| (policy.id, policy))
+        .collect::<HashMap<_, _>>();
+    for entity in entities {
+        if !context
+            .policies
+            .contains_key(&entity.storage_policy_entities)
+        {
+            continue;
+        }
+        let Some(policy) = policies.get(&entity.storage_policy_entities) else {
+            continue;
+        };
+        if policy.r#type != "local" {
+            continue;
+        }
+        verify_local_entity(entity, policy, options)?;
+    }
+    Ok(())
+}
+
+fn verify_local_entity(
+    entity: &cr::entities::Model,
+    policy: &cr::storage_policies::Model,
+    options: &MigrationOptions,
+) -> Result<()> {
+    let root = local_policy_root(options, policy.id);
+    let path = local_storage_path(root, &entity.source);
+    let metadata = std::fs::metadata(&path).wrap_err_with(|| {
+        format!(
+            "read Cloudreve local entity {} at {}",
+            entity.id,
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "Cloudreve local entity {} is not a regular file: {}",
+            entity.id,
+            path.display()
+        );
+    }
+    std::fs::File::open(&path).wrap_err_with(|| {
+        format!(
+            "open Cloudreve local entity {} at {}",
+            entity.id,
+            path.display()
+        )
+    })?;
+    let expected_size = u64::try_from(entity.size).map_err(|_| {
+        color_eyre::eyre::eyre!(
+            "Cloudreve local entity {} has negative size {}",
+            entity.id,
+            entity.size
+        )
+    })?;
+    if metadata.len() != expected_size {
+        bail!(
+            "Cloudreve local entity {} size mismatch at {}: database={}, filesystem={}",
+            entity.id,
+            path.display(),
+            expected_size,
+            metadata.len()
+        );
+    }
+    Ok(())
 }
 
 async fn connect(url: &str, label: &str) -> Result<DatabaseConnection> {
@@ -2026,6 +2235,8 @@ mod tests {
             target_url: target_url.clone(),
             default_password: "temporary-password".to_string(),
             local_base_path: "C:/cloudreve".to_string(),
+            local_policy_roots: std::collections::BTreeMap::new(),
+            verify_local_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -2110,6 +2321,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reuses_and_verifies_local_storage_per_policy_root() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let source_path = std::env::temp_dir().join(format!("cloudreve-local-reuse-{suffix}.db"));
+        let target_path = std::env::temp_dir().join(format!("asterdrive-local-reuse-{suffix}.db"));
+        let storage_root = std::env::temp_dir().join(format!("cloudreve-local-storage-{suffix}"));
+        let source_url = sqlite_url(&source_path);
+        let target_url = sqlite_url(&target_path);
+
+        let source = Database::connect(&source_url).await?;
+        create_source_schema(&source).await?;
+        seed_source(&source).await?;
+        let source_policy_id = cr::storage_policies::Entity::find()
+            .one(&source)
+            .await?
+            .expect("seeded storage policy")
+            .id;
+        source.close().await?;
+        std::fs::create_dir_all(storage_root.join("uploads"))?;
+        std::fs::write(storage_root.join("uploads/object.bin"), vec![0_u8; 128])?;
+
+        let target = Database::connect(&target_url).await?;
+        create_target_schema(&target).await?;
+        target.close().await?;
+
+        let report = migrate(MigrationOptions {
+            source_url: source_url.clone(),
+            target_url: target_url.clone(),
+            default_password: "temporary-password".to_string(),
+            local_base_path: "unused-local-root".to_string(),
+            local_policy_roots: std::collections::BTreeMap::from([(
+                source_policy_id,
+                storage_root.to_string_lossy().to_string(),
+            )]),
+            verify_local_storage: true,
+            direct_link_secret: Some("test-direct-link-secret".to_string()),
+            include_deleted: false,
+            allow_non_empty_target: false,
+            skip_unsupported_policies: false,
+            dry_run: false,
+            run_id: None,
+            resume: false,
+            blob_batch_size: 500,
+            file_batch_size: 500,
+        })
+        .await?;
+        assert!(report.validation.passed);
+
+        let target = Database::connect(&target_url).await?;
+        let policy = ad::storage_policies::Entity::find()
+            .one(&target)
+            .await?
+            .expect("migrated storage policy");
+        assert_eq!(policy.base_path, storage_root.to_string_lossy());
+        target.close().await?;
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+        let _ = std::fs::remove_dir_all(storage_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_local_storage_size_mismatch() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let source_path =
+            std::env::temp_dir().join(format!("cloudreve-local-mismatch-{suffix}.db"));
+        let target_path =
+            std::env::temp_dir().join(format!("asterdrive-local-mismatch-{suffix}.db"));
+        let storage_root =
+            std::env::temp_dir().join(format!("cloudreve-local-mismatch-storage-{suffix}"));
+        let source_url = sqlite_url(&source_path);
+        let target_url = sqlite_url(&target_path);
+
+        let source = Database::connect(&source_url).await?;
+        create_source_schema(&source).await?;
+        seed_source(&source).await?;
+        let source_policy_id = cr::storage_policies::Entity::find()
+            .one(&source)
+            .await?
+            .expect("seeded storage policy")
+            .id;
+        source.close().await?;
+        std::fs::create_dir_all(storage_root.join("uploads"))?;
+        std::fs::write(storage_root.join("uploads/object.bin"), vec![0_u8; 127])?;
+
+        let target = Database::connect(&target_url).await?;
+        create_target_schema(&target).await?;
+        target.close().await?;
+
+        let error = migrate(MigrationOptions {
+            source_url: source_url.clone(),
+            target_url: target_url.clone(),
+            default_password: "temporary-password".to_string(),
+            local_base_path: "unused-local-root".to_string(),
+            local_policy_roots: std::collections::BTreeMap::from([(
+                source_policy_id,
+                storage_root.to_string_lossy().to_string(),
+            )]),
+            verify_local_storage: true,
+            direct_link_secret: Some("test-direct-link-secret".to_string()),
+            include_deleted: false,
+            allow_non_empty_target: false,
+            skip_unsupported_policies: false,
+            dry_run: true,
+            run_id: None,
+            resume: false,
+            blob_batch_size: 500,
+            file_batch_size: 500,
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("size mismatch"));
+
+        let target = Database::connect(&target_url).await?;
+        assert_eq!(
+            ad::storage_policies::Entity::find().count(&target).await?,
+            0
+        );
+        target.close().await?;
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+        let _ = std::fs::remove_dir_all(storage_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_local_policy_root() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let source_path = std::env::temp_dir().join(format!("cloudreve-local-policy-{suffix}.db"));
+        let target_path = std::env::temp_dir().join(format!("asterdrive-local-policy-{suffix}.db"));
+        let source_url = sqlite_url(&source_path);
+        let target_url = sqlite_url(&target_path);
+
+        let source = Database::connect(&source_url).await?;
+        create_source_schema(&source).await?;
+        seed_source(&source).await?;
+        source.close().await?;
+
+        let target = Database::connect(&target_url).await?;
+        create_target_schema(&target).await?;
+        target.close().await?;
+
+        let error = migrate(MigrationOptions {
+            source_url: source_url.clone(),
+            target_url: target_url.clone(),
+            default_password: "temporary-password".to_string(),
+            local_base_path: "unused-local-root".to_string(),
+            local_policy_roots: std::collections::BTreeMap::from([(999, "C:/missing".to_string())]),
+            verify_local_storage: false,
+            direct_link_secret: Some("test-direct-link-secret".to_string()),
+            include_deleted: false,
+            allow_non_empty_target: false,
+            skip_unsupported_policies: false,
+            dry_run: true,
+            run_id: None,
+            resume: false,
+            blob_batch_size: 500,
+            file_batch_size: 500,
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("policy 999"));
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn resumes_from_last_completed_stage() -> Result<()> {
         let suffix = uuid::Uuid::new_v4();
         let run_id = format!("resume-test-{suffix}");
@@ -2138,6 +2519,8 @@ mod tests {
             target_url: target_url.clone(),
             default_password: "temporary-password".to_string(),
             local_base_path: "C:/cloudreve".to_string(),
+            local_policy_roots: std::collections::BTreeMap::new(),
+            verify_local_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -2237,6 +2620,8 @@ mod tests {
             target_url: target_url.clone(),
             default_password: "temporary-password".to_string(),
             local_base_path: "C:/cloudreve".to_string(),
+            local_policy_roots: std::collections::BTreeMap::new(),
+            verify_local_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -2346,6 +2731,8 @@ mod tests {
             target_url: target_url.clone(),
             default_password: "temporary-password".to_string(),
             local_base_path: "C:/cloudreve".to_string(),
+            local_policy_roots: std::collections::BTreeMap::new(),
+            verify_local_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,

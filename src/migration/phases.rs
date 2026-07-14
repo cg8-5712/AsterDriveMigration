@@ -25,7 +25,7 @@ pub(super) async fn migrate_policies(
             continue;
         };
         let base_path = if policy.r#type == "local" {
-            options.local_base_path.clone()
+            local_policy_root(options, policy.id).to_string()
         } else {
             String::new()
         };

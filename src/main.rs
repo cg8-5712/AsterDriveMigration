@@ -39,6 +39,10 @@ struct MigrateArgs {
     default_password: String,
     #[arg(long, default_value = ".")]
     local_base_path: String,
+    #[arg(long = "local-policy-root", value_name = "SOURCE_POLICY_ID=PATH")]
+    local_policy_roots: Vec<String>,
+    #[arg(long)]
+    verify_local_storage: bool,
     #[arg(long, env = "ASTER_DIRECT_LINK_SECRET", hide_env_values = true)]
     direct_link_secret: Option<String>,
     #[arg(long)]
@@ -72,6 +76,8 @@ async fn main() -> Result<()> {
                 target_url: args.connection.target_url,
                 default_password: args.default_password,
                 local_base_path: args.local_base_path,
+                local_policy_roots: parse_local_policy_roots(args.local_policy_roots)?,
+                verify_local_storage: args.verify_local_storage,
                 direct_link_secret: args.direct_link_secret,
                 include_deleted: args.connection.include_deleted,
                 allow_non_empty_target: args.allow_non_empty_target,
@@ -89,6 +95,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn parse_local_policy_roots(
+    values: Vec<String>,
+) -> Result<std::collections::BTreeMap<i64, String>> {
+    let mut roots = std::collections::BTreeMap::new();
+    for value in values {
+        let Some((source_policy_id, path)) = value.split_once('=') else {
+            bail!("--local-policy-root must use SOURCE_POLICY_ID=PATH");
+        };
+        let source_policy_id = source_policy_id.parse::<i64>().map_err(|_| {
+            color_eyre::eyre::eyre!("invalid local storage policy ID {source_policy_id}")
+        })?;
+        if source_policy_id <= 0 || path.trim().is_empty() {
+            bail!("--local-policy-root must use a positive policy ID and non-empty path");
+        }
+        if roots.insert(source_policy_id, path.to_string()).is_some() {
+            bail!("local storage policy {source_policy_id} was configured more than once");
+        }
+    }
+    Ok(roots)
+}
+
 fn emit_report(report_path: Option<&Path>, report: &MigrationReport) -> Result<()> {
     if let Some(path) = report_path {
         write_json_report(path, report)?;
@@ -98,4 +125,33 @@ fn emit_report(report_path: Option<&Path>, report: &MigrationReport) -> Result<(
         bail!("migration committed but post-migration validation failed; inspect the JSON report");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_local_policy_roots() -> Result<()> {
+        let roots = parse_local_policy_roots(vec![
+            "1=D:/cloudreve-data".to_string(),
+            "2=E:/cloudreve-archive".to_string(),
+        ])?;
+        assert_eq!(roots.get(&1).map(String::as_str), Some("D:/cloudreve-data"));
+        assert_eq!(
+            roots.get(&2).map(String::as_str),
+            Some("E:/cloudreve-archive")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_local_policy_roots() {
+        assert!(parse_local_policy_roots(vec!["missing-separator".to_string()]).is_err());
+        assert!(parse_local_policy_roots(vec!["0=C:/data".to_string()]).is_err());
+        assert!(
+            parse_local_policy_roots(vec!["1=C:/data".to_string(), "1=D:/data".to_string()])
+                .is_err()
+        );
+    }
 }

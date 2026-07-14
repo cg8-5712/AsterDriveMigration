@@ -490,6 +490,8 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | 邮箱验证 | 视为已验证 / 全部重新验证 | 活跃用户按已验证处理 |
 | Cloudreve group | AD 策略组 / AD team / 两者都建 | 映射为存储策略组，不自动创建 team |
 | 本地存储根目录 | 复用 Cloudreve 工作目录 / 搬迁文件到 AD 新目录 | 通过 `--local-base-path` 指定并复用旧对象路径 |
+| 多本地策略根目录 | 对所有策略使用同一根目录 / 按 source policy 分别指定 | `--local-policy-root <source_policy_id>=<path>` 覆盖指定策略，未指定策略回退 `--local-base-path` |
+| 本地对象预检 | 仅检查根目录 / 逐对象路径、权限和大小检查 | `--verify-local-storage`；配合 `--dry-run` 可在写入前分页扫描全部可复用 local blob |
 | 对象存储 | 复用原 bucket / 复制到新 bucket | 复用原 endpoint、bucket 和 object key |
 | 历史版本 | 全部迁移 / 只迁移当前版本 | 当前实现迁移全部 `type=0` entity |
 | 分享 URL | 生成新 token / 尝试兼容旧 HashID | 生成新 token，旧 URL 失效 |
