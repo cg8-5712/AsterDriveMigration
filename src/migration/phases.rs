@@ -25,7 +25,7 @@ pub(super) async fn migrate_policies(
             continue;
         };
         let base_path = if policy.r#type == "local" {
-            local_policy_root(options, policy.id).to_string()
+            target_local_policy_root(options, policy.id)?.to_string()
         } else {
             String::new()
         };
@@ -253,6 +253,7 @@ pub(super) async fn migrate_blob_batch(
     entities: &[cr::entities::Model],
     reference_counts: &HashMap<i64, i64>,
     thumbnail_paths: &HashMap<i64, String>,
+    copied_local_objects: &HashMap<i64, CopiedLocalObject>,
     context: &MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<Vec<(i64, i64)>> {
@@ -274,12 +275,21 @@ pub(super) async fn migrate_blob_batch(
             continue;
         };
         let reference_count = reference_counts.get(&entity.id).copied().unwrap_or(1);
-        let thumbnail_path = thumbnail_paths.get(&entity.id).cloned();
+        let copied_local_object = copied_local_objects.get(&entity.id);
+        let thumbnail_path = if copied_local_object.is_some() {
+            None
+        } else {
+            thumbnail_paths.get(&entity.id).cloned()
+        };
         let target = ad::file_blobs::ActiveModel {
-            hash: Set(opaque_blob_key(entity.id)),
+            hash: Set(copied_local_object
+                .map(|object| object.sha256.clone())
+                .unwrap_or_else(|| opaque_blob_key(entity.id))),
             size: Set(entity.size),
             policy_id: Set(policy_id),
-            storage_path: Set(entity.source.clone()),
+            storage_path: Set(copied_local_object
+                .map(|object| object.storage_path.clone())
+                .unwrap_or_else(|| entity.source.clone())),
             thumbnail_path: Set(thumbnail_path),
             thumbnail_processor: Set(None),
             thumbnail_version: Set(None),

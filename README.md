@@ -21,7 +21,7 @@ Cloudreve password hashes are not compatible with AD. The migration assigns the 
 
 Cloudreve tasks are preserved only as terminal AD `system_runtime` history. Completed/error/canceled statuses are mapped to terminal AD statuses; queued/processing/suspending tasks are archived as canceled and are never resumed.
 
-The tool reuses existing storage objects. For local storage, pass the directory from which Cloudreve entity paths should be resolved. Object-storage policies keep their existing bucket, endpoint, credentials and object keys.
+By default the tool reuses existing storage objects. For local storage, pass the directory from which Cloudreve entity paths should be resolved. Object-storage policies keep their existing bucket, endpoint, credentials and object keys. This is a zero-copy migration and is the preferred choice when AD can safely access the same storage backend.
 
 ## Prerequisites
 
@@ -79,6 +79,26 @@ cargo run -- migrate `
 
 `--verify-local-storage` checks each compatible local policy root and every migrated local blob's resolved path, regular-file status, open permission and byte length. With `--dry-run`, it scans all eligible local blobs before any target writes. It does not verify S3-compatible buckets or prove that a running AD instance can access a Docker mount; validate those separately before cutover.
 
+## Copy local storage
+
+Use `--storage-mode copy-local` only when AD must use a **different local root**. It copies compatible local blobs while retaining their relative `entities.source` paths, configures AD's local policy to the target root, and stores a real SHA-256 in each copied `file_blobs.hash`. Source paths must be relative and must not escape the configured root.
+
+```powershell
+cargo run -- migrate `
+  --source-url "sqlite://C:/cloudreve/cloudreve.db?mode=ro" `
+  --target-url "sqlite://C:/asterdrive/asterdrive.db" `
+  --default-password "change-this-password" `
+  --local-policy-root "1=D:/cloudreve-data" `
+  --storage-mode copy-local `
+  --target-local-policy-root "1=E:/asterdrive-data" `
+  --verify-local-storage `
+  --run-id "cloudreve-local-copy-2026-07-22"
+```
+
+`--target-local-base-path` is the fallback destination root; `--target-local-policy-root SOURCE_POLICY_ID=PATH` overrides it for one local policy. The source and target roots must be existing, different directories. If a target object already exists, migration never overwrites it: size and SHA-256 must both match the source before it is reused.
+
+Each copied object first streams to a generated `.aster-migration-<run-hash>-<entity-id>.part` file in the destination directory. The next run with the same `--run-id --resume` verifies the partial prefix and appends the remaining bytes. It calls `sync_all` and atomically renames the temporary file only after the complete byte count has been written. If the database transaction for that blob page rolls back, files newly finalized by that page are deleted as compensation. A commit error is intentionally not compensated because commit outcome may be unknown; resume verifies and reuses a matching finalized object. Thumbnail objects and remote object-storage policies are not copied by this mode.
+
 ## Limited resume
 
 Migration stages run in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. Most stages are committed as one transaction. Blobs use keyset pages ordered by Cloudreve `entities.id`, while files use keyset pages ordered by Cloudreve `files.id`; each page writes target records, object mappings, its cursor and report progress in one target transaction.
@@ -101,7 +121,7 @@ Resume verifies the source URL/count fingerprint, target URL fingerprint and mig
 
 `--blob-batch-size` and `--file-batch-size` default to 500 and accept 1-10000. A failed blob or file page rolls back only that page; resume continues after the last committed entity or file ID. Blob and normal-file source rows are no longer loaded into memory as complete collections, and their mappings are stored row-by-row in `aster_external_migration_object_map`.
 
-Folders, metadata, shares, direct links and tasks are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. Physical object bytes are still reused in place rather than copied or uploaded.
+Folders, metadata, shares, direct links and tasks are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. `copy-local` provides physical byte copying only for compatible local policies; remote object-storage copy/upload is not implemented.
 
 ## JSON migration report
 
