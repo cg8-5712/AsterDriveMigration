@@ -766,9 +766,9 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | 冲突策略 | 仅 username 自动后缀，其他冲突依赖 DB 报错 | fail/rename/skip/reuse/update 可配置 |
 | 本地物理对象复制 | 已支持 `copy-local`：流式复制到新 local root，保留相对 storage path，并写入真实 SHA-256 | 远端对象存储 copy/upload、缩略图复制与 hash + policy 去重 |
 | 本地复制恢复/补偿 | 同目录 `.part` 前缀校验、追加、`sync_all` 和原子 rename；DB blob batch 回滚后删除本批新最终文件 | multipart upload checkpoint、跨进程提交结果确认与远端孤儿对象清理 |
-| ref_count 重算 | 基于源关联计算初值 | 迁移后从 AD 关系统一重算 |
-| storage_used 重算 | 当前复制 Cloudreve 用户统计 | 迁移后按 AD 语义统一重算 |
-| 验证编排 | 提交后重查核心表数量、导入任务终态、标签绑定和直链 property；`copy-local` 校验源对象字节数并记录 SHA-256，对既有目标对象校验大小和 SHA-256；有 SQLite 端到端测试 | 增加 parent/owner/blob/ref_count/storage_used、AD 运行时和远端对象可读性验证 |
+| ref_count 重算 | 最终事务按 `files + file_versions` 统一重算并回写，再复核无漂移 | 大型库的数据库端聚合优化 |
+| storage_used 重算 | 最终事务按 AD 当前文件 + 历史版本、个人/团队 scope 统一重算并回写，再复核无漂移 | 大型库的数据库端聚合优化 |
+| 验证编排 | 提交后重查核心表数量、导入任务终态、标签绑定、直链 property、folder/blob/file/version/share 关系和目录环；`--verify-local-storage`/`copy-local` 打开并读取本地 AD 对象，复制模式复核 SHA-256；有 SQLite 端到端测试 | AD HTTP 下载/分享/直链验证与远端对象存储可读性验证 |
 | 报告 | 已支持终端摘要和 `--report-path` JSON，包含分类跳过原因、核心 ID 映射、标签/直链记录和校验结果 | 增加失败中间态、stage 进度、吞吐量、字节数和独立 CSV 导出 |
 | TUI | 未接入新迁移核心 | 可选进度视图 |
 | 多源系统插件 | 未实现 | SourceAdapter 插件化 |

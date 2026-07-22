@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write};
-use std::io::{Read, Write as IoWrite};
+use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 
 use argon2::Argon2;
@@ -9,8 +9,8 @@ use base64::Engine;
 use color_eyre::eyre::{Result, WrapErr, bail};
 use hmac::{Hmac, Mac};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -668,14 +668,29 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     }
 
     report.set_mappings(&context, &blob_mappings, &file_mappings);
-    report.validation = match validate_migration_result(&target, &target_before, &report).await {
-        Ok(validation) => validation,
-        Err(error) => {
-            let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
-            return Err(error)
-                .wrap_err_with(|| format!("validate completed migration run {run_id}"));
-        }
-    };
+    let recalculation = target
+        .begin()
+        .await
+        .wrap_err("begin final statistics recalculation")?;
+    if let Err(error) = recalculate_statistics(&recalculation).await {
+        let _ = recalculation.rollback().await;
+        let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+        return Err(error)
+            .wrap_err_with(|| format!("recalculate completed migration run {run_id}"));
+    }
+    recalculation
+        .commit()
+        .await
+        .wrap_err("commit final statistics recalculation")?;
+    report.validation =
+        match validate_migration_result(&target, &target_before, &report, &options).await {
+            Ok(validation) => validation,
+            Err(error) => {
+                let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+                return Err(error)
+                    .wrap_err_with(|| format!("validate completed migration run {run_id}"));
+            }
+        };
     report.generated_at = chrono::Utc::now();
     checkpoint::finish(
         &target,
@@ -1870,6 +1885,123 @@ impl TargetCounts {
     }
 }
 
+const INTEGRITY_BATCH_SIZE: u64 = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StorageOwner {
+    User(i64),
+    Team(i64),
+}
+
+fn add_storage_usage(
+    totals: &mut HashMap<StorageOwner, i64>,
+    owner: StorageOwner,
+    size: i64,
+) -> Result<()> {
+    let value = totals.entry(owner).or_insert(0);
+    *value = value.checked_add(size).ok_or_else(|| {
+        color_eyre::eyre::eyre!("storage usage overflow while recalculating {owner:?}")
+    })?;
+    Ok(())
+}
+
+fn file_storage_owner(file: &ad::files::Model) -> Option<StorageOwner> {
+    file.team_id
+        .map(StorageOwner::Team)
+        .or_else(|| file.owner_user_id.map(StorageOwner::User))
+}
+
+async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()> {
+    let mut file_owners = HashMap::new();
+    let mut ref_counts = HashMap::<i64, i64>::new();
+    let mut usage = HashMap::<StorageOwner, i64>::new();
+    let mut last_file_id = 0;
+    loop {
+        let files = ad::files::Entity::find()
+            .filter(ad::files::Column::Id.gt(last_file_id))
+            .order_by_asc(ad::files::Column::Id)
+            .limit(INTEGRITY_BATCH_SIZE)
+            .all(transaction)
+            .await?;
+        let Some(last_file) = files.last() else { break };
+        last_file_id = last_file.id;
+        for file in files {
+            if let Some(owner) = file_storage_owner(&file) {
+                add_storage_usage(&mut usage, owner, file.size)?;
+                file_owners.insert(file.id, owner);
+            }
+            *ref_counts.entry(file.blob_id).or_insert(0) += 1;
+        }
+    }
+
+    let mut last_version_id = 0;
+    loop {
+        let versions = ad::file_versions::Entity::find()
+            .filter(ad::file_versions::Column::Id.gt(last_version_id))
+            .order_by_asc(ad::file_versions::Column::Id)
+            .limit(INTEGRITY_BATCH_SIZE)
+            .all(transaction)
+            .await?;
+        let Some(last_version) = versions.last() else {
+            break;
+        };
+        last_version_id = last_version.id;
+        for version in versions {
+            if let Some(owner) = file_owners.get(&version.file_id).copied() {
+                add_storage_usage(&mut usage, owner, version.size)?;
+            }
+            *ref_counts.entry(version.blob_id).or_insert(0) += 1;
+        }
+    }
+
+    let now = chrono::Utc::now().fixed_offset();
+    let mut last_blob_id = 0;
+    loop {
+        let blobs = ad::file_blobs::Entity::find()
+            .filter(ad::file_blobs::Column::Id.gt(last_blob_id))
+            .order_by_asc(ad::file_blobs::Column::Id)
+            .limit(INTEGRITY_BATCH_SIZE)
+            .all(transaction)
+            .await?;
+        let Some(last_blob) = blobs.last() else { break };
+        last_blob_id = last_blob.id;
+        for blob in blobs {
+            let actual = ref_counts.get(&blob.id).copied().unwrap_or(0);
+            if blob.ref_count != actual {
+                let mut active = blob.into_active_model();
+                active.ref_count = Set(actual);
+                active.updated_at = Set(now);
+                active.update(transaction).await?;
+            }
+        }
+    }
+    for user in ad::users::Entity::find().all(transaction).await? {
+        let actual = usage
+            .get(&StorageOwner::User(user.id))
+            .copied()
+            .unwrap_or(0);
+        if user.storage_used != actual {
+            let mut active = user.into_active_model();
+            active.storage_used = Set(actual);
+            active.updated_at = Set(now);
+            active.update(transaction).await?;
+        }
+    }
+    for team in ad::teams::Entity::find().all(transaction).await? {
+        let actual = usage
+            .get(&StorageOwner::Team(team.id))
+            .copied()
+            .unwrap_or(0);
+        if team.storage_used != actual {
+            let mut active = team.into_active_model();
+            active.storage_used = Set(actual);
+            active.updated_at = Set(now);
+            active.update(transaction).await?;
+        }
+    }
+    Ok(())
+}
+
 fn count_check(name: &str, before: u64, migrated: usize, actual: u64) -> ValidationCheck {
     let migrated = u64::try_from(migrated).unwrap_or(u64::MAX);
     let expected = before.saturating_add(migrated);
@@ -1897,6 +2029,7 @@ async fn validate_migration_result(
     db: &DatabaseConnection,
     before: &TargetCounts,
     report: &MigrationReport,
+    options: &MigrationOptions,
 ) -> Result<MigrationValidation> {
     let after = TargetCounts::load(db).await?;
     let mut checks = vec![
@@ -2104,12 +2237,268 @@ async fn validate_migration_result(
         valid_direct_links,
         "one or more cloudreve.direct_links properties are missing or changed",
     ));
+    checks.extend(validate_target_integrity(db, options).await?);
 
     Ok(MigrationValidation {
         performed: true,
         passed: checks.iter().all(|check| check.passed),
         checks,
     })
+}
+
+async fn validate_target_integrity(
+    db: &DatabaseConnection,
+    options: &MigrationOptions,
+) -> Result<Vec<ValidationCheck>> {
+    let users = ad::users::Entity::find().all(db).await?;
+    let user_ids = users.iter().map(|user| user.id).collect::<HashSet<_>>();
+    let teams = ad::teams::Entity::find().all(db).await?;
+    let team_ids = teams.iter().map(|team| team.id).collect::<HashSet<_>>();
+    let policies = ad::storage_policies::Entity::find().all(db).await?;
+    let policies_by_id = policies
+        .iter()
+        .map(|policy| (policy.id, policy))
+        .collect::<HashMap<_, _>>();
+    let policy_ids = policies_by_id.keys().copied().collect::<HashSet<_>>();
+    let blobs = ad::file_blobs::Entity::find().all(db).await?;
+    let blob_ids = blobs.iter().map(|blob| blob.id).collect::<HashSet<_>>();
+    let folders = ad::folders::Entity::find().all(db).await?;
+    let folders_by_id = folders
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+    let folder_ids = folders_by_id.keys().copied().collect::<HashSet<_>>();
+    let files = ad::files::Entity::find().all(db).await?;
+    let file_ids = files.iter().map(|file| file.id).collect::<HashSet<_>>();
+
+    let invalid_folders = folders
+        .iter()
+        .filter(|folder| {
+            folder
+                .owner_user_id
+                .is_some_and(|id| !user_ids.contains(&id))
+                || folder
+                    .created_by_user_id
+                    .is_some_and(|id| !user_ids.contains(&id))
+                || folder.team_id.is_some_and(|id| !team_ids.contains(&id))
+                || folder.policy_id.is_some_and(|id| !policy_ids.contains(&id))
+                || folder.parent_id.is_some_and(|id| !folder_ids.contains(&id))
+        })
+        .count();
+    let mut checks = vec![invariant_check(
+        "folder_relations_exist",
+        0,
+        invalid_folders,
+        "folders contain an orphan owner, creator, team, policy, or parent",
+    )];
+
+    let folder_cycles = folders
+        .iter()
+        .filter(|folder| folder_has_cycle(folder.id, &folders_by_id))
+        .count();
+    checks.push(invariant_check(
+        "folder_tree_has_no_cycles",
+        0,
+        folder_cycles,
+        "folders contain one or more parent cycles",
+    ));
+
+    let invalid_blobs = blobs
+        .iter()
+        .filter(|blob| !policy_ids.contains(&blob.policy_id))
+        .count();
+    checks.push(invariant_check(
+        "blob_policies_exist",
+        0,
+        invalid_blobs,
+        "file_blobs contain an orphan storage policy",
+    ));
+
+    let invalid_files = files
+        .iter()
+        .filter(|file| {
+            !blob_ids.contains(&file.blob_id)
+                || file.folder_id.is_some_and(|id| !folder_ids.contains(&id))
+                || file.owner_user_id.is_some_and(|id| !user_ids.contains(&id))
+                || file
+                    .created_by_user_id
+                    .is_some_and(|id| !user_ids.contains(&id))
+                || file.team_id.is_some_and(|id| !team_ids.contains(&id))
+                || (file.team_id.is_none() && file.owner_user_id.is_none())
+        })
+        .count();
+    checks.push(invariant_check(
+        "file_relations_exist",
+        0,
+        invalid_files,
+        "files contain an orphan relation or invalid personal/team scope",
+    ));
+
+    let versions = ad::file_versions::Entity::find().all(db).await?;
+    let invalid_versions = versions
+        .iter()
+        .filter(|version| {
+            !file_ids.contains(&version.file_id) || !blob_ids.contains(&version.blob_id)
+        })
+        .count();
+    checks.push(invariant_check(
+        "file_version_relations_exist",
+        0,
+        invalid_versions,
+        "file_versions contain an orphan file or blob",
+    ));
+
+    let shares = ad::shares::Entity::find().all(db).await?;
+    let invalid_shares = shares
+        .iter()
+        .filter(|share| {
+            !user_ids.contains(&share.user_id)
+                || share.team_id.is_some_and(|id| !team_ids.contains(&id))
+                || (share.file_id.is_some() == share.folder_id.is_some())
+                || share.file_id.is_some_and(|id| !file_ids.contains(&id))
+                || share.folder_id.is_some_and(|id| !folder_ids.contains(&id))
+        })
+        .count();
+    checks.push(invariant_check(
+        "share_relations_exist",
+        0,
+        invalid_shares,
+        "shares contain an orphan owner/target or do not select exactly one target",
+    ));
+
+    let (expected_ref_counts, expected_usage) = expected_statistics(&files, &versions)?;
+    let ref_count_drifts = blobs
+        .iter()
+        .filter(|blob| blob.ref_count != expected_ref_counts.get(&blob.id).copied().unwrap_or(0))
+        .count();
+    checks.push(invariant_check(
+        "blob_ref_counts_recalculated",
+        0,
+        ref_count_drifts,
+        "file_blobs.ref_count differs from files plus file_versions references",
+    ));
+    let user_usage_drifts = users
+        .iter()
+        .filter(|user| {
+            user.storage_used
+                != expected_usage
+                    .get(&StorageOwner::User(user.id))
+                    .copied()
+                    .unwrap_or(0)
+        })
+        .count();
+    let team_usage_drifts = teams
+        .iter()
+        .filter(|team| {
+            team.storage_used
+                != expected_usage
+                    .get(&StorageOwner::Team(team.id))
+                    .copied()
+                    .unwrap_or(0)
+        })
+        .count();
+    checks.push(invariant_check(
+        "storage_usage_recalculated",
+        0,
+        user_usage_drifts + team_usage_drifts,
+        "users.storage_used or teams.storage_used differs from current files plus historical versions",
+    ));
+    if options.verify_local_storage || options.storage_mode == StorageMode::CopyLocal {
+        checks.push(verify_local_runtime_readability(
+            &blobs,
+            &policies_by_id,
+            options,
+        ));
+    }
+    Ok(checks)
+}
+
+fn expected_statistics(
+    files: &[ad::files::Model],
+    versions: &[ad::file_versions::Model],
+) -> Result<(HashMap<i64, i64>, HashMap<StorageOwner, i64>)> {
+    let mut refs = HashMap::new();
+    let mut usage = HashMap::new();
+    let mut owners = HashMap::new();
+    for file in files {
+        *refs.entry(file.blob_id).or_insert(0) += 1;
+        if let Some(owner) = file_storage_owner(file) {
+            add_storage_usage(&mut usage, owner, file.size)?;
+            owners.insert(file.id, owner);
+        }
+    }
+    for version in versions {
+        *refs.entry(version.blob_id).or_insert(0) += 1;
+        if let Some(owner) = owners.get(&version.file_id).copied() {
+            add_storage_usage(&mut usage, owner, version.size)?;
+        }
+    }
+    Ok((refs, usage))
+}
+
+fn folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &ad::folders::Model>) -> bool {
+    let mut visited = HashSet::new();
+    let mut current = Some(folder_id);
+    while let Some(id) = current {
+        if !visited.insert(id) {
+            return true;
+        }
+        current = folders.get(&id).and_then(|folder| folder.parent_id);
+    }
+    false
+}
+
+fn verify_local_runtime_readability(
+    blobs: &[ad::file_blobs::Model],
+    policies: &HashMap<i64, &ad::storage_policies::Model>,
+    options: &MigrationOptions,
+) -> ValidationCheck {
+    let mut checked = 0usize;
+    let mut failed = 0usize;
+    let mut failures = Vec::new();
+    for blob in blobs {
+        let Some(policy) = policies.get(&blob.policy_id) else {
+            continue;
+        };
+        if policy.driver_type != "local" {
+            continue;
+        }
+        checked += 1;
+        let path = local_storage_path(&policy.base_path, &blob.storage_path);
+        let result: Result<()> = (|| {
+            let metadata = std::fs::metadata(&path)?;
+            if !metadata.is_file() || metadata.len() != u64::try_from(blob.size)? {
+                bail!("not a regular file with the expected size");
+            }
+            let mut file = std::fs::File::open(&path)?;
+            if metadata.len() > 0 {
+                let mut byte = [0_u8; 1];
+                file.read_exact(&mut byte)?;
+                file.seek(SeekFrom::End(-1))?;
+                file.read_exact(&mut byte)?;
+            }
+            if options.storage_mode == StorageMode::CopyLocal
+                && blob.hash.len() == 64
+                && sha256_file(&path)? != blob.hash
+            {
+                bail!("SHA-256 differs from the copied blob hash");
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failed += 1;
+            if failures.len() < 3 {
+                failures.push(format!("blob {} at {}: {error}", blob.id, path.display()));
+            }
+        }
+    }
+    ValidationCheck {
+        name: "local_storage_runtime_readability".to_string(),
+        passed: failed == 0,
+        expected: checked.to_string(),
+        actual: (checked - failed).to_string(),
+        message: (failed > 0).then(|| failures.join("; ")),
+    }
 }
 
 fn hash_password(password: &str) -> Result<String> {
@@ -2741,9 +3130,34 @@ mod tests {
         assert!(tasks.iter().any(|task| task.status == "canceled"));
         let blob = ad::file_blobs::Entity::find().one(&target).await?.unwrap();
         assert_eq!(blob.storage_path, "uploads/object.bin");
+        let files = ad::files::Entity::find().all(&target).await?;
+        let versions = ad::file_versions::Entity::find().all(&target).await?;
+        let expected_ref_count = files.iter().filter(|file| file.blob_id == blob.id).count() as i64
+            + versions
+                .iter()
+                .filter(|version| version.blob_id == blob.id)
+                .count() as i64;
+        assert_eq!(blob.ref_count, expected_ref_count);
         let user = ad::users::Entity::find().one(&target).await?.unwrap();
         assert!(user.must_change_password);
         assert_eq!(user.role, "admin");
+        let expected_storage_used = files.iter().map(|file| file.size).sum::<i64>()
+            + versions.iter().map(|version| version.size).sum::<i64>();
+        assert_eq!(user.storage_used, expected_storage_used);
+        assert!(
+            report
+                .validation
+                .checks
+                .iter()
+                .any(|check| check.name == "blob_ref_counts_recalculated" && check.passed)
+        );
+        assert!(
+            report
+                .validation
+                .checks
+                .iter()
+                .any(|check| check.name == "storage_usage_recalculated" && check.passed)
+        );
         target.close().await?;
 
         let _ = std::fs::remove_file(source_path);
@@ -3372,6 +3786,13 @@ mod tests {
         assert_eq!(
             blob.hash,
             sha256_file(&source_root.join("uploads/object.bin"))?
+        );
+        assert!(
+            report
+                .validation
+                .checks
+                .iter()
+                .any(|check| { check.name == "local_storage_runtime_readability" && check.passed })
         );
         target.close().await?;
 

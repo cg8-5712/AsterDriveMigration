@@ -133,6 +133,8 @@ Folders, metadata, shares, direct links and tasks are still stage-level only: a 
 - every Cloudreve tag metadata assignment and its AD tag/entity IDs
 - every regenerated direct-link URL and its Cloudreve/AD file IDs
 - post-commit database count checks, imported-task terminal-state checks, tag-binding checks and direct-link property checks
+- final relation checks for folders, blobs, files, versions and shares; automatic `ref_count` and `storage_used` recalculation using AD's current-file-plus-history accounting rule
+- when `--verify-local-storage` or `--storage-mode copy-local` is used, local AD object open/read checks (and copied-object SHA-256 checks)
 - run ID, whether the execution resumed, and the list of completed stages
 
 The CLI writes the JSON report before returning a validation error. A failed post-migration check therefore produces a usable report and exits with a non-zero status. Direct-link URLs are bearer-style public capabilities, so the report file must be stored with restricted access.
