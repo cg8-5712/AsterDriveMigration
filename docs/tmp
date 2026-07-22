@@ -1,0 +1,313 @@
+# Cloudreve v4 → AsterDrive（AD）生产迁移上线手册
+
+> **适用版本**：迁移器提交 `9804f15`（2026-07-23 基线）
+> **适用范围**：Cloudreve v4 迁移至 AsterDrive（下文简称 AD）
+> **文档性质**：生产上线运行手册（Runbook）。本文件替代此前的历史讨论和待办记录。
+
+## 1. 目标、范围与原则
+
+本迁移器将 Cloudreve 的业务数据转换并写入 AD，而非把源表逐行复制到目标表。迁移完成的最低标准是：AD 数据库中的关系、统计和可访问对象均可验证；切换后由 AD 独立提供服务；源库与源对象在回滚窗口内保持可恢复。
+
+### 1.1 当前已覆盖的数据
+
+迁移按以下阶段执行：
+
+```text
+policies → policy_groups → users → folders → blobs → files → metadata → shares → direct_links → tasks
+```
+
+| 类别 | 当前状态 | 说明 |
+|---|---|---|
+| 存储策略、策略组、用户 | 已支持 | 用户密码不能复用；迁移时写入指定临时密码并强制下次修改。 |
+| 文件夹、文件、文件版本、实体 blob | 已支持 | `blobs`、`files` 为 keyset 分页和批事务；保留源到目标的持久映射。 |
+| 文件标签与元数据 | 已支持 | 标签绑定及元数据关系参与迁移后检查。 |
+| 分享与新直链 | 已支持 | 新建 AD share token/direct-link；旧 Cloudreve URL 不会自动保持可用。 |
+| 归档任务 | 有限支持 | 只迁移为终态历史记录；活动上传任务和运行中会话不迁移。 |
+| 本地存储零拷贝复用 | 已支持 | AD 读取原 Cloudreve 本地根目录，无需复制字节。 |
+| 本地存储复制 | 已支持 | 支持断点续传、原子改名、哈希校验和批次失败补偿。 |
+| 远端对象存储零拷贝复用 | 有限支持 | 可保留兼容策略的 endpoint/bucket/key，但尚无提供商在线读验证。 |
+| 远端对象存储物理复制 | 未支持 | 不支持跨 bucket/endpoint 的流式复制或 multipart 上传恢复。 |
+
+### 1.2 明确不迁移的内容
+
+下列内容不得通过直接复制绕过迁移器；必须按相应业务流程重新配置、重新登录或重新注册：
+
+| 内容 | 原因与切换动作 |
+|---|---|
+| Cloudreve 密码 hash | 与 AD 的 Argon2 凭据格式不兼容；使用临时密码并要求用户修改。 |
+| 登录会话、刷新令牌、OAuth grant/client | 安全边界、签名或加密格式不同；全部失效并重新授权。 |
+| TOTP/MFA secret、passkey、WebDAV 密码 | 密钥材料与认证模型不兼容；在 AD 中重新绑定。 |
+| 节点/slave key、远程节点状态 | 属于运行时基础设施；在 AD 环境重新部署和注册。 |
+| 运行中上传、离线下载和活动任务 | 无法保证一致快照；切换前应完成、取消或人工处置。 |
+| 加密存储的密文及其旧密钥 | 不可在未知密钥和语义下安全复用；先解密导出，或单独设计密钥迁移。 |
+| 缩略图、头像、媒体衍生物、搜索索引 | 当前不会完整复制；切换后由 AD 后处理/重建流程生成。 |
+
+### 1.3 上线原则
+
+1. **先验证、后写入**：`check` 和 `migrate` 都执行源端预检；预检不通过时 `migrate` 不创建 checkpoint，也不写 AD 数据库。
+2. **一个运行 ID 对应一次可审计迁移**：生产运行必须指定稳定且唯一的 `--run-id`；发生中断只能用完全相同的配置加 `--resume` 恢复。
+3. **源端冻结优先于“实时同步”假设**：当前 fingerprint 不能检测“记录数不变但内容已修改”的所有变更。最终切换窗口必须冻结 Cloudreve 写入。
+4. **先保留、再删除**：迁移成功不等于可以删除 Cloudreve 数据。应保留源数据库备份与源对象，直至回滚窗口结束并完成业务验收。
+5. **空目标库优先**：默认要求 AD 核心业务表为空。非空目标仅可在经过专项冲突评审后使用 `--allow-non-empty-target`，不能将它当成合并能力。
+
+## 2. 上线门槛（Go / No-Go）
+
+以下项目全部满足才允许生产切换；任一项失败即为 **No-Go**。
+
+| 门槛 | 验收证据 | 责任角色 |
+|---|---|---|
+| AD 目标库已由对应版本的 AD migration 初始化 | 空库检查、schema 版本记录、备份点 | AD DBA |
+| Cloudreve 源库和所有对象存储已完成可恢复备份 | 数据库备份校验、对象版本/快照或恢复演练记录 | Cloudreve DBA / 存储管理员 |
+| 存储方案已评审 | 选择“零拷贝复用”或“本地复制”，并完成挂载/权限演练 | 存储管理员 |
+| 预检通过 | `check` 的 JSON report 中 preflight 无失败项 | 迁移负责人 |
+| 演练通过 | 脱敏全量或代表性样本完成 `migrate`、恢复、验证和回滚演练 | 迁移负责人 / QA |
+| 最终窗口源端已冻结 | 公告、反向代理/应用只读策略、审计日志 | 业务负责人 / 运维 |
+| 自动检查通过 | 迁移 JSON report 无 post-validation failure；计数、关系、统计满足预期 | 迁移负责人 |
+| 人工端到端验收通过 | AD 文件下载、目录/文件分享、密码/过期/次数、直链抽样记录 | QA / 业务代表 |
+| 回滚方案已确认 | DNS/入口回切步骤、源服务保留时间、负责人和时限 | 发布负责人 |
+
+## 3. 存储模式决策
+
+### 3.1 决策表
+
+| 条件 | 选择 | 数据占用与风险 |
+|---|---|---|
+| AD 能安全挂载 Cloudreve 同一份本地数据目录，并能保持相同相对对象路径 | 本地零拷贝复用（推荐） | 不产生第二份文件；必须确认容器/服务进程实际可读。 |
+| AD 与 Cloudreve 使用同一兼容对象存储 endpoint、bucket、凭据和 key 规则 | 远端零拷贝复用（有限支持） | 不产生第二份文件；上线前必须手工完成 provider `HeadObject` 与 range read 验收。 |
+| AD 必须使用不同的本地磁盘/根目录 | `copy-local` | 需要目的端近似一份完整数据空间，外加迁移期间部分 `.part` 临时文件空间。 |
+| AD 必须使用不同 endpoint/bucket 的远端对象存储 | **当前 No-Go** | 迁移器尚未实现远端流式 copy、multipart checkpoint 与失败清理。 |
+| Cloudreve 策略为 Qiniu、Upyun、remote-node、OneDrive 或加密存储 | **当前 No-Go 或显式跳过** | 不可安全复用；可用 `--skip-unsupported-policies` 仅在业务批准丢弃其依赖文件时跳过。 |
+
+### 3.2 本地零拷贝复用
+
+使用 `--local-base-path` 指定默认 Cloudreve 根目录；有多个卷时，为每个源 policy 显式传入 `--local-policy-root SOURCE_POLICY_ID=PATH`。AD 部署环境必须把相同目录挂载到其配置的目标 policy `base_path`，并保证运行用户拥有读取权限。
+
+```powershell
+cargo run -- migrate `
+  --source-url "<CLOUDREVE_DATABASE_URL>" `
+  --target-url "<AD_DATABASE_URL>" `
+  --temporary-password "<临时密码>" `
+  --local-base-path "D:/cloudreve-default" `
+  --local-policy-root "1=D:/cloudreve-default" `
+  --local-policy-root "2=E:/cloudreve-archive" `
+  --verify-local-storage `
+  --run-id "cloudreve-cutover-2026-07-23" `
+  --report-path "C:/migration/cloudreve-to-ad.json"
+```
+
+`--verify-local-storage` 会检查每一个兼容本地 policy，以及每个迁移 blob 的解析路径、普通文件属性、打开权限、文件大小和首尾读取。它不能证明 Docker/Kubernetes 挂载正确，也不能替代启动 AD 后的 HTTP 下载验证。
+
+### 3.3 本地复制模式（`copy-local`）
+
+当必须迁往不同本地根目录时，使用 `--storage-mode copy-local`。迁移器保持 `entities.source` 相对路径，并写入新的 AD 本地 policy 根目录；源路径含绝对路径或目录逃逸时会被拒绝。
+
+```powershell
+cargo run -- migrate `
+  --source-url "<CLOUDREVE_DATABASE_URL>" `
+  --target-url "<AD_DATABASE_URL>" `
+  --temporary-password "<临时密码>" `
+  --local-policy-root "1=D:/cloudreve-data" `
+  --storage-mode copy-local `
+  --target-local-policy-root "1=E:/asterdrive-data" `
+  --verify-local-storage `
+  --run-id "cloudreve-local-copy-2026-07-23" `
+  --report-path "C:/migration/cloudreve-local-copy.json"
+```
+
+目的根目录必须已存在，且不得与源根目录相同。若最终对象已经存在，迁移器只在其大小和 SHA-256 都等于源对象时复用，绝不覆盖不匹配对象。
+
+#### 复制恢复和补偿语义
+
+1. 数据先流式写入目标目录中的 `.aster-migration-<run-hash>-<entity-id>.part`。
+2. 同一 `--run-id --resume` 会校验已有临时文件前缀后续写；不匹配时立即失败，不会盲目追加。
+3. 写满后执行 `sync_all`，再通过同目录原子 `rename` 发布最终对象。
+4. 同一 blob 批次的 AD 数据库事务回滚时，迁移器删除本批新发布的最终对象作为补偿。
+5. 数据库 commit 结果不确定时，不删除已发布对象；恢复运行会校验并复用大小/哈希一致的最终对象。
+
+这只覆盖兼容 **local** policy 的原文件；不复制缩略图，也不支持远端对象存储复制。
+
+## 4. 生产执行 SOP
+
+### 4.1 T-7 至 T-1：准备和演练
+
+| 时间 | 操作 | 完成标准 |
+|---|---|---|
+| T-7 天 | 清点 Cloudreve policy、数据量、最大对象、文件版本、分享和直链；选择存储模式 | 已签字的范围、容量与风险清单。 |
+| T-7 天 | 初始化隔离 AD 目标库，并以相同 AD 版本跑完 schema migration | 可连接、目标核心表为空、备份可还原。 |
+| T-5 天 | 用脱敏生产样本执行 `check`、`--dry-run`、全量迁移和 `--resume` 故障演练 | JSON report、恢复日志、验收记录完整。 |
+| T-3 天 | 完成 AD 容器/主机的真实存储挂载、网络、凭据和最小权限验证 | AD 进程身份可读全部目标对象。 |
+| T-1 天 | 确认公告、冻结窗口、回滚负责人、监控看板和工单 | 所有人知悉停止写入与回切条件。 |
+
+### 4.2 预检和演练命令
+
+先仅检查源数据和兼容性，不写 AD：
+
+```powershell
+cargo run -- check `
+  --source-url "<CLOUDREVE_DATABASE_URL>" `
+  --target-url "<AD_DATABASE_URL>" `
+  --temporary-password "<临时密码>" `
+  --report-path "C:/migration/cloudreve-preflight.json"
+```
+
+建议在已初始化、可丢弃的演练目标库上执行 `migrate --dry-run`；对本地复用场景同时加 `--verify-local-storage`，从而在任何目标写入之前扫描所有可迁移本地对象。
+
+源端预检会拒绝或报告以下问题：文件夹 owner/parent/policy 缺失、文件夹环、文件 owner/folder/policy/primary entity 缺失、负文件或实体大小、`file_entities`/metadata/share/direct-link/task 孤儿、负分享/直链计数，以及重复的 active user email。必须修复源数据或制定经批准的剔除方案后重试，不能绕过。
+
+### 4.3 切换窗口
+
+1. 停止 Cloudreve 上传、删除、移动、重命名、分享修改、后台任务和管理写操作；必要时下线入口或切成只读。
+2. 等待进行中的上传与后台任务结束；无法结束的任务需取消并登记，不能尝试迁移其活动状态。
+3. 对源数据库做最终备份，对本地卷做快照或对对象存储记录版本/清单；记录冻结开始时间与备份校验结果。
+4. 在冻结状态再次运行 `check`。结果失败时停止发布，先修复问题或回退冻结。
+5. 对全新 AD 目标库执行正式 `migrate`，使用唯一、稳定的 `--run-id` 和受限权限目录下的 `--report-path`。
+6. 只观察已经提交的进度：阶段会输出 start/completed；blob/file 批次输出 `source_rows=processed/total`、`batch_rows`、`batch_bytes`，该输出只会在事务成功提交后出现。
+7. 完成自动校验和人工验收后再让 AD 对外开放；保留 Cloudreve 只读实例直至回滚窗口结束。
+
+### 4.4 中断与恢复
+
+发生数据库短暂故障、磁盘/网络问题或进程退出时，先保存 stderr、JSON report 和环境信息，修复外部原因后，以**同一个**运行 ID、相同密码、相同 direct-link secret、相同存储参数恢复：
+
+```powershell
+cargo run -- migrate `
+  --source-url "<CLOUDREVE_DATABASE_URL>" `
+  --target-url "<AD_DATABASE_URL>" `
+  --temporary-password "<与首次完全相同>" `
+  --local-base-path "D:/cloudreve-default" `
+  --run-id "cloudreve-cutover-2026-07-23" `
+  --blob-batch-size 500 `
+  --file-batch-size 500 `
+  --resume `
+  --report-path "C:/migration/cloudreve-to-ad-resume.json"
+```
+
+恢复会校验 source URL/计数 fingerprint、target URL fingerprint 与迁移计划 fingerprint；不一致时必须停止并调查，不能创建“看似相同”的新运行继续写入。`--blob-batch-size` 与 `--file-batch-size` 为运行参数，可在恢复时调整；默认均为 `500`，合法范围为 `1..=10000`。blob/file 仅重试最后一个未提交批次，其他阶段目前仍以整阶段事务恢复。
+
+### 4.5 秘密和报告管理
+
+- 数据库 URL、临时密码、对象存储凭据和 direct-link secret 必须由秘密管理系统/受限环境变量提供，禁止出现在 shell 历史、工单正文或提交记录中。
+- JSON report 可能包含新 direct-link URL；将其视为 bearer capability，限制读权限并设置留存期限。
+- 不得把 `--skip-unsupported-policies` 当作常规开关。启用前应出具受影响用户、文件数、字节数和业务批准记录。
+
+## 5. 自动校验与人工验收
+
+### 5.1 迁移器已执行的校验
+
+迁移成功后，迁移器在最终事务中重算并校验：
+
+| 校验类别 | 当前覆盖 |
+|---|---|
+| 映射与计数 | 支持对象的源/目标数量、object mapping、归档任务状态、标签绑定、直链 property。 |
+| 引用计数 | `file_blobs.ref_count = files + file_versions` 的实际引用数。 |
+| 用量统计 | `users.storage_used` 和 `teams.storage_used` 依 AD 当前文件加历史版本的真实 scope 重算。 |
+| 关系完整性 | folder owner/creator/team/policy/parent 与环；blob policy；file 的 blob/folder/owner/creator/team/scope；file version 的 file/blob；share owner/team/target 且恰好一个 target。 |
+| 本地对象可读性 | 使用 `--verify-local-storage` 或 `copy-local` 时，检查 AD policy `base_path` 下文件类型、大小、打开和首尾读取；`copy-local` 另重算 SHA-256。 |
+
+任何 post-validation failure 都会使命令以非零状态退出，但 JSON report 会在退出前写出，供事故处理使用。
+
+### 5.2 必须人工完成的验收
+
+当前迁移器尚未对运行中的 AD HTTP 服务和远端 provider 做在线验证。每种存储 policy 至少抽样普通文件、小文件、最大文件、带历史版本文件与包含特殊字符路径文件，并记录结果：
+
+| 验收项 | 通过标准 |
+|---|---|
+| AD 登录与临时密码 | 用户可登录，系统要求修改临时密码；不接受旧 Cloudreve 密码。 |
+| 文件浏览和下载 | Web/API 实际下载字节数、hash 与源样本一致；目录层级、名称、大小、版本符合预期。 |
+| 分享 | 文件分享和目录分享均可访问；密码、过期时间、下载次数按 AD 语义生效。 |
+| 新直链 | 迁移产生的 AD direct-link 可访问且权限符合预期。 |
+| 远端策略 | 使用真实 AD 进程凭据执行 `HeadObject`、range read 和完整下载；验证 endpoint、bucket、key 与网络策略。 |
+| 配额与统计 | 管理界面/API 中用户和团队用量与迁移 report 的重算值一致。 |
+| 安全回归 | 未迁移的 session、OAuth、MFA/passkey 均不能继续使用；AD 新认证流程正常。 |
+
+旧 Cloudreve `/f/...`、旧 share URL 以及旧直链不会自动重定向。若业务承诺旧链接可用，必须另行建设受控的重定向服务或生成受权限保护的 old→new URL 映射清单，并完成安全评审。
+
+## 6. 回滚与故障处置
+
+### 6.1 回滚原则
+
+- 在 AD 对外开放前发现预检、自动校验或人工验收失败：停止发布，保留证据，继续由 Cloudreve 提供服务。
+- AD 已开放但未超出回滚窗口：停止 AD 写入，将入口/DNS/反向代理切回仍保留的 Cloudreve，只读/冻结策略按业务决定解除。
+- 切勿在回滚窗口内删除源库、源对象、AD 目标库或迁移 checkpoint；它们是调查和恢复依据。
+- 回滚不等于“反向迁移”。当前没有 AD → Cloudreve 的反向数据同步；AD 开放后新产生的写入需按业务决定丢弃、人工导出或另行处理。
+
+### 6.2 故障处理表
+
+| 场景 | 立即动作 | 后续动作 |
+|---|---|---|
+| `check` 或 preflight 失败 | 不执行正式迁移 | 修复源数据、记录豁免，重新预检。 |
+| blob/file 批次失败 | 不更换 run ID；收集日志 | 修复外部原因后 `--resume`；最后未提交批次会重试。 |
+| `copy-local` 中断 | 保留 `.part` 文件 | 使用相同 run ID 恢复；系统校验前缀并继续复制。 |
+| 本地目标已有同名对象但 hash/大小不同 | 立即停止 | 不允许覆盖；隔离冲突对象并调查路径或数据污染。 |
+| 数据库 commit 结果不确定 | 不手工删除新最终对象 | 恢复时由迁移器核验并复用匹配对象。 |
+| 迁移后关系/统计校验失败 | 不开放 AD | 审阅 report、保留目标库快照；修复代码/数据后在新目标库重跑。 |
+| 远端对象读失败 | 不开放使用该 policy 的 AD 服务 | 检查 AD 部署网络、凭据、endpoint/bucket/key，完成 provider 手工验证。 |
+
+## 7. 当前缺口与风险登记
+
+### P0：阻塞“完整生产迁移”的缺口
+
+| 风险 | 当前状态 | 上线要求 / 验收条件 | 建议责任人 |
+|---|---|---|---|
+| 远端对象存储在线验证 | 未实现自动 `HeadObject`/range read | 生产切换前对每个远端 policy 完成真实 AD 凭据的手工验证；后续实现自动化。 | 存储管理员 / QA |
+| 跨远端 bucket/endpoint 物理复制 | 未实现 | 需要该模式时为 No-Go；实现流式 copy、真实 hash 去重、multipart upload checkpoint（upload ID、part、ETag、字节数）与 abort/cleanup 后方可上线。 | 迁移研发 |
+| AD HTTP 端到端验证 | 未自动化 | 每次切换必须完成第 5.2 节人工验收；后续建设集成测试环境。 | QA / AD 运维 |
+| 生产规模与真实数据库验证 | 缺 MySQL、PostgreSQL、真实 AD 启动和大样本 E2E | 在目标 DB 引擎、脱敏生产样本和预计容量上演练，覆盖中断恢复和性能基线。 | DBA / QA |
+| 源端变更识别 | fingerprint 无法覆盖内容不变计数的修改 | 最终窗口强制冻结写入，完成冻结后的最终迁移与校验。 | 发布负责人 |
+
+### P1：可恢复性、合并和业务兼容
+
+| 风险 | 当前状态 | 处理要求 |
+|---|---|---|
+| 其余 stage 的批次恢复 | folders、metadata/tags、shares、direct_links、tasks 仍为 stage 事务 | 超大规模或高失败率场景应先扩展为分页 cursor 和批次事务。 |
+| 全对象幂等映射 | blob/file 使用持久 object map；其余多依赖 context | 上线至非空目标或复杂恢复前，补齐 created/reused/skipped/conflict 状态和映射。 |
+| 非空目标安全合并 | 仅有空库保护；没有完整合并语义 | 默认禁止；必须支持时设计并验收 `fail/rename/skip/reuse/update` 冲突策略与报告。 |
+| 业务冲突策略 | username 有后缀策略，email、同目录重名、share token/target 不完整 | 由业务确定优先级和处置，不得静默覆盖。 |
+| `files.props` | 尚无白名单映射 | 只迁移逐键评审后的安全 key，禁止暴露 Cloudreve 内部状态。 |
+| Cloudreve `settings` | 尚未安全映射到 AD `system_config` | 逐键定义类型、namespace、可见性、敏感性与 AD 默认值。 |
+| Cloudreve group 与 AD team | 不等价 | 需要业务提供组织映射；不得把 group 自动猜测为 team。 |
+| 媒体与衍生资源 | avatar、thumbnail、媒体元数据、搜索重建未完成 | 作为上线后后处理任务并对用户公告。 |
+| 旧 URL 兼容 | 已生成新 AD 直链，不保持旧 URL | 如需兼容，建设重定向/映射服务；旧直链次数、限速、撤销不能等价继承。 |
+| 任务与活动会话 | task 仅终态归档 | 定义切换期上传/任务取消、完成或人工归档 SOP。 |
+
+### P2：运维体验和可观测性
+
+| 缺口 | 当前替代方式 | 后续目标 |
+|---|---|---|
+| 独立命令 | 当前使用 `check`、`migrate`、`--resume` 和 JSON report | 增加 `migrate list/status/resume/report/abort/verify/cleanup`。 |
+| 进度估算 | 已显示提交后批次行数和字节数 | 增加累计吞吐、ETA、阶段耗时。 |
+| 日志治理 | stderr 和 JSON report | 增加结构化日志、敏感字段脱敏测试、分类 exit code。 |
+| 映射审计 | checkpoint/object map 与 JSON report | 增加可控访问的 CSV old→new 映射报告。 |
+
+## 8. 命令与参数速查
+
+| 参数 | 用途与限制 |
+|---|---|
+| `--source-url` / `--target-url` | Cloudreve 与 AD 数据库连接；生产环境使用秘密管理，禁止记录明文。 |
+| `--temporary-password` | 所有迁移用户的初始密码；恢复时必须与首次运行一致。 |
+| `--run-id` | 生产必填的稳定运行标识；不可在同一次恢复中更换。 |
+| `--resume` | 从同 run ID checkpoint 恢复；会校验 source/target/plan fingerprint。 |
+| `--report-path` | 输出 JSON report；文件包含敏感直链，应受限保存。 |
+| `--dry-run` | 执行预检而不写目标；用于演练和切换前检查。 |
+| `--local-base-path` | 本地源 policy 的默认根目录。 |
+| `--local-policy-root ID=PATH` | 覆盖某个 Cloudreve local policy 的源根目录；可重复使用。 |
+| `--storage-mode copy-local` | 复制兼容 local policy 的对象到新根目录；不支持远端 copy。 |
+| `--target-local-base-path` | copy-local 的默认目标根目录。 |
+| `--target-local-policy-root ID=PATH` | copy-local 时覆盖指定源 policy 的目标根目录；可重复使用。 |
+| `--verify-local-storage` | 在本地复用/复制时验证路径、大小、可读性；复制时额外验证 SHA-256。 |
+| `--blob-batch-size` | blob 每批大小，默认 `500`，范围 `1..=10000`。 |
+| `--file-batch-size` | file 每批大小，默认 `500`，范围 `1..=10000`。 |
+| `--allow-non-empty-target` | 仅解除空目标库保护，**不**提供通用合并/冲突解决能力。 |
+| `--skip-unsupported-policies` | 显式跳过不兼容 policy 及其依赖文件；必须获得业务批准。 |
+
+## 9. 发布完成定义
+
+一次 Cloudreve → AD 迁移只有在以下条件同时成立时才可标记为完成：
+
+1. 目标 AD 使用正确 schema、配置和存储挂载启动，且迁移器 report 无失败校验；
+2. 冻结后的 Cloudreve 数据已完成迁移，且所有预检、关系、统计与本地可读性检查通过；
+3. 所有目标存储 policy 完成真实 AD 运行环境下的读验证；
+4. 业务已验收登录、文件、历史版本、分享与新直链，并接受未迁移内容和旧 URL 策略；
+5. 回滚窗口、源备份、源对象保留期限和切回负责人已明确；
+6. 回滚窗口结束后，才可按数据保留制度处理 Cloudreve 源库与源对象。
+
+在远端物理复制、完整 HTTP 自动化验证、真实生产规模 E2E 和源端冻结控制尚未完善前，不应宣称迁移器已经覆盖“任意 Cloudreve 部署的一键无损迁移”。
