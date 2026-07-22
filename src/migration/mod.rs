@@ -85,6 +85,8 @@ pub struct MigrationReport {
     pub direct_links: Vec<DirectLinkReport>,
     pub tag_assignments: Vec<TagAssignmentReport>,
     pub validation: MigrationValidation,
+    #[serde(default)]
+    pub preflight: MigrationPreflight,
     pub run_id: Option<String>,
     pub resumed: bool,
     pub completed_stages: Vec<String>,
@@ -127,6 +129,7 @@ impl Default for MigrationReport {
             direct_links: Vec::new(),
             tag_assignments: Vec::new(),
             validation: MigrationValidation::default(),
+            preflight: MigrationPreflight::default(),
             run_id: None,
             resumed: false,
             completed_stages: Vec::new(),
@@ -185,6 +188,23 @@ pub struct MigrationValidation {
     pub performed: bool,
     pub passed: bool,
     pub checks: Vec<ValidationCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationPreflight {
+    pub performed: bool,
+    pub passed: bool,
+    pub checks: Vec<ValidationCheck>,
+}
+
+impl Default for MigrationPreflight {
+    fn default() -> Self {
+        Self {
+            performed: false,
+            passed: true,
+            checks: Vec::new(),
+        }
+    }
 }
 
 impl Default for MigrationValidation {
@@ -319,6 +339,18 @@ impl fmt::Display for MigrationReport {
                 )?;
             }
         }
+        if self.preflight.performed {
+            writeln!(
+                output,
+                "preflight: {} ({} checks)",
+                if self.preflight.passed {
+                    "passed"
+                } else {
+                    "failed"
+                },
+                self.preflight.checks.len()
+            )?;
+        }
         if !self.warnings.is_empty() {
             writeln!(output, "warnings:")?;
             for warning in &self.warnings {
@@ -355,6 +387,7 @@ pub async fn inspect(
     let mut report = source_data.report();
     report.dry_run = true;
     report.warnings.extend(source_data.compatibility_warnings());
+    report.preflight = run_preflight(&source, &source_data).await?;
     Ok(report)
 }
 
@@ -450,6 +483,17 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     let target = connect(&options.target_url, "AsterDrive").await?;
     let source_data = SourceData::load(&source, options.include_deleted).await?;
     validate_target_schema(&target).await?;
+    let preflight = run_preflight(&source, &source_data).await?;
+    if !preflight.passed {
+        bail!(
+            "Cloudreve preflight failed ({} checks); run `check --report-path` for details and repair source data before migration",
+            preflight
+                .checks
+                .iter()
+                .filter(|check| !check.passed)
+                .count()
+        );
+    }
 
     let unsupported = source_data.unsupported_policy_types();
     if !unsupported.is_empty() && !options.skip_unsupported_policies {
@@ -474,6 +518,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     let mut report = source_data.report();
     report.dry_run = options.dry_run;
     report.warnings.extend(source_data.compatibility_warnings());
+    report.preflight = preflight;
     if options.dry_run {
         report.run_id = options.run_id.clone();
         return Ok(report);
@@ -569,10 +614,16 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
 
     let password_hash = hash_password(&options.default_password)?;
 
-    for stage in MigrationStage::ALL {
+    for (stage_index, stage) in MigrationStage::ALL.into_iter().enumerate() {
         if !stage.should_run_after(last_completed_stage.as_deref())? {
             continue;
         }
+        eprintln!(
+            "[progress] stage {}/{} {} started",
+            stage_index + 1,
+            MigrationStage::ALL.len(),
+            stage.as_str()
+        );
         if stage == MigrationStage::Blobs {
             let inputs = BlobBatchInputs {
                 source: &source,
@@ -595,6 +646,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
                 });
             }
             last_completed_stage = Some(stage.as_str().to_string());
+            eprintln!("[progress] stage {} completed", stage.as_str());
             continue;
         }
         if stage == MigrationStage::Files {
@@ -619,6 +671,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
                 });
             }
             last_completed_stage = Some(stage.as_str().to_string());
+            eprintln!("[progress] stage {} completed", stage.as_str());
             continue;
         }
         let transaction = target
@@ -665,6 +718,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
             });
         }
         last_completed_stage = Some(stage.as_str().to_string());
+        eprintln!("[progress] stage {} completed", stage.as_str());
     }
 
     report.set_mappings(&context, &blob_mappings, &file_mappings);
@@ -912,6 +966,16 @@ async fn migrate_blobs_batched(
         if let Err(error) = transaction.commit().await {
             return Err(error).wrap_err("commit blobs batch");
         }
+        let batch_bytes = entities.iter().try_fold(0_i64, |total, entity| {
+            total
+                .checked_add(entity.size)
+                .ok_or_else(|| color_eyre::eyre::eyre!("blob batch byte count overflow"))
+        })?;
+        eprintln!(
+            "[progress] blobs: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}",
+            inputs.source_data.source_blobs,
+            entities.len()
+        );
         blob_mappings.extend(mappings);
         cursor_value = last_entity_id;
     }
@@ -1003,6 +1067,16 @@ async fn migrate_files_batched(
         .await?;
         checkpoint::save_progress(&transaction, inputs.run_id, inputs.context, report).await?;
         transaction.commit().await.wrap_err("commit files batch")?;
+        let batch_bytes = files.iter().try_fold(0_i64, |total, file| {
+            total
+                .checked_add(file.size)
+                .ok_or_else(|| color_eyre::eyre::eyre!("file batch byte count overflow"))
+        })?;
+        eprintln!(
+            "[progress] files: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}",
+            inputs.source_data.source_files,
+            files.len()
+        );
         file_mappings.extend(mappings);
         cursor_value = last_file_id;
     }
@@ -2025,6 +2099,198 @@ fn invariant_check(name: &str, expected: usize, actual: usize, message: &str) ->
     }
 }
 
+async fn run_preflight(db: &DatabaseConnection, source: &SourceData) -> Result<MigrationPreflight> {
+    let files = cr::files::Entity::find().all(db).await?;
+    let entities = cr::entities::Entity::find().all(db).await?;
+    let file_entities = cr::file_entities::Entity::find().all(db).await?;
+    let user_ids = source
+        .users
+        .iter()
+        .map(|user| user.id)
+        .collect::<HashSet<_>>();
+    let policy_ids = source
+        .policies
+        .iter()
+        .map(|policy| policy.id)
+        .collect::<HashSet<_>>();
+    let file_ids = files.iter().map(|file| file.id).collect::<HashSet<_>>();
+    let entity_ids = entities
+        .iter()
+        .map(|entity| entity.id)
+        .collect::<HashSet<_>>();
+    let folder_ids = source
+        .folders
+        .iter()
+        .map(|folder| folder.id)
+        .collect::<HashSet<_>>();
+    let folders_by_id = source
+        .folders
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+
+    let invalid_folders = source
+        .folders
+        .iter()
+        .filter(|folder| {
+            !user_ids.contains(&folder.owner_id)
+                || folder
+                    .file_children
+                    .is_some_and(|id| !folder_ids.contains(&id))
+                || folder
+                    .storage_policy_files
+                    .is_some_and(|id| !policy_ids.contains(&id))
+        })
+        .count();
+    let folder_cycles = source
+        .folders
+        .iter()
+        .filter(|folder| source_folder_has_cycle(folder.id, &folders_by_id))
+        .count();
+    let invalid_files = files
+        .iter()
+        .filter(|file| {
+            !user_ids.contains(&file.owner_id)
+                || file
+                    .file_children
+                    .is_some_and(|id| !folder_ids.contains(&id))
+                || file
+                    .storage_policy_files
+                    .is_some_and(|id| !policy_ids.contains(&id))
+                || file
+                    .primary_entity
+                    .is_some_and(|id| !entity_ids.contains(&id))
+                || file.size < 0
+        })
+        .count();
+    let invalid_entities = entities
+        .iter()
+        .filter(|entity| entity.size < 0 || !policy_ids.contains(&entity.storage_policy_entities))
+        .count();
+    let invalid_file_entities = file_entities
+        .iter()
+        .filter(|relation| {
+            !file_ids.contains(&relation.file_id) || !entity_ids.contains(&relation.entity_id)
+        })
+        .count();
+    let invalid_metadata = source
+        .metadata
+        .iter()
+        .filter(|metadata| !file_ids.contains(&metadata.file_id))
+        .count();
+    let invalid_shares = source
+        .shares
+        .iter()
+        .filter(|share| {
+            share.user_shares.is_none_or(|id| !user_ids.contains(&id))
+                || share.file_shares.is_none_or(|id| !file_ids.contains(&id))
+                || share.views < 0
+                || share.downloads < 0
+                || share.remain_downloads.is_some_and(|value| value < 0)
+        })
+        .count();
+    let invalid_direct_links = source
+        .direct_links
+        .iter()
+        .filter(|link| !file_ids.contains(&link.file_id) || link.downloads < 0 || link.speed < 0)
+        .count();
+    let invalid_tasks = source
+        .tasks
+        .iter()
+        .filter(|task| task.user_tasks.is_some_and(|id| !user_ids.contains(&id)))
+        .count();
+    let duplicate_emails = source
+        .users
+        .iter()
+        .fold(HashMap::<&str, usize>::new(), |mut counts, user| {
+            *counts.entry(user.email.as_str()).or_default() += 1;
+            counts
+        })
+        .values()
+        .filter(|count| **count > 1)
+        .count();
+
+    let checks = vec![
+        invariant_check(
+            "source_folder_relations",
+            0,
+            invalid_folders,
+            "folders have an orphan owner, parent, or policy",
+        ),
+        invariant_check(
+            "source_folder_cycles",
+            0,
+            folder_cycles,
+            "folders contain parent cycles",
+        ),
+        invariant_check(
+            "source_file_relations",
+            0,
+            invalid_files,
+            "files have an orphan owner, parent, policy, primary entity, or negative size",
+        ),
+        invariant_check(
+            "source_entity_relations",
+            0,
+            invalid_entities,
+            "entities have an orphan policy or negative size",
+        ),
+        invariant_check(
+            "source_file_entity_relations",
+            0,
+            invalid_file_entities,
+            "file_entities contain an orphan file or entity",
+        ),
+        invariant_check(
+            "source_metadata_relations",
+            0,
+            invalid_metadata,
+            "metadata references a missing file",
+        ),
+        invariant_check(
+            "source_share_relations",
+            0,
+            invalid_shares,
+            "shares have a missing owner/target or invalid counters",
+        ),
+        invariant_check(
+            "source_direct_link_relations",
+            0,
+            invalid_direct_links,
+            "direct links have a missing file or invalid counters",
+        ),
+        invariant_check(
+            "source_task_relations",
+            0,
+            invalid_tasks,
+            "tasks reference a missing user",
+        ),
+        invariant_check(
+            "source_duplicate_emails",
+            0,
+            duplicate_emails,
+            "active source users have duplicate email addresses",
+        ),
+    ];
+    Ok(MigrationPreflight {
+        performed: true,
+        passed: checks.iter().all(|check| check.passed),
+        checks,
+    })
+}
+
+fn source_folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &cr::files::Model>) -> bool {
+    let mut visited = HashSet::new();
+    let mut current = Some(folder_id);
+    while let Some(id) = current {
+        if !visited.insert(id) {
+            return true;
+        }
+        current = folders.get(&id).and_then(|folder| folder.file_children);
+    }
+    false
+}
+
 async fn validate_migration_result(
     db: &DatabaseConnection,
     before: &TargetCounts,
@@ -2545,6 +2811,7 @@ struct SourceData {
     source_files: u64,
     symbolic_files: u64,
     source_entities: u64,
+    source_blobs: u64,
     source_file_entities: u64,
     include_deleted: bool,
     shares: Vec<cr::shares::Model>,
@@ -2578,6 +2845,15 @@ impl SourceData {
             cr::entities::Entity::find().filter(cr::entities::Column::DeletedAt.is_null())
         };
         let source_entities = entity_query.count(db).await?;
+        let blob_query = if include_deleted {
+            cr::entities::Entity::find()
+        } else {
+            cr::entities::Entity::find().filter(cr::entities::Column::DeletedAt.is_null())
+        };
+        let source_blobs = blob_query
+            .filter(cr::entities::Column::Type.eq(0))
+            .count(db)
+            .await?;
         let source_file_entities = cr::file_entities::Entity::find().count(db).await?;
         let shares = cr::shares::Entity::find().all(db).await?;
         let metadata = cr::metadata::Entity::find().all(db).await?;
@@ -2595,6 +2871,7 @@ impl SourceData {
             source_files,
             symbolic_files,
             source_entities,
+            source_blobs,
             source_file_entities,
             include_deleted,
             shares: filter_deleted(shares, include_deleted, |model| model.deleted_at.is_some()),
@@ -2990,6 +3267,37 @@ mod tests {
         assert_eq!(report.skipped_by_type.get("share"), Some(&1));
         assert_eq!(report.skipped_objects[0].source_id, Some(42));
         assert_eq!(report.skipped_objects[0].reason, "missing blob");
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_orphan_source_relations() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let source_path = std::env::temp_dir().join(format!("cloudreve-preflight-{suffix}.db"));
+        let source_url = sqlite_url(&source_path);
+        let source = Database::connect(&source_url).await?;
+        create_source_schema(&source).await?;
+        seed_source(&source).await?;
+        source
+            .execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await?;
+        cr::file_entities::ActiveModel {
+            file_id: Set(999_001),
+            entity_id: Set(999_002),
+        }
+        .insert(&source)
+        .await?;
+
+        let source_data = SourceData::load(&source, false).await?;
+        let preflight = run_preflight(&source, &source_data).await?;
+        assert!(preflight.performed);
+        assert!(!preflight.passed);
+        assert!(preflight.checks.iter().any(|check| {
+            check.name == "source_file_entity_relations" && !check.passed && check.actual == "1"
+        }));
+
+        source.close().await?;
+        let _ = std::fs::remove_file(source_path);
+        Ok(())
     }
 
     #[test]

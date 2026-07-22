@@ -40,6 +40,8 @@ cargo run -- check `
 
 The URLs can also be provided through `CLOUDREVE_DATABASE_URL` and `ASTERDRIVE_DATABASE_URL`. SQLite, MySQL and PostgreSQL URLs supported by SeaORM can be used.
 
+`check` now performs source preflight before reporting compatibility. It checks folder cycles, orphaned file/entity/metadata/share/direct-link/task relations, missing storage policies, negative sizes/counters and duplicate active-user emails. Failed checks are included in the JSON report; `migrate` runs the same checks again and refuses to write the target database until they pass.
+
 ## Run migration
 
 ```powershell
@@ -120,6 +122,8 @@ cargo run -- migrate `
 Resume verifies the source URL/count fingerprint, target URL fingerprint and migration-plan fingerprint. Repeat the same password, direct-link secret and migration flags used by the original run. Completed stages are skipped and their source-to-target mappings are restored from the checkpoint. Blob batch size is operational only and may be adjusted when resuming.
 
 `--blob-batch-size` and `--file-batch-size` default to 500 and accept 1-10000. A failed blob or file page rolls back only that page; resume continues after the last committed entity or file ID. Blob and normal-file source rows are no longer loaded into memory as complete collections, and their mappings are stored row-by-row in `aster_external_migration_object_map`.
+
+During migration the CLI writes progress to stderr: each stage emits start/completed markers, while committed blob/file pages include processed source rows, the exact stage total, batch row count and batch bytes. Progress is printed only after the corresponding target transaction commits, so it never claims an uncommitted page as complete.
 
 Folders, metadata, shares, direct links and tasks are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. `copy-local` provides physical byte copying only for compatible local policies; remote object-storage copy/upload is not implemented.
 
