@@ -25,7 +25,7 @@ policies → policy_groups → users → folders → blobs → files → metadat
 | 归档任务 | 有限支持 | 只迁移为终态历史记录；活动上传任务和运行中会话不迁移。 |
 | 本地存储零拷贝复用 | 已支持 | AD 读取原 Cloudreve 本地根目录，无需复制字节。 |
 | 本地存储复制 | 已支持 | 支持断点续传、原子改名、哈希校验和批次失败补偿。 |
-| 远端对象存储零拷贝复用 | 有限支持 | 可保留兼容策略的 endpoint/bucket/key，但尚无提供商在线读验证。 |
+| 远端对象存储零拷贝复用 | 有限支持 | `--verify-remote-storage` 可校验 S3/OSS/KS3/OBS 的 `HeadObject` 与 range read；COS 原生校验尚未实现。 |
 | 远端对象存储物理复制 | 未支持 | 不支持跨 bucket/endpoint 的流式复制或 multipart 上传恢复。 |
 
 ### 1.2 明确不迁移的内容
@@ -248,7 +248,7 @@ cargo run -- migrate `
 
 | 风险 | 当前状态 | 上线要求 / 验收条件 | 建议责任人 |
 |---|---|---|---|
-| 远端对象存储在线验证 | 未实现自动 `HeadObject`/range read | 生产切换前对每个远端 policy 完成真实 AD 凭据的手工验证；后续实现自动化。 | 存储管理员 / QA |
+| 远端对象存储在线验证 | S3/OSS/KS3/OBS 已支持 source `HeadObject`/range read；COS 与 AD 运行时读验证仍缺失 | 对 COS 及每个目标 AD policy 完成真实 AD 凭据的手工验证；后续实现原生 COS 与 AD HTTP 自动化。 | 存储管理员 / QA |
 | 跨远端 bucket/endpoint 物理复制 | 未实现 | 需要该模式时为 No-Go；实现流式 copy、真实 hash 去重、multipart upload checkpoint（upload ID、part、ETag、字节数）与 abort/cleanup 后方可上线。 | 迁移研发 |
 | AD HTTP 端到端验证 | 未自动化 | 每次切换必须完成第 5.2 节人工验收；后续建设集成测试环境。 | QA / AD 运维 |
 | 生产规模与真实数据库验证 | 缺 MySQL、PostgreSQL、真实 AD 启动和大样本 E2E | 在目标 DB 引擎、脱敏生产样本和预计容量上演练，覆盖中断恢复和性能基线。 | DBA / QA |
@@ -294,6 +294,7 @@ cargo run -- migrate `
 | `--target-local-base-path` | copy-local 的默认目标根目录。 |
 | `--target-local-policy-root ID=PATH` | copy-local 时覆盖指定源 policy 的目标根目录；可重复使用。 |
 | `--verify-local-storage` | 在本地复用/复制时验证路径、大小、可读性；复制时额外验证 SHA-256。 |
+| `--verify-remote-storage` | 对 S3/OSS/KS3/OBS 的源对象执行认证 `HeadObject`、大小比对和 range read；COS 当前会拒绝，避免错误地标记为已验证。 |
 | `--blob-batch-size` | blob 每批大小，默认 `500`，范围 `1..=10000`。 |
 | `--file-batch-size` | file 每批大小，默认 `500`，范围 `1..=10000`。 |
 | `--allow-non-empty-target` | 仅解除空目标库保护，**不**提供通用合并/冲突解决能力。 |

@@ -38,6 +38,7 @@ pub struct MigrationOptions {
     pub target_local_base_path: Option<String>,
     pub target_local_policy_roots: BTreeMap<i64, String>,
     pub verify_local_storage: bool,
+    pub verify_remote_storage: bool,
     pub direct_link_secret: Option<String>,
     pub include_deleted: bool,
     pub allow_non_empty_target: bool,
@@ -514,6 +515,9 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     {
         verify_all_local_source_objects(&source, &source_data, &options).await?;
     }
+    if options.dry_run && options.verify_remote_storage {
+        verify_all_remote_source_objects(&source, &source_data, &options).await?;
+    }
 
     let mut report = source_data.report();
     report.dry_run = options.dry_run;
@@ -914,6 +918,15 @@ async fn migrate_blobs_batched(
                 inputs.options,
                 inputs.context,
             )?;
+        }
+        if inputs.options.verify_remote_storage {
+            verify_remote_blob_batch(
+                &entities,
+                inputs.source_data,
+                inputs.options,
+                inputs.context,
+            )
+            .await?;
         }
 
         let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
@@ -1786,6 +1799,72 @@ fn verify_local_blob_batch(
             continue;
         }
         verify_local_entity(entity, policy, options)?;
+    }
+    Ok(())
+}
+
+async fn verify_all_remote_source_objects(
+    source_db: &DatabaseConnection,
+    source: &SourceData,
+    _options: &MigrationOptions,
+) -> Result<()> {
+    const VERIFY_BATCH_SIZE: u64 = 500;
+
+    let policies = source
+        .policies
+        .iter()
+        .map(|policy| (policy.id, policy))
+        .collect::<HashMap<_, _>>();
+    let mut cursor_value = 0;
+    loop {
+        let mut query = cr::entities::Entity::find()
+            .filter(cr::entities::Column::Type.eq(0))
+            .filter(cr::entities::Column::Id.gt(cursor_value))
+            .order_by_asc(cr::entities::Column::Id)
+            .limit(VERIFY_BATCH_SIZE);
+        if !source.include_deleted {
+            query = query.filter(cr::entities::Column::DeletedAt.is_null());
+        }
+        let entities = query.all(source_db).await?;
+        let Some(last_entity) = entities.last() else {
+            return Ok(());
+        };
+        for entity in &entities {
+            let Some(policy) = policies.get(&entity.storage_policy_entities) else {
+                continue;
+            };
+            if policy.r#type != "local" && map_driver_type(&policy.r#type).is_some() {
+                remote::verify_object(policy, &entity.source, entity.size, entity.id).await?;
+            }
+        }
+        cursor_value = last_entity.id;
+    }
+}
+
+async fn verify_remote_blob_batch(
+    entities: &[cr::entities::Model],
+    source: &SourceData,
+    _options: &MigrationOptions,
+    context: &MigrationContext,
+) -> Result<()> {
+    let policies = source
+        .policies
+        .iter()
+        .map(|policy| (policy.id, policy))
+        .collect::<HashMap<_, _>>();
+    for entity in entities {
+        if !context
+            .policies
+            .contains_key(&entity.storage_policy_entities)
+        {
+            continue;
+        }
+        let Some(policy) = policies.get(&entity.storage_policy_entities) else {
+            continue;
+        };
+        if policy.r#type != "local" && map_driver_type(&policy.r#type).is_some() {
+            remote::verify_object(policy, &entity.source, entity.size, entity.id).await?;
+        }
     }
     Ok(())
 }
@@ -3189,6 +3268,7 @@ fn file_classification(name: &str) -> (String, Option<String>, String, String) {
 
 mod checkpoint;
 mod phases;
+mod remote;
 use phases::*;
 
 #[cfg(test)]
@@ -3365,6 +3445,7 @@ mod tests {
             target_local_base_path: None,
             target_local_policy_roots: std::collections::BTreeMap::new(),
             verify_local_storage: false,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -3511,6 +3592,7 @@ mod tests {
             target_local_base_path: None,
             target_local_policy_roots: std::collections::BTreeMap::new(),
             verify_local_storage: true,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -3579,6 +3661,7 @@ mod tests {
             target_local_base_path: None,
             target_local_policy_roots: std::collections::BTreeMap::new(),
             verify_local_storage: true,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -3633,6 +3716,7 @@ mod tests {
             target_local_base_path: None,
             target_local_policy_roots: std::collections::BTreeMap::new(),
             verify_local_storage: false,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -3686,6 +3770,7 @@ mod tests {
             target_local_base_path: None,
             target_local_policy_roots: std::collections::BTreeMap::new(),
             verify_local_storage: false,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -3790,6 +3875,7 @@ mod tests {
             target_local_base_path: None,
             target_local_policy_roots: std::collections::BTreeMap::new(),
             verify_local_storage: false,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -3904,6 +3990,7 @@ mod tests {
             target_local_base_path: None,
             target_local_policy_roots: std::collections::BTreeMap::new(),
             verify_local_storage: false,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -4063,6 +4150,7 @@ mod tests {
                 target_root.to_string_lossy().to_string(),
             )]),
             verify_local_storage: true,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,
@@ -4163,6 +4251,7 @@ mod tests {
                 target_root.to_string_lossy().to_string(),
             )]),
             verify_local_storage: false,
+            verify_remote_storage: false,
             direct_link_secret: Some("test-direct-link-secret".to_string()),
             include_deleted: false,
             allow_non_empty_target: false,

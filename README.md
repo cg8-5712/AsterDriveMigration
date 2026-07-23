@@ -81,6 +81,8 @@ cargo run -- migrate `
 
 `--verify-local-storage` checks each compatible local policy root and every migrated local blob's resolved path, regular-file status, open permission and byte length. With `--dry-run`, it scans all eligible local blobs before any target writes. It does not verify S3-compatible buckets or prove that a running AD instance can access a Docker mount; validate those separately before cutover.
 
+`--verify-remote-storage` enables provider-level verification for Cloudreve `s3`, `oss`, `ks3` and `obs` policies before each migrated blob is committed. It performs an authenticated `HeadObject` and validates the reported size, then performs an authenticated `bytes=0-0` range read for non-empty objects. With `--dry-run`, the full eligible remote-object set is verified before target writes begin. This verifies the source provider credentials, endpoint, bucket, object key and read path; it does not copy remote bytes or validate a running AD HTTP service. Cloudreve Tencent COS uses a distinct signing protocol and is deliberately rejected by this verification mode until native COS support is implemented.
+
 ## Copy local storage
 
 Use `--storage-mode copy-local` only when AD must use a **different local root**. It copies compatible local blobs while retaining their relative `entities.source` paths, configures AD's local policy to the target root, and stores a real SHA-256 in each copied `file_blobs.hash`. Source paths must be relative and must not escape the configured root.

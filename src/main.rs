@@ -52,6 +52,8 @@ struct MigrateArgs {
     target_local_policy_roots: Vec<String>,
     #[arg(long)]
     verify_local_storage: bool,
+    #[arg(long)]
+    verify_remote_storage: bool,
     #[arg(long, env = "ASTER_DIRECT_LINK_SECRET", hide_env_values = true)]
     direct_link_secret: Option<String>,
     #[arg(long)]
@@ -92,6 +94,7 @@ async fn main() -> Result<()> {
                     args.target_local_policy_roots,
                 )?,
                 verify_local_storage: args.verify_local_storage,
+                verify_remote_storage: args.verify_remote_storage,
                 direct_link_secret: args.direct_link_secret,
                 include_deleted: args.connection.include_deleted,
                 allow_non_empty_target: args.allow_non_empty_target,
