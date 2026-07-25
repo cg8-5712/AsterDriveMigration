@@ -145,6 +145,29 @@ Folders, metadata, shares, direct links and tasks are still stage-level only: a 
 
 The CLI writes the JSON report before returning a validation error. A failed post-migration check therefore produces a usable report and exits with a non-zero status. Direct-link URLs are bearer-style public capabilities, so the report file must be stored with restricted access.
 
+## Migration operations
+
+Use these target-database commands to inspect an existing checkpoint without rerunning the migration:
+
+```powershell
+# List run ID, status, latest completed stage and update time.
+cargo run -- list --target-url "<AD_DATABASE_URL>"
+
+# Print the stored report for a run.
+cargo run -- status --target-url "<AD_DATABASE_URL>" --run-id "cloudreve-cutover-2026-07-23"
+
+# Export a fresh JSON report and a capability-free source-to-target ID CSV.
+cargo run -- report `
+  --target-url "<AD_DATABASE_URL>" `
+  --run-id "cloudreve-cutover-2026-07-23" `
+  --report-path "C:/migration/report.json" `
+  --csv-mapping-path "C:/migration/mappings.csv"
+```
+
+`resume` is an explicit alias for `migrate --resume`; it still requires the original source URL, target URL, temporary password, run ID and every plan-affecting option to match the stored checkpoint. `abort` only marks a `running` or `failed` checkpoint as aborted and never rolls back migrated AD business records. `cleanup --confirm` deletes **only a completed run's migration checkpoint, cursors and object mappings**; it never deletes AD files, blobs, users or source data, and makes that run impossible to resume.
+
+Committed blob/file progress lines now include elapsed seconds, committed rows per second and a row-based ETA. These estimates are intentionally emitted only after the matching database transaction commits.
+
 ## Verification before push
 
 Every migration feature must include focused tests plus end-to-end coverage where it writes database state. Before pushing, run and require all of these commands to pass:

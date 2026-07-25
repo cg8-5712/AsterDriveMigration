@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write};
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};
@@ -48,6 +49,16 @@ pub struct MigrationOptions {
     pub resume: bool,
     pub blob_batch_size: usize,
     pub file_batch_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrationRunSummary {
+    pub run_id: String,
+    pub status: String,
+    pub last_completed_stage: Option<String>,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub updated_at: chrono::DateTime<chrono::FixedOffset>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +385,84 @@ pub fn write_json_report(path: impl AsRef<Path>, report: &MigrationReport) -> Re
     let contents = serde_json::to_vec_pretty(report).wrap_err("serialize migration report")?;
     std::fs::write(path, contents)
         .wrap_err_with(|| format!("write migration report {}", path.display()))
+}
+
+pub fn write_csv_mapping_report(path: impl AsRef<Path>, report: &MigrationReport) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("create mapping report directory {}", parent.display()))?;
+    }
+    let mut output = String::from("object_type,source_id,target_id\n");
+    for (object_type, mappings) in [
+        ("policy", &report.mappings.policies),
+        ("policy_group", &report.mappings.policy_groups),
+        ("user", &report.mappings.users),
+        ("folder", &report.mappings.folders),
+        ("blob", &report.mappings.blobs),
+        ("file", &report.mappings.files),
+        ("share", &report.mappings.shares),
+        ("task", &report.mappings.tasks),
+    ] {
+        for mapping in mappings {
+            writeln!(
+                output,
+                "{object_type},{},{}",
+                mapping.source_id, mapping.target_id
+            )?;
+        }
+    }
+    std::fs::write(path, output)
+        .wrap_err_with(|| format!("write migration CSV mapping report {}", path.display()))
+}
+
+pub async fn list_migration_runs(target_url: &str) -> Result<Vec<MigrationRunSummary>> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    checkpoint::list(&target)
+        .await?
+        .into_iter()
+        .map(run_summary)
+        .collect()
+}
+
+pub async fn migration_run_report(target_url: &str, run_id: &str) -> Result<MigrationReport> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    let run = checkpoint::load_any(&target, run_id).await?;
+    serde_json::from_value(run.report_json).wrap_err("decode stored migration report")
+}
+
+pub async fn migration_run_status(target_url: &str, run_id: &str) -> Result<MigrationRunSummary> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    run_summary(checkpoint::load_any(&target, run_id).await?)
+}
+
+pub async fn abort_migration_run(target_url: &str, run_id: &str) -> Result<()> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    checkpoint::abort(&target, run_id).await
+}
+
+pub async fn cleanup_completed_migration_run(target_url: &str, run_id: &str) -> Result<()> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    checkpoint::delete_completed(&target, run_id).await
+}
+
+fn run_summary(run: checkpoint::Model) -> Result<MigrationRunSummary> {
+    Ok(MigrationRunSummary {
+        run_id: run.id,
+        status: run.status,
+        last_completed_stage: run.last_completed_stage,
+        created_at: run.created_at,
+        updated_at: run.updated_at,
+        last_error: run.last_error,
+    })
 }
 
 pub async fn inspect(
@@ -869,6 +958,7 @@ async fn migrate_blobs_batched(
             .await?;
     let mut cursor_value = cursor.as_ref().map_or(0, |cursor| cursor.cursor_value);
     let mut processed_count = cursor.as_ref().map_or(0, |cursor| cursor.processed_count);
+    let started_at = Instant::now();
 
     loop {
         let mut query = cr::entities::Entity::find()
@@ -985,9 +1075,10 @@ async fn migrate_blobs_batched(
                 .ok_or_else(|| color_eyre::eyre::eyre!("blob batch byte count overflow"))
         })?;
         eprintln!(
-            "[progress] blobs: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}",
+            "[progress] blobs: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}, {}",
             inputs.source_data.source_blobs,
-            entities.len()
+            entities.len(),
+            progress_timing(processed_count, inputs.source_data.source_blobs, started_at)
         );
         blob_mappings.extend(mappings);
         cursor_value = last_entity_id;
@@ -1014,6 +1105,7 @@ async fn migrate_files_batched(
             .await?;
     let mut cursor_value = cursor.as_ref().map_or(0, |cursor| cursor.cursor_value);
     let mut processed_count = cursor.as_ref().map_or(0, |cursor| cursor.processed_count);
+    let started_at = Instant::now();
 
     loop {
         let files = cr::files::Entity::find()
@@ -1086,9 +1178,10 @@ async fn migrate_files_batched(
                 .ok_or_else(|| color_eyre::eyre::eyre!("file batch byte count overflow"))
         })?;
         eprintln!(
-            "[progress] files: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}",
+            "[progress] files: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}, {}",
             inputs.source_data.source_files,
-            files.len()
+            files.len(),
+            progress_timing(processed_count, inputs.source_data.source_files, started_at)
         );
         file_mappings.extend(mappings);
         cursor_value = last_file_id;
@@ -1255,6 +1348,20 @@ fn source_fingerprint(source_url: &str, source: &SourceData) -> String {
         source.direct_links.len(),
         source.tasks.len(),
     ))
+}
+
+fn progress_timing(processed: i64, total: u64, started_at: Instant) -> String {
+    let elapsed_seconds = started_at.elapsed().as_secs_f64().max(0.001);
+    let rows_per_second = processed as f64 / elapsed_seconds;
+    let remaining_rows = total.saturating_sub(processed.max(0) as u64);
+    let eta_seconds = if rows_per_second > 0.0 {
+        remaining_rows as f64 / rows_per_second
+    } else {
+        0.0
+    };
+    format!(
+        "elapsed_secs={elapsed_seconds:.1}, rows_per_sec={rows_per_second:.2}, eta_secs={eta_seconds:.1}"
+    )
 }
 
 fn plan_fingerprint(options: &MigrationOptions) -> String {
@@ -3272,1320 +3379,4 @@ mod remote;
 use phases::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use sea_orm::{ConnectionTrait, DbBackend, Schema};
-
-    #[test]
-    fn classifies_common_file_types() {
-        assert_eq!(file_classification("photo.JPG").3, "image");
-        assert_eq!(
-            file_classification("backup.tar.gz").1.as_deref(),
-            Some("tar.gz")
-        );
-        assert_eq!(file_classification("main.rs").3, "code");
-    }
-
-    #[test]
-    fn maps_supported_storage_drivers_conservatively() {
-        assert_eq!(map_driver_type("local"), Some("local"));
-        assert_eq!(map_driver_type("oss"), Some("s3"));
-        assert_eq!(map_driver_type("cos"), Some("tencent_cos"));
-        assert_eq!(map_driver_type("onedrive"), None);
-        assert_eq!(map_driver_type("qiniu"), None);
-    }
-
-    #[test]
-    fn parses_and_normalizes_cloudreve_tags_for_ad() {
-        assert_eq!(tag_name("tag:Important"), Some("Important"));
-        assert_eq!(tag_name("tag:  Project A  "), Some("Project A"));
-        assert_eq!(tag_name("author"), None);
-        assert_eq!(normalize_tag_name(" Important "), "important");
-        assert_eq!(target_tag_color("#AbC"), "#aabbcc");
-        assert_eq!(target_tag_color("#3B82F6"), "#3b82f6");
-        assert_eq!(target_tag_color(""), "#3b82f6");
-        assert_eq!(target_tag_name(&"x".repeat(80)).chars().count(), 64);
-    }
-
-    #[test]
-    fn builds_asterdrive_v2_direct_link_urls() -> Result<()> {
-        let url = direct_link_url(1, 7, "hello world.txt", "test-direct-link-secret")?;
-        assert!(url.starts_with("/d/v2.b."));
-        assert!(url.ends_with("/hello%20world.txt"));
-        assert_eq!(
-            url,
-            direct_link_url(1, 7, "hello world.txt", "test-direct-link-secret")?
-        );
-        assert_ne!(
-            url,
-            direct_link_url(1, 8, "hello world.txt", "test-direct-link-secret")?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn maps_cloudreve_tasks_to_non_executable_terminal_statuses() {
-        assert_eq!(archived_task_status("completed"), "succeeded");
-        assert_eq!(archived_task_status("error"), "failed");
-        assert_eq!(archived_task_status("canceled"), "canceled");
-        for status in ["queued", "processing", "suspending"] {
-            assert!(source_task_was_active(status));
-            assert_eq!(archived_task_status(status), "canceled");
-        }
-        assert_eq!(archived_task_status("unknown"), "canceled");
-    }
-
-    #[test]
-    fn records_skipped_objects_by_type() {
-        let mut report = MigrationReport::default();
-        report.record_skip("file", Some(42), "missing blob");
-        report.record_skip("file", Some(43), "symbolic file");
-        report.record_skip("share", None, "missing target");
-
-        assert_eq!(report.skipped, 3);
-        assert_eq!(report.skipped_by_type.get("file"), Some(&2));
-        assert_eq!(report.skipped_by_type.get("share"), Some(&1));
-        assert_eq!(report.skipped_objects[0].source_id, Some(42));
-        assert_eq!(report.skipped_objects[0].reason, "missing blob");
-    }
-
-    #[tokio::test]
-    async fn preflight_rejects_orphan_source_relations() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let source_path = std::env::temp_dir().join(format!("cloudreve-preflight-{suffix}.db"));
-        let source_url = sqlite_url(&source_path);
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        source
-            .execute_unprepared("PRAGMA foreign_keys = OFF")
-            .await?;
-        cr::file_entities::ActiveModel {
-            file_id: Set(999_001),
-            entity_id: Set(999_002),
-        }
-        .insert(&source)
-        .await?;
-
-        let source_data = SourceData::load(&source, false).await?;
-        let preflight = run_preflight(&source, &source_data).await?;
-        assert!(preflight.performed);
-        assert!(!preflight.passed);
-        assert!(preflight.checks.iter().any(|check| {
-            check.name == "source_file_entity_relations" && !check.passed && check.actual == "1"
-        }));
-
-        source.close().await?;
-        let _ = std::fs::remove_file(source_path);
-        Ok(())
-    }
-
-    #[test]
-    fn writes_structured_json_report() -> Result<()> {
-        let report_path = std::env::temp_dir().join(format!(
-            "asterdrive-migration-report-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        let mut report = MigrationReport {
-            migrated_users: 1,
-            validation: MigrationValidation {
-                performed: true,
-                passed: true,
-                checks: vec![ValidationCheck {
-                    name: "users_count".to_string(),
-                    passed: true,
-                    expected: "1".to_string(),
-                    actual: "1".to_string(),
-                    message: None,
-                }],
-            },
-            ..Default::default()
-        };
-        report.mappings.users.push(IdMapping {
-            source_id: 7,
-            target_id: 11,
-        });
-
-        write_json_report(&report_path, &report)?;
-        let value: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
-        assert_eq!(value["schema_version"], 1);
-        assert_eq!(value["migrated_users"], 1);
-        assert_eq!(value["mappings"]["users"][0]["source_id"], 7);
-        assert_eq!(value["mappings"]["users"][0]["target_id"], 11);
-        assert_eq!(value["validation"]["passed"], true);
-
-        let _ = std::fs::remove_file(report_path);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn migrates_minimal_cloudreve_database() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let source_path = std::env::temp_dir().join(format!("cloudreve-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-{suffix}.db"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        source.close().await?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target.close().await?;
-
-        let report = migrate(MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "C:/cloudreve".to_string(),
-            local_policy_roots: std::collections::BTreeMap::new(),
-            storage_mode: StorageMode::ReuseSourceStorage,
-            target_local_base_path: None,
-            target_local_policy_roots: std::collections::BTreeMap::new(),
-            verify_local_storage: false,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: false,
-            run_id: None,
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 500,
-        })
-        .await?;
-
-        assert_eq!(report.migrated_users, 1);
-        assert_eq!(report.migrated_folders, 1);
-        assert_eq!(report.migrated_files, 1);
-        assert_eq!(report.migrated_blobs, 1);
-        assert_eq!(report.migrated_shares, 1);
-        assert_eq!(report.migrated_properties, 3);
-        assert_eq!(report.migrated_tags, 1);
-        assert_eq!(report.migrated_tag_assignments, 1);
-        assert_eq!(report.migrated_direct_links, 1);
-        assert_eq!(report.migrated_tasks, 2);
-        assert!(report.validation.performed);
-        assert!(report.validation.passed);
-        assert!(report.validation.checks.iter().all(|check| check.passed));
-        assert_eq!(report.mappings.users.len(), 1);
-        assert_eq!(report.mappings.folders.len(), 1);
-        assert_eq!(report.mappings.files.len(), 1);
-        assert_eq!(report.mappings.blobs.len(), 1);
-        assert_eq!(report.mappings.shares.len(), 1);
-        assert_eq!(report.mappings.tasks.len(), 2);
-        assert_eq!(report.direct_links.len(), 1);
-        assert!(report.direct_links[0].url.starts_with("/d/v2."));
-        assert_eq!(report.tag_assignments.len(), 1);
-        assert_eq!(report.tag_assignments[0].target_entity_type, "file");
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(ad::users::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::folders::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::files::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::file_blobs::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::shares::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::tags::Entity::find().count(&target).await?, 1);
-        assert_eq!(
-            ad::background_tasks::Entity::find().count(&target).await?,
-            2
-        );
-        assert_eq!(
-            ad::entity_properties::Entity::find().count(&target).await?,
-            3
-        );
-        let properties = ad::entity_properties::Entity::find().all(&target).await?;
-        assert!(
-            properties.iter().any(|property| {
-                property.namespace == "system.tags" && property.value.is_none()
-            })
-        );
-        let direct_link = properties
-            .iter()
-            .find(|property| property.namespace == "cloudreve.direct_links")
-            .and_then(|property| property.value.as_deref())
-            .expect("migrated direct link mapping");
-        assert!(direct_link.contains("/d/v2."));
-        let tasks = ad::background_tasks::Entity::find().all(&target).await?;
-        assert!(tasks.iter().all(|task| {
-            matches!(task.status.as_str(), "succeeded" | "failed" | "canceled")
-                && task.kind == "system_runtime"
-                && task.lease_expires_at.is_none()
-        }));
-        assert!(tasks.iter().any(|task| task.status == "succeeded"));
-        assert!(tasks.iter().any(|task| task.status == "canceled"));
-        let blob = ad::file_blobs::Entity::find().one(&target).await?.unwrap();
-        assert_eq!(blob.storage_path, "uploads/object.bin");
-        let files = ad::files::Entity::find().all(&target).await?;
-        let versions = ad::file_versions::Entity::find().all(&target).await?;
-        let expected_ref_count = files.iter().filter(|file| file.blob_id == blob.id).count() as i64
-            + versions
-                .iter()
-                .filter(|version| version.blob_id == blob.id)
-                .count() as i64;
-        assert_eq!(blob.ref_count, expected_ref_count);
-        let user = ad::users::Entity::find().one(&target).await?.unwrap();
-        assert!(user.must_change_password);
-        assert_eq!(user.role, "admin");
-        let expected_storage_used = files.iter().map(|file| file.size).sum::<i64>()
-            + versions.iter().map(|version| version.size).sum::<i64>();
-        assert_eq!(user.storage_used, expected_storage_used);
-        assert!(
-            report
-                .validation
-                .checks
-                .iter()
-                .any(|check| check.name == "blob_ref_counts_recalculated" && check.passed)
-        );
-        assert!(
-            report
-                .validation
-                .checks
-                .iter()
-                .any(|check| check.name == "storage_usage_recalculated" && check.passed)
-        );
-        target.close().await?;
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reuses_and_verifies_local_storage_per_policy_root() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let source_path = std::env::temp_dir().join(format!("cloudreve-local-reuse-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-local-reuse-{suffix}.db"));
-        let storage_root = std::env::temp_dir().join(format!("cloudreve-local-storage-{suffix}"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        let source_policy_id = cr::storage_policies::Entity::find()
-            .one(&source)
-            .await?
-            .expect("seeded storage policy")
-            .id;
-        source.close().await?;
-        std::fs::create_dir_all(storage_root.join("uploads"))?;
-        std::fs::write(storage_root.join("uploads/object.bin"), vec![0_u8; 128])?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target.close().await?;
-
-        let report = migrate(MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "unused-local-root".to_string(),
-            local_policy_roots: std::collections::BTreeMap::from([(
-                source_policy_id,
-                storage_root.to_string_lossy().to_string(),
-            )]),
-            storage_mode: StorageMode::ReuseSourceStorage,
-            target_local_base_path: None,
-            target_local_policy_roots: std::collections::BTreeMap::new(),
-            verify_local_storage: true,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: false,
-            run_id: None,
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 500,
-        })
-        .await?;
-        assert!(report.validation.passed);
-
-        let target = Database::connect(&target_url).await?;
-        let policy = ad::storage_policies::Entity::find()
-            .one(&target)
-            .await?
-            .expect("migrated storage policy");
-        assert_eq!(policy.base_path, storage_root.to_string_lossy());
-        target.close().await?;
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        let _ = std::fs::remove_dir_all(storage_root);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_local_storage_size_mismatch() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let source_path =
-            std::env::temp_dir().join(format!("cloudreve-local-mismatch-{suffix}.db"));
-        let target_path =
-            std::env::temp_dir().join(format!("asterdrive-local-mismatch-{suffix}.db"));
-        let storage_root =
-            std::env::temp_dir().join(format!("cloudreve-local-mismatch-storage-{suffix}"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        let source_policy_id = cr::storage_policies::Entity::find()
-            .one(&source)
-            .await?
-            .expect("seeded storage policy")
-            .id;
-        source.close().await?;
-        std::fs::create_dir_all(storage_root.join("uploads"))?;
-        std::fs::write(storage_root.join("uploads/object.bin"), vec![0_u8; 127])?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target.close().await?;
-
-        let error = migrate(MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "unused-local-root".to_string(),
-            local_policy_roots: std::collections::BTreeMap::from([(
-                source_policy_id,
-                storage_root.to_string_lossy().to_string(),
-            )]),
-            storage_mode: StorageMode::ReuseSourceStorage,
-            target_local_base_path: None,
-            target_local_policy_roots: std::collections::BTreeMap::new(),
-            verify_local_storage: true,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: true,
-            run_id: None,
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 500,
-        })
-        .await
-        .unwrap_err();
-        assert!(format!("{error:?}").contains("size mismatch"));
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(
-            ad::storage_policies::Entity::find().count(&target).await?,
-            0
-        );
-        target.close().await?;
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        let _ = std::fs::remove_dir_all(storage_root);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejects_unknown_local_policy_root() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let source_path = std::env::temp_dir().join(format!("cloudreve-local-policy-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-local-policy-{suffix}.db"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        source.close().await?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target.close().await?;
-
-        let error = migrate(MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "unused-local-root".to_string(),
-            local_policy_roots: std::collections::BTreeMap::from([(999, "C:/missing".to_string())]),
-            storage_mode: StorageMode::ReuseSourceStorage,
-            target_local_base_path: None,
-            target_local_policy_roots: std::collections::BTreeMap::new(),
-            verify_local_storage: false,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: true,
-            run_id: None,
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 500,
-        })
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("policy 999"));
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn resumes_from_last_completed_stage() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let run_id = format!("resume-test-{suffix}");
-        let source_path = std::env::temp_dir().join(format!("cloudreve-resume-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-resume-{suffix}.db"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        source.close().await?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target
-            .execute_unprepared(
-                "CREATE TRIGGER fail_folder_insert BEFORE INSERT ON folders \
-                 BEGIN SELECT RAISE(ABORT, 'forced folder stage failure'); END",
-            )
-            .await?;
-        target.close().await?;
-
-        let options = MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "C:/cloudreve".to_string(),
-            local_policy_roots: std::collections::BTreeMap::new(),
-            storage_mode: StorageMode::ReuseSourceStorage,
-            target_local_base_path: None,
-            target_local_policy_roots: std::collections::BTreeMap::new(),
-            verify_local_storage: false,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: false,
-            run_id: Some(run_id.clone()),
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 500,
-        };
-
-        let error = migrate(options.clone()).await.unwrap_err();
-        assert!(error.to_string().contains(&run_id));
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(
-            ad::storage_policies::Entity::find().count(&target).await?,
-            1
-        );
-        assert_eq!(ad::users::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::folders::Entity::find().count(&target).await?, 0);
-        let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
-            .one(&target)
-            .await?
-            .expect("failed migration checkpoint");
-        assert_eq!(failed_checkpoint.status, "failed");
-        assert_eq!(
-            failed_checkpoint.last_completed_stage.as_deref(),
-            Some("users")
-        );
-        target
-            .execute_unprepared("DROP TRIGGER fail_folder_insert")
-            .await?;
-        target.close().await?;
-
-        let report = migrate(MigrationOptions {
-            resume: true,
-            ..options
-        })
-        .await?;
-        assert!(report.resumed);
-        assert_eq!(report.run_id.as_deref(), Some(run_id.as_str()));
-        assert!(report.validation.passed);
-        assert_eq!(report.migrated_users, 1);
-        assert_eq!(report.migrated_folders, 1);
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(ad::users::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::folders::Entity::find().count(&target).await?, 1);
-        assert_eq!(ad::files::Entity::find().count(&target).await?, 1);
-        let completed_checkpoint = checkpoint::Entity::find_by_id(run_id)
-            .one(&target)
-            .await?
-            .expect("completed migration checkpoint");
-        assert_eq!(completed_checkpoint.status, "completed");
-        assert_eq!(
-            completed_checkpoint.last_completed_stage.as_deref(),
-            Some("tasks")
-        );
-        target.close().await?;
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let run_id = format!("blob-resume-test-{suffix}");
-        let source_path = std::env::temp_dir().join(format!("cloudreve-blob-resume-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-blob-resume-{suffix}.db"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        let extra_blob_ids = seed_extra_blob_entities(&source, 3).await?;
-        source.close().await?;
-
-        let failing_blob_id = extra_blob_ids[1];
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target
-            .execute_unprepared(&format!(
-                "CREATE TRIGGER fail_blob_batch BEFORE INSERT ON file_blobs \
-                 WHEN NEW.hash = '{}' \
-                 BEGIN SELECT RAISE(ABORT, 'forced blob batch failure'); END",
-                opaque_blob_key(failing_blob_id)
-            ))
-            .await?;
-        target.close().await?;
-
-        let options = MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "C:/cloudreve".to_string(),
-            local_policy_roots: std::collections::BTreeMap::new(),
-            storage_mode: StorageMode::ReuseSourceStorage,
-            target_local_base_path: None,
-            target_local_policy_roots: std::collections::BTreeMap::new(),
-            verify_local_storage: false,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: false,
-            run_id: Some(run_id.clone()),
-            resume: false,
-            blob_batch_size: 2,
-            file_batch_size: 500,
-        };
-
-        let error = migrate(options.clone()).await.unwrap_err();
-        assert!(error.to_string().contains("blobs"));
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(ad::file_blobs::Entity::find().count(&target).await?, 2);
-        let cursor = checkpoint::load_stage_cursor(&target, &run_id, "blobs")
-            .await?
-            .expect("committed blob cursor");
-        assert_eq!(cursor.cursor_value, extra_blob_ids[0]);
-        assert_eq!(cursor.processed_count, 2);
-        assert_eq!(
-            checkpoint::object_map::Entity::find()
-                .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-                .filter(checkpoint::object_map::Column::ObjectType.eq("blob"))
-                .count(&target)
-                .await?,
-            2
-        );
-        let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
-            .one(&target)
-            .await?
-            .expect("failed blob migration checkpoint");
-        assert_eq!(failed_checkpoint.status, "failed");
-        assert_eq!(
-            failed_checkpoint.last_completed_stage.as_deref(),
-            Some("folders")
-        );
-        let failed_report: MigrationReport = serde_json::from_value(failed_checkpoint.report_json)?;
-        assert_eq!(failed_report.migrated_blobs, 2);
-        target
-            .execute_unprepared("DROP TRIGGER fail_blob_batch")
-            .await?;
-        target.close().await?;
-
-        let report = migrate(MigrationOptions {
-            resume: true,
-            ..options
-        })
-        .await?;
-        assert!(report.resumed);
-        assert_eq!(report.migrated_blobs, 4);
-        assert_eq!(report.mappings.blobs.len(), 4);
-        assert!(report.validation.passed);
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(ad::file_blobs::Entity::find().count(&target).await?, 4);
-        assert_eq!(
-            checkpoint::object_map::Entity::find()
-                .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-                .filter(checkpoint::object_map::Column::ObjectType.eq("blob"))
-                .count(&target)
-                .await?,
-            4
-        );
-        let completed_cursor = checkpoint::load_stage_cursor(&target, &run_id, "blobs")
-            .await?
-            .expect("completed blob cursor");
-        assert_eq!(completed_cursor.cursor_value, extra_blob_ids[2]);
-        assert_eq!(completed_cursor.processed_count, 4);
-        target.close().await?;
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn resumes_files_from_last_committed_batch() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let run_id = format!("file-resume-test-{suffix}");
-        let source_path = std::env::temp_dir().join(format!("cloudreve-file-resume-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-file-resume-{suffix}.db"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        let extra_blob_ids = seed_extra_blob_entities(&source, 3).await?;
-        let extra_file_ids = seed_extra_files(&source, &extra_blob_ids).await?;
-        source.close().await?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target
-            .execute_unprepared(
-                "CREATE TRIGGER fail_file_batch BEFORE INSERT ON files \
-                 WHEN NEW.name = 'extra-1.txt' \
-                 BEGIN SELECT RAISE(ABORT, 'forced file batch failure'); END",
-            )
-            .await?;
-        target.close().await?;
-
-        let options = MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "C:/cloudreve".to_string(),
-            local_policy_roots: std::collections::BTreeMap::new(),
-            storage_mode: StorageMode::ReuseSourceStorage,
-            target_local_base_path: None,
-            target_local_policy_roots: std::collections::BTreeMap::new(),
-            verify_local_storage: false,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: false,
-            run_id: Some(run_id.clone()),
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 2,
-        };
-
-        let error = migrate(options.clone()).await.unwrap_err();
-        assert!(error.to_string().contains("files"));
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(ad::files::Entity::find().count(&target).await?, 2);
-        assert_eq!(ad::file_versions::Entity::find().count(&target).await?, 1);
-        let cursor = checkpoint::load_stage_cursor(&target, &run_id, "files")
-            .await?
-            .expect("committed file cursor");
-        assert_eq!(cursor.cursor_value, extra_file_ids[0]);
-        assert_eq!(cursor.processed_count, 2);
-        assert_eq!(
-            checkpoint::object_map::Entity::find()
-                .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-                .filter(checkpoint::object_map::Column::ObjectType.eq("file"))
-                .count(&target)
-                .await?,
-            2
-        );
-        let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
-            .one(&target)
-            .await?
-            .expect("failed file migration checkpoint");
-        assert_eq!(failed_checkpoint.status, "failed");
-        assert_eq!(
-            failed_checkpoint.last_completed_stage.as_deref(),
-            Some("blobs")
-        );
-        let failed_report: MigrationReport = serde_json::from_value(failed_checkpoint.report_json)?;
-        assert_eq!(failed_report.migrated_files, 2);
-        assert_eq!(failed_report.migrated_versions, 1);
-        target
-            .execute_unprepared("DROP TRIGGER fail_file_batch")
-            .await?;
-        target.close().await?;
-
-        let report = migrate(MigrationOptions {
-            resume: true,
-            ..options
-        })
-        .await?;
-        assert!(report.resumed);
-        assert_eq!(report.migrated_files, 4);
-        assert_eq!(report.migrated_versions, 1);
-        assert_eq!(report.mappings.files.len(), 4);
-        assert!(report.validation.passed);
-
-        let target = Database::connect(&target_url).await?;
-        assert_eq!(ad::files::Entity::find().count(&target).await?, 4);
-        assert_eq!(ad::file_versions::Entity::find().count(&target).await?, 1);
-        assert_eq!(
-            checkpoint::object_map::Entity::find()
-                .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-                .filter(checkpoint::object_map::Column::ObjectType.eq("file"))
-                .count(&target)
-                .await?,
-            4
-        );
-        let completed_cursor = checkpoint::load_stage_cursor(&target, &run_id, "files")
-            .await?
-            .expect("completed file cursor");
-        assert_eq!(completed_cursor.cursor_value, extra_file_ids[2]);
-        assert_eq!(completed_cursor.processed_count, 4);
-        target.close().await?;
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        Ok(())
-    }
-
-    #[test]
-    fn resumes_local_copy_from_matching_temporary_file() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let root = std::env::temp_dir().join(format!("asterdrive-copy-resume-{suffix}"));
-        let source_path = root.join("source.bin");
-        let target_path = root.join("target/object.bin");
-        let content = b"a local object that resumes from a generated checkpoint";
-        std::fs::create_dir_all(&root)?;
-        std::fs::write(&source_path, content)?;
-        std::fs::create_dir_all(target_path.parent().expect("target parent"))?;
-        let temporary_path = temporary_copy_path(
-            target_path.parent().expect("target parent"),
-            "local-copy-resume",
-            42,
-        );
-        std::fs::write(&temporary_path, &content[..17])?;
-
-        let (sha256, created) = copy_local_object(
-            &source_path,
-            &target_path,
-            content.len() as i64,
-            "local-copy-resume",
-            42,
-        )?;
-
-        assert!(created);
-        assert_eq!(sha256, sha256_file(&source_path)?);
-        assert_eq!(std::fs::read(&target_path)?, content);
-        assert!(!temporary_path.exists());
-
-        let _ = std::fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn copies_local_objects_to_target_root_and_uses_content_hashes() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let source_path = std::env::temp_dir().join(format!("cloudreve-copy-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-copy-{suffix}.db"));
-        let source_root = std::env::temp_dir().join(format!("cloudreve-copy-source-{suffix}"));
-        let target_root = std::env::temp_dir().join(format!("asterdrive-copy-target-{suffix}"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        let source_policy_id = cr::storage_policies::Entity::find()
-            .one(&source)
-            .await?
-            .expect("seeded storage policy")
-            .id;
-        source.close().await?;
-        let content = vec![0x5a_u8; 128];
-        std::fs::create_dir_all(source_root.join("uploads"))?;
-        std::fs::create_dir_all(&target_root)?;
-        std::fs::write(source_root.join("uploads/object.bin"), &content)?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target.close().await?;
-
-        let report = migrate(MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "unused-source-root".to_string(),
-            local_policy_roots: BTreeMap::from([(
-                source_policy_id,
-                source_root.to_string_lossy().to_string(),
-            )]),
-            storage_mode: StorageMode::CopyLocal,
-            target_local_base_path: None,
-            target_local_policy_roots: BTreeMap::from([(
-                source_policy_id,
-                target_root.to_string_lossy().to_string(),
-            )]),
-            verify_local_storage: true,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: false,
-            run_id: Some(format!("local-copy-{suffix}")),
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 500,
-        })
-        .await?;
-        assert!(report.validation.passed);
-        assert_eq!(
-            std::fs::read(target_root.join("uploads/object.bin"))?,
-            content
-        );
-
-        let target = Database::connect(&target_url).await?;
-        let policy = ad::storage_policies::Entity::find()
-            .one(&target)
-            .await?
-            .expect("copied local policy");
-        assert_eq!(policy.base_path, target_root.to_string_lossy());
-        let blob = ad::file_blobs::Entity::find()
-            .one(&target)
-            .await?
-            .expect("copied blob");
-        assert_eq!(blob.storage_path, "uploads/object.bin");
-        assert_eq!(
-            blob.hash,
-            sha256_file(&source_root.join("uploads/object.bin"))?
-        );
-        assert!(
-            report
-                .validation
-                .checks
-                .iter()
-                .any(|check| { check.name == "local_storage_runtime_readability" && check.passed })
-        );
-        target.close().await?;
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        let _ = std::fs::remove_dir_all(source_root);
-        let _ = std::fs::remove_dir_all(target_root);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn compensates_copied_local_objects_when_blob_database_write_fails() -> Result<()> {
-        let suffix = uuid::Uuid::new_v4();
-        let source_path = std::env::temp_dir().join(format!("cloudreve-copy-fail-{suffix}.db"));
-        let target_path = std::env::temp_dir().join(format!("asterdrive-copy-fail-{suffix}.db"));
-        let source_root = std::env::temp_dir().join(format!("cloudreve-copy-fail-source-{suffix}"));
-        let target_root =
-            std::env::temp_dir().join(format!("asterdrive-copy-fail-target-{suffix}"));
-        let source_url = sqlite_url(&source_path);
-        let target_url = sqlite_url(&target_path);
-
-        let source = Database::connect(&source_url).await?;
-        create_source_schema(&source).await?;
-        seed_source(&source).await?;
-        let source_policy_id = cr::storage_policies::Entity::find()
-            .one(&source)
-            .await?
-            .expect("seeded storage policy")
-            .id;
-        source.close().await?;
-        std::fs::create_dir_all(source_root.join("uploads"))?;
-        std::fs::create_dir_all(&target_root)?;
-        std::fs::write(source_root.join("uploads/object.bin"), vec![0x4d_u8; 128])?;
-        let expected_hash = sha256_file(&source_root.join("uploads/object.bin"))?;
-
-        let target = Database::connect(&target_url).await?;
-        create_target_schema(&target).await?;
-        target
-            .execute_unprepared(&format!(
-                "CREATE TRIGGER fail_copied_blob BEFORE INSERT ON file_blobs
-                 WHEN NEW.hash = '{expected_hash}'
-                 BEGIN SELECT RAISE(ABORT, 'forced copied blob failure'); END"
-            ))
-            .await?;
-        target.close().await?;
-
-        let error = migrate(MigrationOptions {
-            source_url: source_url.clone(),
-            target_url: target_url.clone(),
-            default_password: "temporary-password".to_string(),
-            local_base_path: "unused-source-root".to_string(),
-            local_policy_roots: BTreeMap::from([(
-                source_policy_id,
-                source_root.to_string_lossy().to_string(),
-            )]),
-            storage_mode: StorageMode::CopyLocal,
-            target_local_base_path: None,
-            target_local_policy_roots: BTreeMap::from([(
-                source_policy_id,
-                target_root.to_string_lossy().to_string(),
-            )]),
-            verify_local_storage: false,
-            verify_remote_storage: false,
-            direct_link_secret: Some("test-direct-link-secret".to_string()),
-            include_deleted: false,
-            allow_non_empty_target: false,
-            skip_unsupported_policies: false,
-            dry_run: false,
-            run_id: Some(format!("local-copy-failure-{suffix}")),
-            resume: false,
-            blob_batch_size: 500,
-            file_batch_size: 500,
-        })
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("blobs"));
-        assert!(!target_root.join("uploads/object.bin").exists());
-
-        let _ = std::fs::remove_file(source_path);
-        let _ = std::fs::remove_file(target_path);
-        let _ = std::fs::remove_dir_all(source_root);
-        let _ = std::fs::remove_dir_all(target_root);
-        Ok(())
-    }
-
-    fn sqlite_url(path: &std::path::Path) -> String {
-        format!(
-            "sqlite://{}?mode=rwc",
-            path.to_string_lossy().replace('\\', "/")
-        )
-    }
-
-    async fn create_table<E: EntityTrait>(db: &DatabaseConnection, entity: E) -> Result<()> {
-        let schema = Schema::new(DbBackend::Sqlite);
-        db.execute(&schema.create_table_from_entity(entity)).await?;
-        Ok(())
-    }
-
-    async fn create_source_schema(db: &DatabaseConnection) -> Result<()> {
-        create_table(db, cr::nodes::Entity).await?;
-        create_table(db, cr::groups::Entity).await?;
-        create_table(db, cr::users::Entity).await?;
-        create_table(db, cr::storage_policies::Entity).await?;
-        create_table(db, cr::files::Entity).await?;
-        create_table(db, cr::entities::Entity).await?;
-        create_table(db, cr::file_entities::Entity).await?;
-        create_table(db, cr::shares::Entity).await?;
-        create_table(db, cr::metadata::Entity).await?;
-        create_table(db, cr::direct_links::Entity).await?;
-        create_table(db, cr::tasks::Entity).await?;
-        Ok(())
-    }
-
-    async fn create_target_schema(db: &DatabaseConnection) -> Result<()> {
-        create_table(db, ad::managed_followers::Entity).await?;
-        create_table(db, ad::storage_policy_groups::Entity).await?;
-        create_table(db, ad::storage_policies::Entity).await?;
-        create_table(db, ad::storage_policy_group_items::Entity).await?;
-        create_table(db, ad::users::Entity).await?;
-        create_table(db, ad::user_profiles::Entity).await?;
-        create_table(db, ad::folders::Entity).await?;
-        create_table(db, ad::file_blobs::Entity).await?;
-        create_table(db, ad::files::Entity).await?;
-        create_table(db, ad::file_versions::Entity).await?;
-        create_table(db, ad::entity_properties::Entity).await?;
-        create_table(db, ad::shares::Entity).await?;
-        create_table(db, ad::teams::Entity).await?;
-        create_table(db, ad::tags::Entity).await?;
-        create_table(db, ad::background_tasks::Entity).await?;
-        Ok(())
-    }
-
-    async fn seed_source(db: &DatabaseConnection) -> Result<()> {
-        let now = chrono::Utc::now().fixed_offset();
-        let policy = cr::storage_policies::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            name: Set("Local".to_string()),
-            r#type: Set("local".to_string()),
-            server: Set(None),
-            bucket_name: Set(None),
-            is_private: Set(Some(true)),
-            access_key: Set(None),
-            secret_key: Set(None),
-            max_size: Set(None),
-            dir_name_rule: Set(None),
-            file_name_rule: Set(None),
-            settings: Set(Some(json!({"chunk_size": 0}))),
-            node_id: Set(None),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        let group = cr::groups::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            name: Set("Administrators".to_string()),
-            max_storage: Set(Some(1024 * 1024)),
-            speed_limit: Set(None),
-            permissions: Set(vec![1]),
-            settings: Set(None),
-            storage_policy_id: Set(Some(policy.id)),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        let user = cr::users::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            email: Set("admin@example.test".to_string()),
-            nick: Set("admin".to_string()),
-            password: Set(Some("legacy:hash".to_string())),
-            status: Set("active".to_string()),
-            storage: Set(128),
-            two_factor_secret: Set(None),
-            avatar: Set(None),
-            settings: Set(None),
-            group_users: Set(group.id),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        let folder = cr::files::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            r#type: Set(1),
-            name: Set("Documents".to_string()),
-            size: Set(0),
-            primary_entity: Set(None),
-            is_symbolic: Set(false),
-            props: Set(None),
-            file_children: Set(None),
-            storage_policy_files: Set(Some(policy.id)),
-            owner_id: Set(user.id),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        let entity = cr::entities::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            r#type: Set(0),
-            source: Set("uploads/object.bin".to_string()),
-            size: Set(128),
-            reference_count: Set(1),
-            upload_session_id: Set(None),
-            recycle_options: Set(None),
-            storage_policy_entities: Set(policy.id),
-            created_by: Set(Some(user.id)),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        let file = cr::files::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            r#type: Set(0),
-            name: Set("hello.txt".to_string()),
-            size: Set(128),
-            primary_entity: Set(Some(entity.id)),
-            is_symbolic: Set(false),
-            props: Set(None),
-            file_children: Set(Some(folder.id)),
-            storage_policy_files: Set(Some(policy.id)),
-            owner_id: Set(user.id),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        cr::file_entities::ActiveModel {
-            file_id: Set(file.id),
-            entity_id: Set(entity.id),
-        }
-        .insert(db)
-        .await?;
-        cr::metadata::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            name: Set("author".to_string()),
-            value: Set("Cloudreve".to_string()),
-            is_public: Set(true),
-            file_id: Set(file.id),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        cr::metadata::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            name: Set("tag:Important".to_string()),
-            value: Set("#abc".to_string()),
-            is_public: Set(true),
-            file_id: Set(file.id),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        cr::shares::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            password: Set(Some("share-password".to_string())),
-            views: Set(4),
-            downloads: Set(2),
-            expires: Set(None),
-            remain_downloads: Set(Some(3)),
-            file_shares: Set(Some(file.id)),
-            user_shares: Set(Some(user.id)),
-            props: Set(None),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        cr::direct_links::ActiveModel {
-            created_at: Set(now),
-            updated_at: Set(now),
-            deleted_at: Set(None),
-            name: Set("legacy-name.txt".to_string()),
-            downloads: Set(7),
-            speed: Set(1024),
-            file_id: Set(file.id),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        for status in ["completed", "processing"] {
-            cr::tasks::ActiveModel {
-                created_at: Set(now),
-                updated_at: Set(now),
-                deleted_at: Set(None),
-                r#type: Set("remote_download".to_string()),
-                status: Set(status.to_string()),
-                public_state: Set(json!({"progress": 50})),
-                private_state: Set(Some("legacy-private-state".to_string())),
-                correlation_id: Set(None),
-                user_tasks: Set(Some(user.id)),
-                ..Default::default()
-            }
-            .insert(db)
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn seed_extra_blob_entities(db: &DatabaseConnection, count: usize) -> Result<Vec<i64>> {
-        let now = chrono::Utc::now().fixed_offset();
-        let policy_id = cr::storage_policies::Entity::find()
-            .one(db)
-            .await?
-            .expect("seeded storage policy")
-            .id;
-        let user_id = cr::users::Entity::find()
-            .one(db)
-            .await?
-            .expect("seeded user")
-            .id;
-        let mut ids = Vec::with_capacity(count);
-        for index in 0..count {
-            let entity = cr::entities::ActiveModel {
-                created_at: Set(now),
-                updated_at: Set(now),
-                deleted_at: Set(None),
-                r#type: Set(0),
-                source: Set(format!("uploads/extra-{index}.bin")),
-                size: Set(256 + index as i64),
-                reference_count: Set(1),
-                upload_session_id: Set(None),
-                recycle_options: Set(None),
-                storage_policy_entities: Set(policy_id),
-                created_by: Set(Some(user_id)),
-                ..Default::default()
-            }
-            .insert(db)
-            .await?;
-            ids.push(entity.id);
-        }
-        Ok(ids)
-    }
-
-    async fn seed_extra_files(db: &DatabaseConnection, entity_ids: &[i64]) -> Result<Vec<i64>> {
-        let now = chrono::Utc::now().fixed_offset();
-        let policy_id = cr::storage_policies::Entity::find()
-            .one(db)
-            .await?
-            .expect("seeded storage policy")
-            .id;
-        let user_id = cr::users::Entity::find()
-            .one(db)
-            .await?
-            .expect("seeded user")
-            .id;
-        let folder_id = cr::files::Entity::find()
-            .filter(cr::files::Column::Type.eq(1))
-            .one(db)
-            .await?
-            .expect("seeded folder")
-            .id;
-        let mut ids = Vec::with_capacity(entity_ids.len());
-        for (index, entity_id) in entity_ids.iter().copied().enumerate() {
-            let file = cr::files::ActiveModel {
-                created_at: Set(now),
-                updated_at: Set(now),
-                r#type: Set(0),
-                name: Set(format!("extra-{index}.txt")),
-                size: Set(256 + index as i64),
-                primary_entity: Set(Some(entity_id)),
-                is_symbolic: Set(false),
-                props: Set(None),
-                file_children: Set(Some(folder_id)),
-                storage_policy_files: Set(Some(policy_id)),
-                owner_id: Set(user_id),
-                ..Default::default()
-            }
-            .insert(db)
-            .await?;
-            cr::file_entities::ActiveModel {
-                file_id: Set(file.id),
-                entity_id: Set(entity_id),
-            }
-            .insert(db)
-            .await?;
-            ids.push(file.id);
-        }
-        if entity_ids.len() >= 2 {
-            cr::file_entities::ActiveModel {
-                file_id: Set(ids[0]),
-                entity_id: Set(entity_ids[1]),
-            }
-            .insert(db)
-            .await?;
-        }
-        Ok(ids)
-    }
-}
+mod tests;

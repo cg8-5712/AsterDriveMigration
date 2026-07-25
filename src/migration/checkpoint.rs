@@ -1,6 +1,9 @@
 use color_eyre::eyre::{Result, WrapErr, bail};
 use sea_orm::entity::prelude::*;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Schema, Set, Unchanged};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Schema,
+    Set, Unchanged,
+};
 
 use super::{MigrationContext, MigrationReport, TargetCounts};
 
@@ -84,6 +87,65 @@ pub(super) struct NewCheckpoint<'a> {
     pub context: &'a MigrationContext,
     pub report: &'a MigrationReport,
     pub baseline: &'a TargetCounts,
+}
+
+pub(super) async fn list<C: ConnectionTrait>(db: &C) -> Result<Vec<Model>> {
+    Entity::find()
+        .order_by_desc(Column::UpdatedAt)
+        .all(db)
+        .await
+        .wrap_err("list migration runs")
+}
+
+pub(super) async fn load_any<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<Model> {
+    Entity::find_by_id(run_id.to_string())
+        .one(db)
+        .await?
+        .ok_or_else(|| color_eyre::eyre::eyre!("migration run {run_id} does not exist"))
+}
+
+pub(super) async fn abort<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<()> {
+    let model = load_any(db, run_id).await?;
+    if model.status != "running" && model.status != "failed" {
+        bail!(
+            "migration run {run_id} has status {}; only running or failed runs may be aborted",
+            model.status
+        );
+    }
+    ActiveModel {
+        id: Unchanged(run_id.to_string()),
+        status: Set("aborted".to_string()),
+        last_error: Set(Some("aborted by operator".to_string())),
+        updated_at: Set(chrono::Utc::now().fixed_offset()),
+        ..Default::default()
+    }
+    .update(db)
+    .await
+    .wrap_err_with(|| format!("abort migration run {run_id}"))?;
+    Ok(())
+}
+
+pub(super) async fn delete_completed<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<()> {
+    let model = load_any(db, run_id).await?;
+    if model.status != "completed" {
+        bail!(
+            "migration run {run_id} has status {}; only completed run metadata may be cleaned up",
+            model.status
+        );
+    }
+    stage_cursor::Entity::delete_many()
+        .filter(stage_cursor::Column::RunId.eq(run_id))
+        .exec(db)
+        .await?;
+    object_map::Entity::delete_many()
+        .filter(object_map::Column::RunId.eq(run_id))
+        .exec(db)
+        .await?;
+    Entity::delete_by_id(run_id.to_string())
+        .exec(db)
+        .await
+        .wrap_err_with(|| format!("delete completed migration run {run_id}"))?;
+    Ok(())
 }
 
 pub(super) async fn ensure_table<C: ConnectionTrait>(db: &C) -> Result<()> {

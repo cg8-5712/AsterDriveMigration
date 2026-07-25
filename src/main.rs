@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use aster_drive_migration::migration::{
-    MigrationOptions, MigrationReport, StorageMode, inspect, migrate, write_json_report,
+    MigrationOptions, MigrationReport, StorageMode, abort_migration_run,
+    cleanup_completed_migration_run, inspect, list_migration_runs, migrate, migration_run_report,
+    migration_run_status, write_csv_mapping_report, write_json_report,
 };
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, bail};
@@ -17,6 +19,44 @@ struct Cli {
 enum Command {
     Check(ConnectionArgs),
     Migrate(MigrateArgs),
+    Resume(MigrateArgs),
+    List(TargetArgs),
+    Status(RunArgs),
+    Report(ReportArgs),
+    Abort(RunArgs),
+    Cleanup(CleanupArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct TargetArgs {
+    #[arg(long, env = "ASTERDRIVE_DATABASE_URL")]
+    target_url: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+    #[arg(long, value_name = "ID")]
+    run_id: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct ReportArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    #[arg(long, value_name = "PATH")]
+    report_path: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    csv_mapping_path: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+struct CleanupArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    #[arg(long)]
+    confirm: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -81,35 +121,91 @@ async fn main() -> Result<()> {
             emit_report(args.report_path.as_deref(), &report)?;
         }
         Command::Migrate(args) => {
-            let report_path = args.connection.report_path.clone();
-            let report = migrate(MigrationOptions {
-                source_url: args.connection.source_url,
-                target_url: args.connection.target_url,
-                default_password: args.default_password,
-                local_base_path: args.local_base_path,
-                local_policy_roots: parse_local_policy_roots(args.local_policy_roots)?,
-                storage_mode: args.storage_mode,
-                target_local_base_path: args.target_local_base_path,
-                target_local_policy_roots: parse_local_policy_roots(
-                    args.target_local_policy_roots,
-                )?,
-                verify_local_storage: args.verify_local_storage,
-                verify_remote_storage: args.verify_remote_storage,
-                direct_link_secret: args.direct_link_secret,
-                include_deleted: args.connection.include_deleted,
-                allow_non_empty_target: args.allow_non_empty_target,
-                skip_unsupported_policies: args.skip_unsupported_policies,
-                dry_run: args.dry_run,
-                run_id: args.run_id,
-                resume: args.resume,
-                blob_batch_size: args.blob_batch_size,
-                file_batch_size: args.file_batch_size,
-            })
-            .await?;
-            emit_report(report_path.as_deref(), &report)?;
+            run_migration(args, false).await?;
+        }
+        Command::Resume(args) => {
+            run_migration(args, true).await?;
+        }
+        Command::List(args) => {
+            for run in list_migration_runs(&args.target_url).await? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    run.run_id,
+                    run.status,
+                    run.last_completed_stage.as_deref().unwrap_or("-"),
+                    run.updated_at
+                );
+            }
+        }
+        Command::Status(args) => {
+            let status = migration_run_status(&args.target.target_url, &args.run_id).await?;
+            println!("run_id: {}", status.run_id);
+            println!("status: {}", status.status);
+            println!(
+                "last_completed_stage: {}",
+                status.last_completed_stage.as_deref().unwrap_or("-")
+            );
+            println!("updated_at: {}", status.updated_at);
+            if let Some(error) = status.last_error {
+                println!("last_error: {error}");
+            }
+            let report = migration_run_report(&args.target.target_url, &args.run_id).await?;
+            println!("{report}");
+        }
+        Command::Report(args) => {
+            let report =
+                migration_run_report(&args.run.target.target_url, &args.run.run_id).await?;
+            emit_report(args.report_path.as_deref(), &report)?;
+            if let Some(path) = args.csv_mapping_path.as_deref() {
+                write_csv_mapping_report(path, &report)?;
+            }
+        }
+        Command::Abort(args) => {
+            abort_migration_run(&args.target.target_url, &args.run_id).await?;
+            println!("migration run {} was marked aborted", args.run_id);
+        }
+        Command::Cleanup(args) => {
+            if !args.confirm {
+                bail!("cleanup only removes completed checkpoint metadata; rerun with --confirm");
+            }
+            cleanup_completed_migration_run(&args.run.target.target_url, &args.run.run_id).await?;
+            println!(
+                "completed migration checkpoint {} was removed",
+                args.run.run_id
+            );
         }
     }
     Ok(())
+}
+
+async fn run_migration(args: MigrateArgs, force_resume: bool) -> Result<()> {
+    let report_path = args.connection.report_path.clone();
+    if force_resume && args.run_id.is_none() {
+        bail!("resume requires --run-id");
+    }
+    let report = migrate(MigrationOptions {
+        source_url: args.connection.source_url,
+        target_url: args.connection.target_url,
+        default_password: args.default_password,
+        local_base_path: args.local_base_path,
+        local_policy_roots: parse_local_policy_roots(args.local_policy_roots)?,
+        storage_mode: args.storage_mode,
+        target_local_base_path: args.target_local_base_path,
+        target_local_policy_roots: parse_local_policy_roots(args.target_local_policy_roots)?,
+        verify_local_storage: args.verify_local_storage,
+        verify_remote_storage: args.verify_remote_storage,
+        direct_link_secret: args.direct_link_secret,
+        include_deleted: args.connection.include_deleted,
+        allow_non_empty_target: args.allow_non_empty_target,
+        skip_unsupported_policies: args.skip_unsupported_policies,
+        dry_run: args.dry_run,
+        run_id: args.run_id,
+        resume: force_resume || args.resume,
+        blob_batch_size: args.blob_batch_size,
+        file_batch_size: args.file_batch_size,
+    })
+    .await?;
+    emit_report(report_path.as_deref(), &report)
 }
 
 fn parse_local_policy_roots(
@@ -147,6 +243,7 @@ fn emit_report(report_path: Option<&Path>, report: &MigrationReport) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn parses_local_policy_roots() -> Result<()> {
@@ -170,5 +267,28 @@ mod tests {
             parse_local_policy_roots(vec!["1=C:/data".to_string(), "1=D:/data".to_string()])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_operational_commands() -> Result<()> {
+        let list = Cli::try_parse_from([
+            "aster-drive-migration",
+            "list",
+            "--target-url",
+            "sqlite://target.db",
+        ])?;
+        assert!(matches!(list.command, Command::List(_)));
+
+        let cleanup = Cli::try_parse_from([
+            "aster-drive-migration",
+            "cleanup",
+            "--target-url",
+            "sqlite://target.db",
+            "--run-id",
+            "cutover-1",
+            "--confirm",
+        ])?;
+        assert!(matches!(cleanup.command, Command::Cleanup(_)));
+        Ok(())
     }
 }
