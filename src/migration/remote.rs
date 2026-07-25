@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use cloudreve_entities as cr;
 
-const S3_COMPATIBLE_DRIVERS: &[&str] = &["s3", "oss", "ks3", "obs"];
+const S3_COMPATIBLE_DRIVERS: &[&str] = &["s3", "oss", "ks3", "obs", "cos"];
 
 pub(super) fn supports_s3_validation(policy: &cr::storage_policies::Model) -> bool {
     S3_COMPATIBLE_DRIVERS.contains(&policy.r#type.as_str()) && !encryption_enabled(policy)
@@ -16,12 +16,6 @@ pub(super) async fn verify_object(
     entity_id: i64,
 ) -> Result<()> {
     if !supports_s3_validation(policy) {
-        if policy.r#type == "cos" {
-            bail!(
-                "Cloudreve COS policy {} requires Tencent COS signature validation, which is not implemented; do not claim this policy was verified",
-                policy.id
-            );
-        }
         bail!(
             "Cloudreve storage policy {} ({}) is not an S3-compatible remote policy",
             policy.id,
@@ -76,16 +70,8 @@ fn client(policy: &cr::storage_policies::Model) -> Result<aws_sdk_s3::Client> {
     let access_key = required(&policy.access_key, "access key", policy.id)?;
     let secret_key = required(&policy.secret_key, "secret key", policy.id)?;
     let settings = policy.settings.as_ref().cloned().unwrap_or(Value::Null);
-    let region = settings
-        .get("region")
-        .or_else(|| settings.get("s3_region"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("us-east-1");
-    let path_style = settings
-        .get("s3_path_style")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let region = storage_region(policy, endpoint, &settings)?;
+    let path_style = force_path_style(policy, &settings);
     let config = aws_sdk_s3::Config::builder()
         .behavior_version_latest()
         .region(aws_sdk_s3::config::Region::new(region.to_string()))
@@ -100,6 +86,59 @@ fn client(policy: &cr::storage_policies::Model) -> Result<aws_sdk_s3::Client> {
         ))
         .build();
     Ok(aws_sdk_s3::Client::from_conf(config))
+}
+
+fn storage_region(
+    policy: &cr::storage_policies::Model,
+    endpoint: &str,
+    settings: &Value,
+) -> Result<String> {
+    if let Some(region) = settings
+        .get("region")
+        .or_else(|| settings.get("s3_region"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(region.trim().to_string());
+    }
+    if policy.r#type == "cos" {
+        return cos_region_from_endpoint(endpoint).ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "Cloudreve COS policy {} needs settings.region (or settings.s3_region); it could not be derived from endpoint {endpoint}",
+                policy.id
+            )
+        });
+    }
+    Ok("us-east-1".to_string())
+}
+
+fn force_path_style(policy: &cr::storage_policies::Model, settings: &Value) -> bool {
+    if policy.r#type == "cos" {
+        // Tencent COS recommends virtual-hosted-style URLs, and newer buckets require them.
+        false
+    } else {
+        settings
+            .get("s3_path_style")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+}
+
+fn cos_region_from_endpoint(endpoint: &str) -> Option<String> {
+    let authority = endpoint
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| endpoint.trim().strip_prefix("http://"))
+        .unwrap_or(endpoint)
+        .split('/')
+        .next()?
+        .split(':')
+        .next()?;
+    let labels = authority.split('.').collect::<Vec<_>>();
+    let cos_index = labels.iter().position(|label| *label == "cos")?;
+    let region = *labels.get(cos_index + 1)?;
+    let suffix = labels.get(cos_index + 2..)?;
+    (suffix == ["myqcloud", "com"] && !region.is_empty()).then(|| region.to_string())
 }
 
 fn encryption_enabled(policy: &cr::storage_policies::Model) -> bool {
@@ -144,11 +183,45 @@ mod tests {
         };
         assert!(supports_s3_validation(&policy));
         policy.r#type = "cos".to_string();
-        assert!(!supports_s3_validation(&policy));
+        assert!(supports_s3_validation(&policy));
         policy.r#type = "qiniu".to_string();
         assert!(!supports_s3_validation(&policy));
         policy.r#type = "oss".to_string();
         policy.settings = Some(serde_json::json!({"encryption": true}));
         assert!(!supports_s3_validation(&policy));
+    }
+
+    #[test]
+    fn derives_cos_region_and_uses_virtual_hosted_style() -> Result<()> {
+        let policy = cr::storage_policies::Model {
+            id: 7,
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+            deleted_at: None,
+            name: "COS".to_string(),
+            r#type: "cos".to_string(),
+            server: Some("https://example-1250000000.cos.ap-guangzhou.myqcloud.com".to_string()),
+            bucket_name: Some("example-1250000000".to_string()),
+            is_private: Some(true),
+            access_key: Some("secret-id".to_string()),
+            secret_key: Some("secret-key".to_string()),
+            max_size: None,
+            dir_name_rule: None,
+            file_name_rule: None,
+            settings: None,
+            node_id: None,
+        };
+
+        assert_eq!(
+            storage_region(
+                &policy,
+                policy.server.as_deref().expect("COS endpoint"),
+                &Value::Null,
+            )?,
+            "ap-guangzhou"
+        );
+        assert!(!force_path_style(&policy, &Value::Null));
+        assert!(storage_region(&policy, "https://cos.invalid.example", &Value::Null).is_err());
+        Ok(())
     }
 }
