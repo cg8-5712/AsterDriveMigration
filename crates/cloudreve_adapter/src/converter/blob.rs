@@ -1,0 +1,48 @@
+use super::*;
+
+impl SourceConverter<CloudreveBlobRecord> for CloudreveConverter {
+    type Output = MigrationBlob;
+    type Error = color_eyre::Report;
+
+    fn convert(
+        &self,
+        source: CloudreveBlobRecord,
+        _: &ConversionContext,
+    ) -> Result<Conversion<Self::Output>> {
+        let entity = source.entity;
+        if entity.r#type != 0 {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "not_a_blob",
+                message: format!("Cloudreve entity {} is not an original object", entity.id),
+            }));
+        }
+        if entity.size < 0 {
+            bail!(
+                "Cloudreve entity {} has negative size {}",
+                entity.id,
+                entity.size
+            );
+        }
+        if entity.source.is_empty() {
+            bail!("Cloudreve entity {} has an empty storage path", entity.id);
+        }
+        let reference_count = i32::try_from(source.reference_count)
+            .map_err(|_| color_eyre::eyre::eyre!("blob reference count exceeds i32"))?;
+        if reference_count < 0 {
+            bail!(
+                "Cloudreve entity {} has a negative reference count",
+                entity.id
+            );
+        }
+        Ok(Conversion::Ready(MigrationBlob {
+            source_id: entity.id,
+            policy_source_id: entity.storage_policy_entities,
+            opaque_key: format!("cloudreve-{:016x}", entity.id),
+            storage_path: entity.source,
+            size: entity.size,
+            reference_count,
+            created_at: target_time(entity.created_at),
+            updated_at: target_time(entity.updated_at),
+        }))
+    }
+}
