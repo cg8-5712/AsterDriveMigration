@@ -11,20 +11,23 @@
     )
 )]
 
+use base64::Engine;
 use color_eyre::eyre::{Result, WrapErr};
+use hmac::{Hmac, Mac};
 use sea_orm::{ActiveModelTrait, DatabaseTransaction, Set};
 use serde_json::{Map, Value, json};
+use sha2::Sha256;
 
 use aster_drive_model as aster_drive_schema;
 use aster_drive_model::types::{
-    AvatarSource, DriverType, StoredStoragePolicyAllowedTypes, StoredStoragePolicyOptions,
-    StoredUserConfig, UserRole, UserStatus,
+    AvatarSource, DriverType, EntityType, StoredStoragePolicyAllowedTypes,
+    StoredStoragePolicyOptions, StoredUserConfig, TagScopeType, UserRole, UserStatus,
 };
 
 use aster_drive_migration_core::{
-    MigrationAvatarSource, MigrationBlob, MigrationFile, MigrationFolder, MigrationPolicyGroup,
-    MigrationStorageDriver, MigrationStoragePolicy, MigrationUser, MigrationUserRole,
-    MigrationUserStatus,
+    MigrationAvatarSource, MigrationBlob, MigrationDirectLink, MigrationFile, MigrationFolder,
+    MigrationPolicyGroup, MigrationStorageDriver, MigrationStoragePolicy, MigrationUser,
+    MigrationUserRole, MigrationUserStatus,
 };
 
 pub struct ResolvedPolicyGroup {
@@ -82,6 +85,48 @@ pub struct ResolvedShare {
     pub view_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolvedEntityTarget {
+    File { target_id: i64 },
+    Folder { target_id: i64 },
+}
+
+pub struct ResolvedProperty {
+    pub source_metadata_id: i64,
+    pub target: ResolvedEntityTarget,
+    pub namespace: String,
+    pub name: String,
+    pub value: Option<String>,
+}
+
+pub struct ResolvedTag {
+    pub source_metadata_id: i64,
+    pub owner_id: i64,
+    pub name: String,
+    pub normalized_name: String,
+    pub color: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct ResolvedTagAssignment {
+    pub source_metadata_id: i64,
+    pub target: ResolvedEntityTarget,
+    pub tag_id: i64,
+}
+
+pub struct ResolvedDirectLink {
+    pub direct_link: MigrationDirectLink,
+    pub target_file_id: i64,
+    pub target_owner_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenDirectLink {
+    pub property_id: i64,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +433,162 @@ impl<'a> AsterDriveWriter<'a> {
         .wrap_err_with(|| format!("migrate Cloudreve share {source_id}"))?;
         Ok(target.id)
     }
+
+    pub async fn write_property(&self, resolved: ResolvedProperty) -> Result<i64> {
+        let ResolvedProperty {
+            source_metadata_id,
+            target,
+            namespace,
+            name,
+            value,
+        } = resolved;
+        let (entity_type, entity_id) = resolved_entity_target(target);
+        let target = aster_drive_schema::entities::entity_property::ActiveModel {
+            entity_type: Set(entity_type),
+            entity_id: Set(entity_id),
+            namespace: Set(namespace),
+            name: Set(name),
+            value: Set(value),
+            ..Default::default()
+        }
+        .insert(self.transaction)
+        .await
+        .wrap_err_with(|| format!("migrate Cloudreve metadata {source_metadata_id}"))?;
+        Ok(target.id)
+    }
+
+    pub async fn write_tag(&self, resolved: ResolvedTag) -> Result<i64> {
+        let ResolvedTag {
+            source_metadata_id,
+            owner_id,
+            name,
+            normalized_name,
+            color,
+            created_at,
+            updated_at,
+        } = resolved;
+        let target = aster_drive_schema::entities::tag::ActiveModel {
+            scope_type: Set(TagScopeType::Personal),
+            owner_user_id: Set(Some(owner_id)),
+            team_id: Set(None),
+            name: Set(name),
+            normalized_name: Set(normalized_name),
+            color: Set(color),
+            sort_order: Set(0),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
+            ..Default::default()
+        }
+        .insert(self.transaction)
+        .await
+        .wrap_err_with(|| format!("migrate tag metadata {source_metadata_id}"))?;
+        Ok(target.id)
+    }
+
+    pub async fn write_tag_assignment(&self, resolved: ResolvedTagAssignment) -> Result<i64> {
+        let ResolvedTagAssignment {
+            source_metadata_id,
+            target,
+            tag_id,
+        } = resolved;
+        let (entity_type, entity_id) = resolved_entity_target(target);
+        let target = aster_drive_schema::entities::entity_property::ActiveModel {
+            entity_type: Set(entity_type),
+            entity_id: Set(entity_id),
+            namespace: Set("system.tags".to_string()),
+            name: Set(tag_id.to_string()),
+            value: Set(None),
+            ..Default::default()
+        }
+        .insert(self.transaction)
+        .await
+        .wrap_err_with(|| format!("attach migrated tag for metadata {source_metadata_id}"))?;
+        Ok(target.id)
+    }
+
+    pub async fn write_direct_link(
+        &self,
+        resolved: ResolvedDirectLink,
+        secret: &str,
+    ) -> Result<WrittenDirectLink> {
+        let ResolvedDirectLink {
+            direct_link,
+            target_file_id,
+            target_owner_id,
+        } = resolved;
+        let url = direct_link_url(
+            target_file_id,
+            target_owner_id,
+            &direct_link.file_name,
+            secret,
+        )?;
+        let property_id = self
+            .write_property(ResolvedProperty {
+                source_metadata_id: direct_link.source_id,
+                target: ResolvedEntityTarget::File {
+                    target_id: target_file_id,
+                },
+                namespace: "cloudreve.direct_links".to_string(),
+                name: direct_link.source_id.to_string(),
+                value: Some(
+                    json!({
+                        "url": url.clone(),
+                        "source_direct_link_id": direct_link.source_id,
+                        "source_file_id": direct_link.file_source_id,
+                        "source_name": direct_link.source_name,
+                        "source_downloads": direct_link.source_downloads,
+                        "source_speed_limit": direct_link.source_speed_limit,
+                    })
+                    .to_string(),
+                ),
+            })
+            .await?;
+        Ok(WrittenDirectLink { property_id, url })
+    }
+}
+
+fn resolved_entity_target(target: ResolvedEntityTarget) -> (EntityType, i64) {
+    match target {
+        ResolvedEntityTarget::File { target_id } => (EntityType::File, target_id),
+        ResolvedEntityTarget::Folder { target_id } => (EntityType::Folder, target_id),
+    }
+}
+
+fn direct_link_url(
+    file_id: i64,
+    owner_user_id: i64,
+    file_name: &str,
+    secret: &str,
+) -> Result<String> {
+    let file_id = u64::try_from(file_id).wrap_err("AD direct link file ID must be non-negative")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|error| color_eyre::eyre::eyre!("initialize direct link HMAC: {error}"))?;
+    mac.update(b"direct_link:v2:");
+    mac.update(format!("user:{owner_user_id}").as_bytes());
+    mac.update(b":");
+    mac.update(file_id.to_string().as_bytes());
+    let signature =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!(
+        "/d/v2.{}.{}/{}",
+        encode_base62(file_id)?,
+        signature,
+        urlencoding::encode(file_name)
+    ))
+}
+
+fn encode_base62(mut value: u64) -> Result<String> {
+    const BASE62: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    if value == 0 {
+        return Ok("a".to_string());
+    }
+    let mut encoded = Vec::new();
+    while value > 0 {
+        let index = usize::try_from(value % 62).wrap_err("base62 digit index exceeds usize")?;
+        encoded.push(char::from(BASE62[index]));
+        value /= 62;
+    }
+    Ok(encoded.iter().rev().collect())
 }
 
 #[cfg(test)]
@@ -399,8 +600,8 @@ mod tests {
         MigrationUserStatus,
     };
     use sea_orm::{
-        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
-        TransactionTrait,
+        ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
+        PaginatorTrait, QueryFilter, TransactionTrait,
     };
 
     use super::*;
@@ -536,6 +737,45 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn direct_link(source_id: i64) -> MigrationDirectLink {
+        MigrationDirectLink {
+            source_id,
+            file_source_id: 71,
+            owner_source_id: 2,
+            file_name: "report 2026.txt".to_string(),
+            source_name: "legacy-name.txt".to_string(),
+            source_downloads: 7,
+            source_speed_limit: 1_024,
+        }
+    }
+
+    async fn write_file_target(
+        transaction: &DatabaseTransaction,
+        policy_id: i64,
+        user_id: i64,
+        folder_id: i64,
+    ) -> Result<i64> {
+        let writer = AsterDriveWriter::new(transaction);
+        let blob_id = writer
+            .write_blob(ResolvedBlob {
+                blob: blob(70, "objects/property-target", 64, 1),
+                policy_id,
+            })
+            .await?;
+        Ok(writer
+            .write_file(ResolvedFile {
+                file: file(71),
+                folder_id: Some(folder_id),
+                owner_id: user_id,
+                owner_username: "owner".to_string(),
+                primary_blob_id: blob_id,
+                primary_blob_size: 64,
+                historical_versions: Vec::new(),
+            })
+            .await?
+            .target_id)
     }
 
     #[tokio::test]
@@ -741,6 +981,225 @@ mod tests {
         transaction.rollback().await?;
         assert_eq!(
             aster_drive_schema::entities::share::Entity::find()
+                .count(&database)
+                .await?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_properties_personal_tags_and_file_folder_assignments() -> Result<()> {
+        let database = database().await?;
+        let transaction = database.begin().await?;
+        let (policy_id, user_id, folder_id) = write_prerequisites(&transaction).await?;
+        let file_id = write_file_target(&transaction, policy_id, user_id, folder_id).await?;
+        let writer = AsterDriveWriter::new(&transaction);
+
+        writer
+            .write_property(ResolvedProperty {
+                source_metadata_id: 80,
+                target: ResolvedEntityTarget::File { target_id: file_id },
+                namespace: "cloudreve.public".to_string(),
+                name: "author".to_string(),
+                value: Some("Cloudreve".to_string()),
+            })
+            .await?;
+        let now = chrono::Utc::now();
+        let tag_id = writer
+            .write_tag(ResolvedTag {
+                source_metadata_id: 81,
+                owner_id: user_id,
+                name: "Important".to_string(),
+                normalized_name: "important".to_string(),
+                color: "#aabbcc".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        writer
+            .write_tag_assignment(ResolvedTagAssignment {
+                source_metadata_id: 81,
+                target: ResolvedEntityTarget::File { target_id: file_id },
+                tag_id,
+            })
+            .await?;
+        writer
+            .write_tag_assignment(ResolvedTagAssignment {
+                source_metadata_id: 82,
+                target: ResolvedEntityTarget::Folder {
+                    target_id: folder_id,
+                },
+                tag_id,
+            })
+            .await?;
+        transaction.commit().await?;
+
+        let stored_tag = aster_drive_schema::entities::tag::Entity::find_by_id(tag_id)
+            .one(&database)
+            .await?
+            .expect("written tag");
+        assert_eq!(stored_tag.scope_type, TagScopeType::Personal);
+        assert_eq!(stored_tag.owner_user_id, Some(user_id));
+        assert_eq!(stored_tag.team_id, None);
+        assert_eq!(stored_tag.name, "Important");
+        assert_eq!(stored_tag.normalized_name, "important");
+        assert_eq!(stored_tag.color, "#aabbcc");
+
+        let properties = aster_drive_schema::entities::entity_property::Entity::find()
+            .all(&database)
+            .await?;
+        assert_eq!(properties.len(), 3);
+        assert!(properties.iter().any(|property| {
+            property.entity_type == EntityType::File
+                && property.entity_id == file_id
+                && property.namespace == "cloudreve.public"
+                && property.name == "author"
+                && property.value.as_deref() == Some("Cloudreve")
+        }));
+        assert_eq!(
+            properties
+                .iter()
+                .filter(|property| property.namespace == "system.tags")
+                .count(),
+            2
+        );
+        assert!(properties.iter().any(|property| {
+            property.entity_type == EntityType::Folder
+                && property.entity_id == folder_id
+                && property.namespace == "system.tags"
+                && property.name == tag_id.to_string()
+                && property.value.is_none()
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_metadata_key_rolls_back_tag_and_assignment_transaction() -> Result<()> {
+        let database = database().await?;
+        let setup = database.begin().await?;
+        let (_, user_id, folder_id) = write_prerequisites(&setup).await?;
+        setup.commit().await?;
+
+        let transaction = database.begin().await?;
+        let writer = AsterDriveWriter::new(&transaction);
+        let now = chrono::Utc::now();
+        let tag_id = writer
+            .write_tag(ResolvedTag {
+                source_metadata_id: 90,
+                owner_id: user_id,
+                name: "Important".to_string(),
+                normalized_name: "important".to_string(),
+                color: "#aabbcc".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        let assignment = || ResolvedTagAssignment {
+            source_metadata_id: 90,
+            target: ResolvedEntityTarget::Folder {
+                target_id: folder_id,
+            },
+            tag_id,
+        };
+        writer.write_tag_assignment(assignment()).await?;
+        let duplicate = writer.write_tag_assignment(assignment()).await;
+        assert!(duplicate.is_err());
+        transaction.rollback().await?;
+
+        assert_eq!(
+            aster_drive_schema::entities::tag::Entity::find()
+                .count(&database)
+                .await?,
+            0
+        );
+        assert_eq!(
+            aster_drive_schema::entities::entity_property::Entity::find()
+                .filter(
+                    aster_drive_schema::entities::entity_property::Column::Namespace
+                        .eq("system.tags"),
+                )
+                .count(&database)
+                .await?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_v2_direct_link_and_archives_cloudreve_counters() -> Result<()> {
+        let database = database().await?;
+        let transaction = database.begin().await?;
+        let (policy_id, user_id, folder_id) = write_prerequisites(&transaction).await?;
+        let file_id = write_file_target(&transaction, policy_id, user_id, folder_id).await?;
+        let writer = AsterDriveWriter::new(&transaction);
+        let written = writer
+            .write_direct_link(
+                ResolvedDirectLink {
+                    direct_link: direct_link(100),
+                    target_file_id: file_id,
+                    target_owner_id: user_id,
+                },
+                "test-direct-link-secret",
+            )
+            .await?;
+        transaction.commit().await?;
+
+        assert!(written.url.starts_with("/d/v2."));
+        assert!(written.url.ends_with("/report%202026.txt"));
+        let property =
+            aster_drive_schema::entities::entity_property::Entity::find_by_id(written.property_id)
+                .one(&database)
+                .await?
+                .expect("archived direct link property");
+        assert_eq!(property.entity_type, EntityType::File);
+        assert_eq!(property.entity_id, file_id);
+        assert_eq!(property.namespace, "cloudreve.direct_links");
+        assert_eq!(property.name, "100");
+        let value: Value =
+            serde_json::from_str(property.value.as_deref().expect("property value"))?;
+        assert_eq!(value["url"], written.url);
+        assert_eq!(value["source_direct_link_id"], 100);
+        assert_eq!(value["source_file_id"], 71);
+        assert_eq!(value["source_name"], "legacy-name.txt");
+        assert_eq!(value["source_downloads"], 7);
+        assert_eq!(value["source_speed_limit"], 1_024);
+
+        let other_owner = direct_link_url(
+            file_id,
+            user_id + 1,
+            "report 2026.txt",
+            "test-direct-link-secret",
+        )?;
+        let other_secret =
+            direct_link_url(file_id, user_id, "report 2026.txt", "different-secret")?;
+        assert_ne!(written.url, other_owner);
+        assert_ne!(written.url, other_secret);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_direct_link_target_id_leaves_no_archive_property() -> Result<()> {
+        let database = database().await?;
+        let transaction = database.begin().await?;
+        let result = AsterDriveWriter::new(&transaction)
+            .write_direct_link(
+                ResolvedDirectLink {
+                    direct_link: direct_link(101),
+                    target_file_id: -1,
+                    target_owner_id: 2,
+                },
+                "test-direct-link-secret",
+            )
+            .await;
+        assert!(result.is_err());
+        transaction.rollback().await?;
+        assert_eq!(
+            aster_drive_schema::entities::entity_property::Entity::find()
+                .filter(
+                    aster_drive_schema::entities::entity_property::Column::Namespace
+                        .eq("cloudreve.direct_links"),
+                )
                 .count(&database)
                 .await?,
             0

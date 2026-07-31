@@ -14,11 +14,15 @@ workspace = true
 [dependencies]
 aster_drive_model.workspace = true
 aster_drive_migration_core.workspace = true
+base64.workspace = true
 chrono.workspace = true
 color-eyre.workspace = true
+hmac.workspace = true
 mime_guess.workspace = true
 sea-orm = { workspace = true, features = ["macros"] }
 serde_json.workspace = true
+sha2.workspace = true
+urlencoding.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]

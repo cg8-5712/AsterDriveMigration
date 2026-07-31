@@ -4,7 +4,7 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use aster_drive_migration::migration::*;
 use aster_drive_model as aster_drive_schema;
 use aster_drive_model::types::{
-    AvatarSource, BackgroundTaskKind, BackgroundTaskStatus, DriverType, UserRole, UserStatus,
+    AvatarSource, DriverType, EntityType, TagScopeType, UserRole, UserStatus,
 };
 use color_eyre::eyre::Result;
 use sea_orm::ConnectionTrait;
@@ -100,16 +100,25 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
     assert_eq!(report.migrated_tags, 1);
     assert_eq!(report.migrated_tag_assignments, 1);
     assert_eq!(report.migrated_direct_links, 1);
-    assert_eq!(report.migrated_tasks, 2);
+    assert_eq!(report.source_tasks, 2);
     assert!(report.validation.performed);
     assert!(report.validation.passed);
     assert!(report.validation.checks.iter().all(|check| check.passed));
+    assert!(!report.completed_stages.iter().any(|stage| stage == "tasks"));
+    assert_eq!(
+        report.completed_stages.last().map(String::as_str),
+        Some("direct_links")
+    );
     assert_eq!(report.mappings.users.len(), 1);
     assert_eq!(report.mappings.folders.len(), 1);
     assert_eq!(report.mappings.files.len(), 1);
     assert_eq!(report.mappings.blobs.len(), 1);
     assert_eq!(report.mappings.shares.len(), 1);
-    assert_eq!(report.mappings.tasks.len(), 2);
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning == "2 Cloudreve runtime tasks were intentionally not migrated"
+        })
+    );
     assert_eq!(report.direct_links.len(), 1);
     assert!(report.direct_links[0].url.starts_with("/d/v2."));
     assert_eq!(report.tag_assignments.len(), 1);
@@ -212,11 +221,21 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
             .await?,
         1
     );
+    let migrated_tag = aster_drive_schema::entities::tag::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated tag");
+    assert_eq!(migrated_tag.scope_type, TagScopeType::Personal);
+    assert!(migrated_tag.owner_user_id.is_some());
+    assert_eq!(migrated_tag.team_id, None);
+    assert_eq!(migrated_tag.name, "Important");
+    assert_eq!(migrated_tag.normalized_name, "important");
+    assert_eq!(migrated_tag.color, "#aabbcc");
     assert_eq!(
         aster_drive_schema::entities::background_task::Entity::find()
             .count(&target)
             .await?,
-        2
+        0
     );
     assert_eq!(
         aster_drive_schema::entities::entity_property::Entity::find()
@@ -232,29 +251,40 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
             .iter()
             .any(|property| { property.namespace == "system.tags" && property.value.is_none() })
     );
+    assert!(properties.iter().any(|property| {
+        property.entity_type == EntityType::File
+            && property.namespace == "cloudreve.public"
+            && property.name == "author"
+            && property.value.as_deref() == Some("Cloudreve")
+    }));
     let direct_link = properties
         .iter()
         .find(|property| property.namespace == "cloudreve.direct_links")
         .and_then(|property| property.value.as_deref())
         .expect("migrated direct link mapping");
-    assert!(direct_link.contains("/d/v2."));
-    let tasks = aster_drive_schema::entities::background_task::Entity::find()
-        .all(&target)
-        .await?;
-    assert!(tasks.iter().all(|task| {
-        matches!(task.status.as_str(), "succeeded" | "failed" | "canceled")
-            && task.kind == BackgroundTaskKind::SystemRuntime
-            && task.lease_expires_at.is_none()
-    }));
+    let direct_link: serde_json::Value = serde_json::from_str(direct_link)?;
     assert!(
-        tasks
-            .iter()
-            .any(|task| task.status == BackgroundTaskStatus::Succeeded)
+        direct_link["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("/d/v2.") && url.ends_with("/hello.txt"))
     );
-    assert!(
-        tasks
-            .iter()
-            .any(|task| task.status == BackgroundTaskStatus::Canceled)
+    let direct_link_report = &report.direct_links[0];
+    assert_eq!(
+        direct_link["source_direct_link_id"],
+        direct_link_report.source_direct_link_id
+    );
+    assert_eq!(
+        direct_link["source_file_id"],
+        direct_link_report.source_file_id
+    );
+    assert_eq!(direct_link["source_name"], direct_link_report.source_name);
+    assert_eq!(
+        direct_link["source_downloads"],
+        direct_link_report.source_downloads
+    );
+    assert_eq!(
+        direct_link["source_speed_limit"],
+        direct_link_report.source_speed_limit
     );
     let blob = aster_drive_schema::entities::file_blob::Entity::find()
         .one(&target)
@@ -329,6 +359,207 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
             .checks
             .iter()
             .any(|check| check.name == "storage_usage_recalculated" && check.passed)
+    );
+    target.close().await?;
+
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolves_cross_entity_tag_conflicts_deterministically() -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let source_path = std::env::temp_dir().join(format!("cloudreve-tag-conflict-{suffix}.db"));
+    let target_path = std::env::temp_dir().join(format!("asterdrive-tag-conflict-{suffix}.db"));
+    let source_url = sqlite_url(&source_path);
+    let target_url = sqlite_url(&target_path);
+
+    let source = Database::connect(&source_url).await?;
+    create_source_schema(&source).await?;
+    seed_source(&source).await?;
+    let folder = cloudreve_schema::files::Entity::find()
+        .filter(cloudreve_schema::files::Column::Type.eq(1))
+        .one(&source)
+        .await?
+        .expect("seeded folder");
+    let existing_tag = cloudreve_schema::metadata::Entity::find()
+        .filter(cloudreve_schema::metadata::Column::Name.eq("tag:Important"))
+        .one(&source)
+        .await?
+        .expect("seeded tag metadata");
+    let earlier = existing_tag.created_at - chrono::TimeDelta::seconds(1);
+    cloudreve_schema::metadata::ActiveModel {
+        created_at: Set(earlier),
+        updated_at: Set(earlier),
+        deleted_at: Set(None),
+        name: Set("tag:important".to_string()),
+        value: Set("#def".to_string()),
+        is_public: Set(false),
+        file_id: Set(folder.id),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await?;
+    source.close().await?;
+
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let report = migrate(MigrationOptions {
+        source_url: source_url.clone(),
+        target_url: target_url.clone(),
+        default_password: "temporary-password".to_string(),
+        local_base_path: "C:/cloudreve".to_string(),
+        local_policy_roots: std::collections::BTreeMap::new(),
+        verify_local_storage: false,
+        verify_remote_storage: false,
+        direct_link_secret: Some("test-direct-link-secret".to_string()),
+        include_deleted: false,
+        allow_non_empty_target: false,
+        skip_unsupported_policies: false,
+        dry_run: false,
+        run_id: None,
+        resume: false,
+        blob_batch_size: 500,
+        file_batch_size: 500,
+    })
+    .await?;
+
+    assert_eq!(report.migrated_tags, 1);
+    assert_eq!(report.migrated_tag_assignments, 2);
+    assert_eq!(report.migrated_properties, 4);
+    assert_eq!(report.tag_assignments.len(), 2);
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("conflicting display names or colors"))
+            .count(),
+        1
+    );
+
+    let target = Database::connect(&target_url).await?;
+    let tag = aster_drive_schema::entities::tag::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated tag");
+    assert_eq!(tag.name, "important");
+    assert_eq!(tag.normalized_name, "important");
+    assert_eq!(tag.color, "#ddeeff");
+    let assignments = aster_drive_schema::entities::entity_property::Entity::find()
+        .filter(aster_drive_schema::entities::entity_property::Column::Namespace.eq("system.tags"))
+        .all(&target)
+        .await?;
+    assert_eq!(assignments.len(), 2);
+    assert!(
+        assignments
+            .iter()
+            .all(|property| { property.name == tag.id.to_string() && property.value.is_none() })
+    );
+    assert!(
+        assignments
+            .iter()
+            .any(|property| property.entity_type == EntityType::File)
+    );
+    assert!(
+        assignments
+            .iter()
+            .any(|property| property.entity_type == EntityType::Folder)
+    );
+    target.close().await?;
+
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_direct_link_secret_counts_only_active_convertible_links() -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let source_path = std::env::temp_dir().join(format!("cloudreve-no-link-secret-{suffix}.db"));
+    let target_path = std::env::temp_dir().join(format!("asterdrive-no-link-secret-{suffix}.db"));
+    let source_url = sqlite_url(&source_path);
+    let target_url = sqlite_url(&target_path);
+
+    let source = Database::connect(&source_url).await?;
+    create_source_schema(&source).await?;
+    seed_source(&source).await?;
+    let file_id = cloudreve_schema::files::Entity::find()
+        .filter(cloudreve_schema::files::Column::Type.eq(0))
+        .one(&source)
+        .await?
+        .expect("seeded file")
+        .id;
+    let now = chrono::Utc::now().fixed_offset();
+    cloudreve_schema::direct_links::ActiveModel {
+        created_at: Set(now),
+        updated_at: Set(now),
+        deleted_at: Set(Some(now)),
+        name: Set("deleted-link.txt".to_string()),
+        downloads: Set(0),
+        speed: Set(0),
+        file_id: Set(file_id),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await?;
+    source.close().await?;
+
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let report = migrate(MigrationOptions {
+        source_url: source_url.clone(),
+        target_url: target_url.clone(),
+        default_password: "temporary-password".to_string(),
+        local_base_path: "C:/cloudreve".to_string(),
+        local_policy_roots: std::collections::BTreeMap::new(),
+        verify_local_storage: false,
+        verify_remote_storage: false,
+        direct_link_secret: None,
+        include_deleted: true,
+        allow_non_empty_target: false,
+        skip_unsupported_policies: false,
+        dry_run: false,
+        run_id: None,
+        resume: false,
+        blob_batch_size: 500,
+        file_batch_size: 500,
+    })
+    .await?;
+
+    assert_eq!(report.source_direct_links, 2);
+    assert_eq!(report.migrated_direct_links, 0);
+    assert!(report.validation.passed);
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("1 Cloudreve direct links were not regenerated"))
+            .count(),
+        1
+    );
+    assert!(report.skipped_objects.iter().any(|skipped| {
+        skipped.object_type == "direct_link"
+            && skipped.reason == "AD direct_link_secret was not supplied"
+    }));
+    assert!(report.skipped_objects.iter().any(|skipped| {
+        skipped.object_type == "direct_link" && skipped.reason.contains("is deleted")
+    }));
+
+    let target = Database::connect(&target_url).await?;
+    assert_eq!(
+        aster_drive_schema::entities::entity_property::Entity::find()
+            .filter(
+                aster_drive_schema::entities::entity_property::Column::Namespace
+                    .eq("cloudreve.direct_links"),
+            )
+            .count(&target)
+            .await?,
+        0
     );
     target.close().await?;
 
@@ -447,7 +678,7 @@ async fn resumes_from_last_completed_stage() -> Result<()> {
     assert_eq!(completed_checkpoint.status, "completed");
     assert_eq!(
         completed_checkpoint.last_completed_stage.as_deref(),
-        Some("tasks")
+        Some("direct_links")
     );
     target.close().await?;
 

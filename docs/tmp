@@ -13,7 +13,7 @@
 迁移按以下阶段执行：
 
 ```text
-policies → policy_groups → users → folders → blobs → files → metadata → shares → direct_links → tasks
+policies → policy_groups → users → folders → blobs → files → metadata → shares → direct_links
 ```
 
 | 类别 | 当前状态 | 说明 |
@@ -22,7 +22,7 @@ policies → policy_groups → users → folders → blobs → files → metadat
 | 文件夹、文件、文件版本、实体 blob | 已支持 | `blobs`、`files` 为 keyset 分页和批事务；保留源到目标的持久映射。 |
 | 文件标签与元数据 | 已支持 | 标签绑定及元数据关系参与迁移后检查。 |
 | 分享与新直链 | 已支持 | 新建 AD share token/direct-link；旧 Cloudreve URL 不会自动保持可用。 |
-| 归档任务 | 有限支持 | 只迁移为终态历史记录；活动上传任务和运行中会话不迁移。 |
+| Cloudreve task 统计 | 已支持 | 仅在报告中记录源数量，不写入 AD `background_tasks`。 |
 | 本地存储零拷贝复用 | 已支持 | AD 读取原 Cloudreve 本地根目录，无需复制字节。 |
 | 跨根目录对象搬运 | 外部前置步骤 | 使用 rsync、rclone、快照或云厂商复制能力，并保持相对 `storage_path`。 |
 | 远端对象存储零拷贝复用 | 有限支持 | `--verify-remote-storage` 可校验 S3/OSS/KS3/OBS 的 `HeadObject` 与 range read；COS 原生校验尚未实现。 |
@@ -129,7 +129,7 @@ cargo run -- check `
 
 建议在已初始化、可丢弃的演练目标库上执行 `migrate --dry-run`；对本地复用场景同时加 `--verify-local-storage`，从而在任何目标写入之前扫描所有可迁移本地对象。
 
-源端预检会拒绝或报告以下问题：文件夹 owner/parent/policy 缺失、文件夹环、文件 owner/folder/policy/primary entity 缺失、负文件或实体大小、`file_entities`/metadata/share/direct-link/task 孤儿、负分享/直链计数，以及重复的 active user email。必须修复源数据或制定经批准的剔除方案后重试，不能绕过。
+源端预检会拒绝或报告以下问题：文件夹 owner/parent/policy 缺失、文件夹环、文件 owner/folder/policy/primary entity 缺失、负文件或实体大小、`file_entities`/metadata/share/direct-link 孤儿、负分享/直链计数，以及重复的 active user email。必须修复源数据或制定经批准的剔除方案后重试，不能绕过。
 
 ### 4.3 切换窗口
 
@@ -233,7 +233,7 @@ cargo run -- migrate `
 
 | 风险 | 当前状态 | 处理要求 |
 |---|---|---|
-| 其余 stage 的批次恢复 | folders、metadata/tags、shares、direct_links、tasks 仍为 stage 事务 | 超大规模或高失败率场景应先扩展为分页 cursor 和批次事务。 |
+| 其余 stage 的批次恢复 | folders、metadata/tags、shares、direct_links 仍为 stage 事务 | 超大规模或高失败率场景应先扩展为分页 cursor 和批次事务。 |
 | 全对象幂等映射 | blob/file 使用持久 object map；其余多依赖 context | 上线至非空目标或复杂恢复前，补齐 created/reused/skipped/conflict 状态和映射。 |
 | 非空目标安全合并 | 仅有空库保护；没有完整合并语义 | 默认禁止；必须支持时设计并验收 `fail/rename/skip/reuse/update` 冲突策略与报告。 |
 | 业务冲突策略 | username 有后缀策略，email、同目录重名、share token/target 不完整 | 由业务确定优先级和处置，不得静默覆盖。 |
@@ -242,7 +242,7 @@ cargo run -- migrate `
 | Cloudreve group 与 AD team | 不等价 | 需要业务提供组织映射；不得把 group 自动猜测为 team。 |
 | 媒体与衍生资源 | avatar、thumbnail、媒体元数据、搜索重建未完成 | 作为上线后后处理任务并对用户公告。 |
 | 旧 URL 兼容 | 已生成新 AD 直链，不保持旧 URL | 如需兼容，建设重定向/映射服务；旧直链次数、限速、撤销不能等价继承。 |
-| 任务与活动会话 | task 仅终态归档 | 定义切换期上传/任务取消、完成或人工归档 SOP。 |
+| 任务与活动会话 | task 仅统计并跳过 | 定义切换期上传/任务取消、完成或人工处置 SOP。 |
 
 ### P2：运维体验和可观测性
 

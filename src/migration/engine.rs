@@ -73,11 +73,10 @@ pub(super) enum MigrationStage {
     Metadata,
     Shares,
     DirectLinks,
-    Tasks,
 }
 
 impl MigrationStage {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 9] = [
         Self::Policies,
         Self::PolicyGroups,
         Self::Users,
@@ -87,7 +86,6 @@ impl MigrationStage {
         Self::Metadata,
         Self::Shares,
         Self::DirectLinks,
-        Self::Tasks,
     ];
 
     const fn as_str(self) -> &'static str {
@@ -101,7 +99,6 @@ impl MigrationStage {
             Self::Metadata => "metadata",
             Self::Shares => "shares",
             Self::DirectLinks => "direct_links",
-            Self::Tasks => "tasks",
         }
     }
 
@@ -210,9 +207,11 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
             );
         }
         report = loaded.report;
+        report.completed_stages.retain(|stage| stage != "tasks");
         report.resumed = true;
         report.run_id = Some(run_id.clone());
-        (loaded.context, loaded.baseline, loaded.last_completed_stage)
+        let last_completed_stage = normalize_legacy_completed_stage(loaded.last_completed_stage);
+        (loaded.context, loaded.baseline, last_completed_stage)
     } else {
         ensure_target_safe(&target, options.allow_non_empty_target).await?;
         let baseline = TargetCounts::load(&target).await?;
@@ -500,9 +499,6 @@ pub(super) async fn execute_stage(
                 report,
             )
             .await
-        }
-        MigrationStage::Tasks => {
-            migrate_tasks(transaction, inputs.source_data, context, report).await
         }
     }
 }
@@ -868,6 +864,14 @@ pub(super) fn validate_run_id(run_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_legacy_completed_stage(stage: Option<String>) -> Option<String> {
+    match stage.as_deref() {
+        // Runs created before task migration was removed used `tasks` as the terminal stage.
+        Some("tasks") => Some(MigrationStage::DirectLinks.as_str().to_string()),
+        _ => stage,
+    }
+}
+
 pub(super) fn hash_fingerprint(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -884,7 +888,7 @@ pub(super) fn source_fingerprint(source_url: &str, source: &SourceData) -> Strin
         source.shares.len(),
         source.metadata.len(),
         source.direct_links.len(),
-        source.tasks.len(),
+        source.source_tasks,
     ))
 }
 
@@ -936,6 +940,19 @@ mod tests {
         let timing = progress_timing(50, 100, Instant::now());
         assert!(timing.contains("rows_per_sec="));
         assert!(timing.contains("eta_secs="));
+    }
+
+    #[test]
+    fn normalizes_removed_task_stage_for_legacy_checkpoints() {
+        assert_eq!(
+            normalize_legacy_completed_stage(Some("tasks".to_string())).as_deref(),
+            Some("direct_links")
+        );
+        assert_eq!(
+            normalize_legacy_completed_stage(Some("shares".to_string())).as_deref(),
+            Some("shares")
+        );
+        assert_eq!(normalize_legacy_completed_stage(None), None);
     }
 
     #[tokio::test]

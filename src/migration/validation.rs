@@ -41,10 +41,6 @@ pub(super) async fn validate_target_schema(db: &DatabaseConnection) -> Result<()
         .count(db)
         .await
         .wrap_err("AsterDrive tags table is unavailable")?;
-    aster_drive_schema::entities::background_task::Entity::find()
-        .count(db)
-        .await
-        .wrap_err("AsterDrive background_tasks table is unavailable")?;
     Ok(())
 }
 
@@ -122,12 +118,6 @@ pub(super) async fn ensure_target_safe(
                 .count(db)
                 .await?,
         ),
-        (
-            "background_tasks",
-            aster_drive_schema::entities::background_task::Entity::find()
-                .count(db)
-                .await?,
-        ),
     ];
     let occupied: Vec<String> = counts
         .into_iter()
@@ -156,7 +146,6 @@ pub(super) struct TargetCounts {
     shares: u64,
     properties: u64,
     tags: u64,
-    tasks: u64,
 }
 
 impl TargetCounts {
@@ -193,9 +182,6 @@ impl TargetCounts {
                 .count(db)
                 .await?,
             tags: aster_drive_schema::entities::tag::Entity::find()
-                .count(db)
-                .await?,
-            tasks: aster_drive_schema::entities::background_task::Entity::find()
                 .count(db)
                 .await?,
         })
@@ -469,11 +455,6 @@ pub(super) async fn run_preflight(
         .iter()
         .filter(|link| !file_ids.contains(&link.file_id) || link.downloads < 0 || link.speed < 0)
         .count();
-    let invalid_tasks = source
-        .tasks
-        .iter()
-        .filter(|task| task.user_tasks.is_some_and(|id| !user_ids.contains(&id)))
-        .count();
     let duplicate_emails = source
         .users
         .iter()
@@ -533,12 +514,6 @@ pub(super) async fn run_preflight(
             0,
             invalid_direct_links,
             "direct links have a missing file or invalid counters",
-        ),
-        invariant_check(
-            "source_task_relations",
-            0,
-            invalid_tasks,
-            "tasks reference a missing user",
         ),
         invariant_check(
             "source_duplicate_emails",
@@ -638,12 +613,6 @@ pub(super) async fn validate_migration_result(
             after.properties,
         ),
         count_check("tags_count", before.tags, report.migrated_tags, after.tags),
-        count_check(
-            "background_tasks_count",
-            before.tasks,
-            report.migrated_tasks,
-            after.tasks,
-        ),
         invariant_check(
             "policy_mappings_count",
             report.migrated_policies,
@@ -686,51 +655,7 @@ pub(super) async fn validate_migration_result(
             report.mappings.shares.len(),
             "share source-to-target mappings are incomplete",
         ),
-        invariant_check(
-            "task_mappings_count",
-            report.migrated_tasks,
-            report.mappings.tasks.len(),
-            "task source-to-target mappings are incomplete",
-        ),
     ];
-
-    let task_ids = report
-        .mappings
-        .tasks
-        .iter()
-        .map(|mapping| mapping.target_id)
-        .collect::<Vec<_>>();
-    let mut imported_tasks = Vec::new();
-    for chunk in task_ids.chunks(500) {
-        imported_tasks.extend(
-            aster_drive_schema::entities::background_task::Entity::find()
-                .filter(
-                    aster_drive_schema::entities::background_task::Column::Id
-                        .is_in(chunk.iter().copied()),
-                )
-                .all(db)
-                .await?,
-        );
-    }
-    checks.push(invariant_check(
-        "imported_tasks_exist",
-        task_ids.len(),
-        imported_tasks.len(),
-        "one or more imported task IDs are missing",
-    ));
-    let terminal_tasks = imported_tasks
-        .iter()
-        .filter(|task| {
-            matches!(task.status.as_str(), "succeeded" | "failed" | "canceled")
-                && task.lease_expires_at.is_none()
-        })
-        .count();
-    checks.push(invariant_check(
-        "imported_tasks_are_terminal",
-        imported_tasks.len(),
-        terminal_tasks,
-        "imported tasks must be terminal and have no active lease",
-    ));
 
     let tag_properties = aster_drive_schema::entities::entity_property::Entity::find()
         .filter(aster_drive_schema::entities::entity_property::Column::Namespace.eq("system.tags"))

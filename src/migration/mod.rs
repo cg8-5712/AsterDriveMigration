@@ -6,9 +6,7 @@ use std::time::Instant;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};
-use base64::Engine;
 use color_eyre::eyre::{Result, WrapErr, bail};
-use hmac::{Hmac, Mac};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, DatabaseTransaction, EntityTrait,
     IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
@@ -18,15 +16,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use aster_drive_model as aster_drive_schema;
-use aster_drive_model::types::{
-    BackgroundTaskKind, BackgroundTaskStatus, DriverType, EntityType, StoredTaskPayload,
-    StoredTaskResult, StoredTaskRuntime, StoredTaskSteps, TagScopeType,
-};
+use aster_drive_model::types::DriverType;
 use aster_drive_schema_migration::{MigrationTrack, inspect_migration_history};
-
-fn target_time(value: chrono::DateTime<chrono::FixedOffset>) -> chrono::DateTime<chrono::Utc> {
-    value.with_timezone(&chrono::Utc)
-}
 
 mod checkpoint;
 mod engine;

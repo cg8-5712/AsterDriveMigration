@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const REPORT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct MigrationOptions {
     pub source_url: String,
@@ -56,7 +58,6 @@ pub struct MigrationReport {
     pub migrated_tags: usize,
     pub migrated_tag_assignments: usize,
     pub migrated_direct_links: usize,
-    pub migrated_tasks: usize,
     pub skipped: usize,
     pub dry_run: bool,
     pub warnings: Vec<String>,
@@ -76,7 +77,7 @@ pub struct MigrationReport {
 impl Default for MigrationReport {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: REPORT_SCHEMA_VERSION,
             generated_at: chrono::Utc::now(),
             source_users: 0,
             source_groups: 0,
@@ -100,7 +101,6 @@ impl Default for MigrationReport {
             migrated_tags: 0,
             migrated_tag_assignments: 0,
             migrated_direct_links: 0,
-            migrated_tasks: 0,
             skipped: 0,
             dry_run: true,
             warnings: Vec::new(),
@@ -134,7 +134,6 @@ pub struct MigrationMappings {
     pub blobs: Vec<IdMapping>,
     pub files: Vec<IdMapping>,
     pub shares: Vec<IdMapping>,
-    pub tasks: Vec<IdMapping>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,7 +239,6 @@ impl MigrationReport {
             blobs: sorted_id_mappings(blobs),
             files: sorted_id_mappings(files),
             shares: sorted_id_mappings(&context.shares),
-            tasks: sorted_id_mappings(&context.tasks),
         };
     }
 }
@@ -275,7 +273,7 @@ impl fmt::Display for MigrationReport {
         } else {
             writeln!(
                 output,
-                "migrated: users={}, policy_groups={}, policies={}, folders={}, files={}, blobs={}, versions={}, shares={}, properties={}, tags={}, tag_assignments={}, direct_links={}, archived_tasks={}",
+                "migrated: users={}, policy_groups={}, policies={}, folders={}, files={}, blobs={}, versions={}, shares={}, properties={}, tags={}, tag_assignments={}, direct_links={}",
                 self.migrated_users,
                 self.migrated_policy_groups,
                 self.migrated_policies,
@@ -287,8 +285,7 @@ impl fmt::Display for MigrationReport {
                 self.migrated_properties,
                 self.migrated_tags,
                 self.migrated_tag_assignments,
-                self.migrated_direct_links,
-                self.migrated_tasks
+                self.migrated_direct_links
             )?;
             writeln!(output, "skipped: {}", self.skipped)?;
             if !self.skipped_by_type.is_empty() {
@@ -374,7 +371,6 @@ pub fn write_csv_mapping_report(path: impl AsRef<Path>, report: &MigrationReport
         ("blob", &report.mappings.blobs),
         ("file", &report.mappings.files),
         ("share", &report.mappings.shares),
-        ("task", &report.mappings.tasks),
     ] {
         for mapping in mappings {
             writeln!(
@@ -435,7 +431,7 @@ mod tests {
 
         write_json_report(&report_path, &report)?;
         let value: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         assert_eq!(value["migrated_users"], 1);
         assert_eq!(value["mappings"]["users"][0]["source_id"], 7);
         assert_eq!(value["mappings"]["users"][0]["target_id"], 11);

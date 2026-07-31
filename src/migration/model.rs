@@ -20,7 +20,6 @@ pub(super) struct MigrationContext {
     pub(super) blobs: HashMap<i64, i64>,
     pub(super) files: HashMap<i64, i64>,
     pub(super) shares: HashMap<i64, i64>,
-    pub(super) tasks: HashMap<i64, i64>,
 }
 
 pub(super) fn sorted_id_mappings(values: &HashMap<i64, i64>) -> Vec<IdMapping> {
@@ -50,7 +49,7 @@ pub(super) struct SourceData {
     pub(super) shares: Vec<cloudreve_schema::shares::Model>,
     pub(super) metadata: Vec<cloudreve_schema::metadata::Model>,
     pub(super) direct_links: Vec<cloudreve_schema::direct_links::Model>,
-    pub(super) tasks: Vec<cloudreve_schema::tasks::Model>,
+    pub(super) source_tasks: u64,
 }
 
 impl SourceData {
@@ -99,7 +98,13 @@ impl SourceData {
         let direct_links = cloudreve_schema::direct_links::Entity::find()
             .all(db)
             .await?;
-        let tasks = cloudreve_schema::tasks::Entity::find().all(db).await?;
+        let task_query = if include_deleted {
+            cloudreve_schema::tasks::Entity::find()
+        } else {
+            cloudreve_schema::tasks::Entity::find()
+                .filter(cloudreve_schema::tasks::Column::DeletedAt.is_null())
+        };
+        let source_tasks = task_query.count(db).await?;
 
         Ok(Self {
             groups: filter_deleted(groups, include_deleted, |model| model.deleted_at.is_some()),
@@ -122,7 +127,7 @@ impl SourceData {
             direct_links: filter_deleted(direct_links, include_deleted, |model| {
                 model.deleted_at.is_some()
             }),
-            tasks: filter_deleted(tasks, include_deleted, |model| model.deleted_at.is_some()),
+            source_tasks,
         })
     }
 
@@ -139,9 +144,14 @@ impl SourceData {
             source_tag_assignments: self
                 .metadata
                 .iter()
-                .filter(|metadata| tag_name(&metadata.name).is_some())
+                .filter(|metadata| {
+                    metadata
+                        .name
+                        .strip_prefix("tag:")
+                        .is_some_and(|name| !name.trim().is_empty())
+                })
                 .count() as u64,
-            source_tasks: self.tasks.len() as u64,
+            source_tasks: self.source_tasks,
             ..Default::default()
         }
     }
@@ -163,7 +173,6 @@ impl SourceData {
             "OAuth grants, login sessions and Cloudreve filesystem events are intentionally not migrated".to_string(),
             "Cloudreve Passkeys, WebDAV credentials and two-factor secrets are not portable to AD and must be enrolled again".to_string(),
             "file objects are reused in their existing local/object-storage locations; the migration does not duplicate object bytes".to_string(),
-            "Cloudreve tasks are archived as terminal AD system_runtime records; queued, processing and suspending tasks are canceled instead of resumed".to_string(),
         ];
         let symbolic = self.symbolic_files;
         if symbolic > 0 {
@@ -180,6 +189,12 @@ impl SourceData {
         }
         if !self.direct_links.is_empty() {
             warnings.push("Cloudreve direct links require --direct-link-secret to regenerate AD v2 URLs; old /f/... URLs, per-link counters, speed limits and revocation semantics cannot be preserved".to_string());
+        }
+        if self.source_tasks > 0 {
+            warnings.push(format!(
+                "{} Cloudreve runtime tasks were intentionally not migrated",
+                self.source_tasks
+            ));
         }
         let duplicate_active_share_targets =
             duplicate_active_share_targets(&self.shares, chrono::Utc::now().fixed_offset());
@@ -253,93 +268,6 @@ pub(super) fn source_settings(value: &Option<Value>) -> Value {
     value.clone().unwrap_or_else(|| json!({}))
 }
 
-pub(super) fn tag_name(metadata_name: &str) -> Option<&str> {
-    metadata_name
-        .strip_prefix("tag:")
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-}
-
-pub(super) fn normalize_tag_name(name: &str) -> String {
-    name.trim().to_lowercase()
-}
-
-pub(super) fn target_tag_name(name: &str) -> String {
-    name.trim().chars().take(64).collect()
-}
-
-pub(super) fn target_tag_color(color: &str) -> String {
-    let color = color.trim().to_ascii_lowercase();
-    if color.len() == 7
-        && color.starts_with('#')
-        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return color;
-    }
-    if color.len() == 4
-        && color.starts_with('#')
-        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        let mut expanded = String::with_capacity(7);
-        expanded.push('#');
-        for character in color[1..].chars() {
-            expanded.push(character);
-            expanded.push(character);
-        }
-        return expanded;
-    }
-    "#3b82f6".to_string()
-}
-
-pub(super) fn encode_base62(mut value: u64) -> String {
-    const BASE62: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    if value == 0 {
-        return "a".to_string();
-    }
-    let mut encoded = Vec::new();
-    while value > 0 {
-        encoded.push(char::from(BASE62[(value % 62) as usize]));
-        value /= 62;
-    }
-    encoded.iter().rev().collect()
-}
-
-pub(super) fn direct_link_url(
-    file_id: i64,
-    owner_user_id: i64,
-    file_name: &str,
-    secret: &str,
-) -> Result<String> {
-    let file_id = u64::try_from(file_id).wrap_err("AD direct link file ID must be non-negative")?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|error| color_eyre::eyre::eyre!("initialize direct link HMAC: {error}"))?;
-    mac.update(b"direct_link:v2:");
-    mac.update(format!("user:{owner_user_id}").as_bytes());
-    mac.update(b":");
-    mac.update(file_id.to_string().as_bytes());
-    let signature =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    Ok(format!(
-        "/d/v2.{}.{}/{}",
-        encode_base62(file_id),
-        signature,
-        urlencoding::encode(file_name)
-    ))
-}
-
-pub(super) fn archived_task_status(source_status: &str) -> &'static str {
-    match source_status {
-        "completed" => "succeeded",
-        "error" => "failed",
-        "canceled" | "queued" | "processing" | "suspending" => "canceled",
-        _ => "canceled",
-    }
-}
-
-pub(super) fn source_task_was_active(source_status: &str) -> bool {
-    matches!(source_status, "queued" | "processing" | "suspending")
-}
-
 pub(super) fn unique_username(source: &str, source_id: i64, used: &mut HashSet<String>) -> String {
     let mut base: String = source
         .trim()
@@ -404,46 +332,6 @@ mod tests {
         assert_eq!(map_driver_type("cos"), Some(DriverType::TencentCos));
         assert_eq!(map_driver_type("onedrive"), None);
         assert_eq!(map_driver_type("qiniu"), None);
-    }
-
-    #[test]
-    fn parses_and_normalizes_cloudreve_tags_for_aster_drive() {
-        assert_eq!(tag_name("tag:Important"), Some("Important"));
-        assert_eq!(tag_name("tag:  Project A  "), Some("Project A"));
-        assert_eq!(tag_name("author"), None);
-        assert_eq!(normalize_tag_name(" Important "), "important");
-        assert_eq!(target_tag_color("#AbC"), "#aabbcc");
-        assert_eq!(target_tag_color("#3B82F6"), "#3b82f6");
-        assert_eq!(target_tag_color(""), "#3b82f6");
-        assert_eq!(target_tag_name(&"x".repeat(80)).chars().count(), 64);
-    }
-
-    #[test]
-    fn builds_asterdrive_v2_direct_link_urls() -> Result<()> {
-        let url = direct_link_url(1, 7, "hello world.txt", "test-direct-link-secret")?;
-        assert!(url.starts_with("/d/v2.b."));
-        assert!(url.ends_with("/hello%20world.txt"));
-        assert_eq!(
-            url,
-            direct_link_url(1, 7, "hello world.txt", "test-direct-link-secret")?
-        );
-        assert_ne!(
-            url,
-            direct_link_url(1, 8, "hello world.txt", "test-direct-link-secret")?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn maps_cloudreve_tasks_to_non_executable_terminal_statuses() {
-        assert_eq!(archived_task_status("completed"), "succeeded");
-        assert_eq!(archived_task_status("error"), "failed");
-        assert_eq!(archived_task_status("canceled"), "canceled");
-        for status in ["queued", "processing", "suspending"] {
-            assert!(source_task_was_active(status));
-            assert_eq!(archived_task_status(status), "canceled");
-        }
-        assert_eq!(archived_task_status("unknown"), "canceled");
     }
 
     #[test]

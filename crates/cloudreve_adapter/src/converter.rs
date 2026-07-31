@@ -4,14 +4,16 @@ use color_eyre::eyre::{Result, bail};
 use serde_json::{Value, json};
 
 use super::{
-    CloudreveBlobRecord, CloudreveFileRecord, CloudreveFolderRecord, CloudrevePolicyGroupRecord,
-    CloudreveShareRecord, CloudreveStoragePolicyRecord, CloudreveUserRecord,
+    CloudreveBlobRecord, CloudreveDirectLinkRecord, CloudreveFileRecord, CloudreveFolderRecord,
+    CloudreveMetadataRecord, CloudrevePolicyGroupRecord, CloudreveShareRecord,
+    CloudreveStoragePolicyRecord, CloudreveUserRecord,
 };
 use aster_drive_migration_core::{
-    Conversion, ConversionContext, MigrationAvatarSource, MigrationBlob, MigrationFile,
-    MigrationFileVersion, MigrationFolder, MigrationPolicyGroup, MigrationShare,
-    MigrationShareTarget, MigrationStorageDriver, MigrationStoragePolicy, MigrationUser,
-    MigrationUserRole, MigrationUserStatus, SkipReason, SourceConverter,
+    Conversion, ConversionContext, MigrationAvatarSource, MigrationBlob, MigrationDirectLink,
+    MigrationEntityKind, MigrationEntityRef, MigrationFile, MigrationFileVersion, MigrationFolder,
+    MigrationMetadata, MigrationPolicyGroup, MigrationProperty, MigrationShare,
+    MigrationShareTarget, MigrationStorageDriver, MigrationStoragePolicy, MigrationTagAssignment,
+    MigrationUser, MigrationUserRole, MigrationUserStatus, SkipReason, SourceConverter,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -23,6 +25,57 @@ fn target_time(value: chrono::DateTime<chrono::FixedOffset>) -> chrono::DateTime
 
 fn settings(value: &Option<Value>) -> Value {
     value.clone().unwrap_or_else(|| json!({}))
+}
+
+const ASTER_DRIVE_PROPERTY_NAME_MAX_CHARS: usize = 255;
+const ASTER_DRIVE_PROPERTY_VALUE_MAX_BYTES: usize = 65_536;
+const ASTER_DRIVE_TAG_NAME_MAX_CHARS: usize = 64;
+const DEFAULT_TAG_COLOR: &str = "#3b82f6";
+
+fn metadata_target(target: &cloudreve_schema::files::Model) -> Option<MigrationEntityRef> {
+    let kind = match target.r#type {
+        0 => MigrationEntityKind::File,
+        1 => MigrationEntityKind::Folder,
+        _ => return None,
+    };
+    Some(MigrationEntityRef {
+        kind,
+        source_id: target.id,
+    })
+}
+
+fn tag_name(metadata_name: &str) -> Option<&str> {
+    metadata_name.strip_prefix("tag:").map(str::trim)
+}
+
+fn target_tag_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .take(ASTER_DRIVE_TAG_NAME_MAX_CHARS)
+        .collect()
+}
+
+fn target_tag_color(color: &str) -> String {
+    let color = color.trim().to_ascii_lowercase();
+    if color.len() == 7
+        && color.starts_with('#')
+        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return color;
+    }
+    if color.len() == 4
+        && color.starts_with('#')
+        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        let mut expanded = String::with_capacity(7);
+        expanded.push('#');
+        for character in color[1..].chars() {
+            expanded.push(character);
+            expanded.push(character);
+        }
+        return expanded;
+    }
+    DEFAULT_TAG_COLOR.to_string()
 }
 
 impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
@@ -442,6 +495,180 @@ impl SourceConverter<CloudreveShareRecord> for CloudreveConverter {
     }
 }
 
+impl SourceConverter<CloudreveMetadataRecord> for CloudreveConverter {
+    type Output = MigrationMetadata;
+    type Error = color_eyre::Report;
+
+    fn convert(
+        &self,
+        source: CloudreveMetadataRecord,
+        _: &ConversionContext,
+    ) -> Result<Conversion<Self::Output>> {
+        let metadata = source.metadata;
+        if metadata.deleted_at.is_some() {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "deleted_metadata",
+                message: format!("Cloudreve metadata {} is deleted", metadata.id),
+            }));
+        }
+        let Some(target) = source.target else {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "missing_metadata_target",
+                message: format!(
+                    "Cloudreve metadata {} target {} does not exist",
+                    metadata.id, metadata.file_id
+                ),
+            }));
+        };
+        if target.id != metadata.file_id {
+            bail!(
+                "Cloudreve metadata {} target record {} does not match target {}",
+                metadata.id,
+                target.id,
+                metadata.file_id
+            );
+        }
+        let Some(target_ref) = metadata_target(&target) else {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "unsupported_metadata_target",
+                message: format!(
+                    "Cloudreve metadata {} target {} has unsupported type {}",
+                    metadata.id, target.id, target.r#type
+                ),
+            }));
+        };
+
+        if let Some(source_tag_name) = tag_name(&metadata.name) {
+            let name = target_tag_name(source_tag_name);
+            if name.is_empty() {
+                return Ok(Conversion::Skipped(SkipReason {
+                    code: "empty_tag_name",
+                    message: format!(
+                        "Cloudreve metadata {} tag name is empty after trimming",
+                        metadata.id
+                    ),
+                }));
+            }
+            let normalized_name = name.to_lowercase();
+            if normalized_name.chars().count() > ASTER_DRIVE_TAG_NAME_MAX_CHARS {
+                bail!(
+                    "Cloudreve metadata {} normalized tag name exceeds AsterDrive's {} character limit",
+                    metadata.id,
+                    ASTER_DRIVE_TAG_NAME_MAX_CHARS
+                );
+            }
+            return Ok(Conversion::Ready(MigrationMetadata::TagAssignment(
+                MigrationTagAssignment {
+                    source_metadata_id: metadata.id,
+                    owner_source_id: target.owner_id,
+                    target: target_ref,
+                    normalized_name,
+                    name,
+                    color: target_tag_color(&metadata.value),
+                    created_at: target_time(metadata.created_at),
+                    updated_at: target_time(metadata.updated_at),
+                },
+            )));
+        }
+
+        if metadata.name.chars().count() > ASTER_DRIVE_PROPERTY_NAME_MAX_CHARS {
+            bail!(
+                "Cloudreve metadata {} name exceeds AsterDrive's {} character limit",
+                metadata.id,
+                ASTER_DRIVE_PROPERTY_NAME_MAX_CHARS
+            );
+        }
+        if metadata.value.len() > ASTER_DRIVE_PROPERTY_VALUE_MAX_BYTES {
+            bail!(
+                "Cloudreve metadata {} value exceeds AsterDrive's {} byte API limit",
+                metadata.id,
+                ASTER_DRIVE_PROPERTY_VALUE_MAX_BYTES
+            );
+        }
+        Ok(Conversion::Ready(MigrationMetadata::Property(
+            MigrationProperty {
+                source_metadata_id: metadata.id,
+                target: target_ref,
+                namespace: if metadata.is_public {
+                    "cloudreve.public".to_string()
+                } else {
+                    "cloudreve.private".to_string()
+                },
+                name: metadata.name,
+                value: Some(metadata.value),
+            },
+        )))
+    }
+}
+
+impl SourceConverter<CloudreveDirectLinkRecord> for CloudreveConverter {
+    type Output = MigrationDirectLink;
+    type Error = color_eyre::Report;
+
+    fn convert(
+        &self,
+        source: CloudreveDirectLinkRecord,
+        _: &ConversionContext,
+    ) -> Result<Conversion<Self::Output>> {
+        let link = source.direct_link;
+        if link.deleted_at.is_some() {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "deleted_direct_link",
+                message: format!("Cloudreve direct link {} is deleted", link.id),
+            }));
+        }
+        let Some(target) = source.target else {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "missing_direct_link_target",
+                message: format!(
+                    "Cloudreve direct link {} target file {} does not exist",
+                    link.id, link.file_id
+                ),
+            }));
+        };
+        if target.id != link.file_id {
+            bail!(
+                "Cloudreve direct link {} target record {} does not match target {}",
+                link.id,
+                target.id,
+                link.file_id
+            );
+        }
+        if target.r#type != 0 {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "unsupported_direct_link_target",
+                message: format!(
+                    "Cloudreve direct link {} target {} is not a file",
+                    link.id, target.id
+                ),
+            }));
+        }
+        if link.downloads < 0 {
+            bail!(
+                "Cloudreve direct link {} has negative download count {}",
+                link.id,
+                link.downloads
+            );
+        }
+        if link.speed < 0 {
+            bail!(
+                "Cloudreve direct link {} has negative speed limit {}",
+                link.id,
+                link.speed
+            );
+        }
+        Ok(Conversion::Ready(MigrationDirectLink {
+            source_id: link.id,
+            file_source_id: target.id,
+            owner_source_id: target.owner_id,
+            file_name: target.name,
+            source_name: link.name,
+            source_downloads: link.downloads,
+            source_speed_limit: link.speed,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +783,32 @@ mod tests {
             props: Some(json!({"show_readme": true})),
             file_shares: target_id,
             user_shares: owner_id,
+        }
+    }
+
+    fn metadata(id: i64, name: &str, value: &str) -> cloudreve_schema::metadata::Model {
+        cloudreve_schema::metadata::Model {
+            id,
+            created_at: now(),
+            updated_at: now(),
+            deleted_at: None,
+            name: name.to_string(),
+            value: value.to_string(),
+            is_public: true,
+            file_id: 10,
+        }
+    }
+
+    fn direct_link(id: i64) -> cloudreve_schema::direct_links::Model {
+        cloudreve_schema::direct_links::Model {
+            id,
+            created_at: now(),
+            updated_at: now(),
+            deleted_at: None,
+            name: "legacy-name.txt".to_string(),
+            downloads: 7,
+            speed: 1_024,
+            file_id: 10,
         }
     }
 
@@ -940,6 +1193,304 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("download limit exceeds i64")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_public_and_private_metadata_for_files_and_folders() -> Result<()> {
+        for (is_public, target_type, namespace, kind) in [
+            (true, 0, "cloudreve.public", MigrationEntityKind::File),
+            (false, 1, "cloudreve.private", MigrationEntityKind::Folder),
+        ] {
+            let mut source = metadata(40, "author", "Cloudreve");
+            source.is_public = is_public;
+            let converted = ready(CloudreveConverter.convert(
+                CloudreveMetadataRecord {
+                    metadata: source,
+                    target: Some(folder(target_type)),
+                },
+                &ConversionContext,
+            )?);
+            let MigrationMetadata::Property(property) = converted else {
+                panic!("expected property conversion");
+            };
+            assert_eq!(property.source_metadata_id, 40);
+            assert_eq!(property.target.kind, kind);
+            assert_eq!(property.target.source_id, 10);
+            assert_eq!(property.namespace, namespace);
+            assert_eq!(property.name, "author");
+            assert_eq!(property.value.as_deref(), Some("Cloudreve"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn converts_tags_with_asterdrive_name_and_color_rules() -> Result<()> {
+        for (source_name, source_color, expected_name, expected_color) in [
+            ("tag:Important", "#AbC", "Important", "#aabbcc"),
+            ("tag:  Project A  ", "#3B82F6", "Project A", "#3b82f6"),
+            ("tag:Fallback", "invalid", "Fallback", DEFAULT_TAG_COLOR),
+        ] {
+            let converted = ready(CloudreveConverter.convert(
+                CloudreveMetadataRecord {
+                    metadata: metadata(41, source_name, source_color),
+                    target: Some(folder(0)),
+                },
+                &ConversionContext,
+            )?);
+            let MigrationMetadata::TagAssignment(tag) = converted else {
+                panic!("expected tag conversion");
+            };
+            assert_eq!(tag.source_metadata_id, 41);
+            assert_eq!(tag.owner_source_id, 9);
+            assert_eq!(tag.target.kind, MigrationEntityKind::File);
+            assert_eq!(tag.name, expected_name);
+            assert_eq!(tag.normalized_name, expected_name.to_lowercase());
+            assert_eq!(tag.color, expected_color);
+        }
+
+        let long_name = format!("tag:{}", "x".repeat(65));
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveMetadataRecord {
+                metadata: metadata(42, &long_name, ""),
+                target: Some(folder(1)),
+            },
+            &ConversionContext,
+        )?);
+        let MigrationMetadata::TagAssignment(tag) = converted else {
+            panic!("expected tag conversion");
+        };
+        assert_eq!(tag.name.chars().count(), ASTER_DRIVE_TAG_NAME_MAX_CHARS);
+        assert_eq!(tag.target.kind, MigrationEntityKind::Folder);
+
+        let expanding_name = format!("tag:{}İ", "x".repeat(63));
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveMetadataRecord {
+                        metadata: metadata(43, &expanding_name, "#abc"),
+                        target: Some(folder(0)),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("normalized tag name exceeds")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn skips_deleted_missing_and_unsupported_metadata() -> Result<()> {
+        let mut deleted = metadata(40, "author", "Cloudreve");
+        deleted.deleted_at = Some(now());
+        let cases = [
+            (
+                CloudreveMetadataRecord {
+                    metadata: deleted,
+                    target: Some(folder(0)),
+                },
+                "deleted_metadata",
+            ),
+            (
+                CloudreveMetadataRecord {
+                    metadata: metadata(41, "author", "Cloudreve"),
+                    target: None,
+                },
+                "missing_metadata_target",
+            ),
+            (
+                CloudreveMetadataRecord {
+                    metadata: metadata(42, "author", "Cloudreve"),
+                    target: Some(folder(2)),
+                },
+                "unsupported_metadata_target",
+            ),
+            (
+                CloudreveMetadataRecord {
+                    metadata: metadata(43, "tag:   ", "#abc"),
+                    target: Some(folder(0)),
+                },
+                "empty_tag_name",
+            ),
+        ];
+        for (source, expected_code) in cases {
+            let conversion = CloudreveConverter.convert(source, &ConversionContext)?;
+            assert!(
+                matches!(conversion, Conversion::Skipped(reason) if reason.code == expected_code)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validates_metadata_target_identity_and_persistence_limits() -> Result<()> {
+        let mut mismatched_target = folder(0);
+        mismatched_target.id = 11;
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveMetadataRecord {
+                        metadata: metadata(40, "author", "Cloudreve"),
+                        target: Some(mismatched_target),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("does not match target")
+        );
+
+        let unicode_boundary = "界".repeat(ASTER_DRIVE_PROPERTY_NAME_MAX_CHARS);
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveMetadataRecord {
+                metadata: metadata(41, &unicode_boundary, ""),
+                target: Some(folder(0)),
+            },
+            &ConversionContext,
+        )?);
+        let MigrationMetadata::Property(property) = converted else {
+            panic!("expected property conversion");
+        };
+        assert_eq!(
+            property.name.chars().count(),
+            ASTER_DRIVE_PROPERTY_NAME_MAX_CHARS
+        );
+
+        let too_long_name = "界".repeat(ASTER_DRIVE_PROPERTY_NAME_MAX_CHARS + 1);
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveMetadataRecord {
+                        metadata: metadata(42, &too_long_name, ""),
+                        target: Some(folder(0)),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("name exceeds")
+        );
+
+        let value_boundary = "x".repeat(ASTER_DRIVE_PROPERTY_VALUE_MAX_BYTES);
+        assert!(matches!(
+            CloudreveConverter.convert(
+                CloudreveMetadataRecord {
+                    metadata: metadata(43, "boundary", &value_boundary),
+                    target: Some(folder(0)),
+                },
+                &ConversionContext,
+            )?,
+            Conversion::Ready(MigrationMetadata::Property(_))
+        ));
+        let too_long_value = "x".repeat(ASTER_DRIVE_PROPERTY_VALUE_MAX_BYTES + 1);
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveMetadataRecord {
+                        metadata: metadata(44, "too-long", &too_long_value),
+                        target: Some(folder(0)),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("value exceeds")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_direct_links_as_file_scoped_legacy_records() -> Result<()> {
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveDirectLinkRecord {
+                direct_link: direct_link(50),
+                target: Some(folder(0)),
+            },
+            &ConversionContext,
+        )?);
+        assert_eq!(converted.source_id, 50);
+        assert_eq!(converted.file_source_id, 10);
+        assert_eq!(converted.owner_source_id, 9);
+        assert_eq!(converted.file_name, "Documents");
+        assert_eq!(converted.source_name, "legacy-name.txt");
+        assert_eq!(converted.source_downloads, 7);
+        assert_eq!(converted.source_speed_limit, 1_024);
+        Ok(())
+    }
+
+    #[test]
+    fn handles_direct_link_boundaries_without_reactivating_deleted_rows() -> Result<()> {
+        let mut deleted = direct_link(50);
+        deleted.deleted_at = Some(now());
+        for (source, target, expected_code) in [
+            (deleted, Some(folder(0)), "deleted_direct_link"),
+            (direct_link(51), None, "missing_direct_link_target"),
+            (
+                direct_link(52),
+                Some(folder(1)),
+                "unsupported_direct_link_target",
+            ),
+        ] {
+            let conversion = CloudreveConverter.convert(
+                CloudreveDirectLinkRecord {
+                    direct_link: source,
+                    target,
+                },
+                &ConversionContext,
+            )?;
+            assert!(
+                matches!(conversion, Conversion::Skipped(reason) if reason.code == expected_code)
+            );
+        }
+
+        let mut mismatched_target = folder(0);
+        mismatched_target.id = 11;
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveDirectLinkRecord {
+                        direct_link: direct_link(53),
+                        target: Some(mismatched_target),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("does not match target")
+        );
+
+        let mut negative_downloads = direct_link(54);
+        negative_downloads.downloads = -1;
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveDirectLinkRecord {
+                        direct_link: negative_downloads,
+                        target: Some(folder(0)),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("negative download count")
+        );
+
+        let mut negative_speed = direct_link(55);
+        negative_speed.speed = -1;
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveDirectLinkRecord {
+                        direct_link: negative_speed,
+                        target: Some(folder(0)),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("negative speed limit")
         );
         Ok(())
     }

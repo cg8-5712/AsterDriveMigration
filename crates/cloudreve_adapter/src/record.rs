@@ -38,3 +38,15 @@ pub struct CloudreveShareRecord {
     pub share: cloudreve_schema::shares::Model,
     pub target: Option<cloudreve_schema::files::Model>,
 }
+
+#[derive(Debug, Clone)]
+pub struct CloudreveMetadataRecord {
+    pub metadata: cloudreve_schema::metadata::Model,
+    pub target: Option<cloudreve_schema::files::Model>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudreveDirectLinkRecord {
+    pub direct_link: cloudreve_schema::direct_links::Model,
+    pub target: Option<cloudreve_schema::files::Model>,
+}

@@ -2,16 +2,18 @@ use super::*;
 use sea_orm::DatabaseTransaction;
 
 use aster_drive_migration_core::{
-    Conversion, ConversionContext, MigrationShareTarget, SourceConverter,
+    Conversion, ConversionContext, MigrationEntityKind, MigrationEntityRef, MigrationMetadata,
+    MigrationShareTarget, SourceConverter,
 };
 use aster_drive_writer::{
-    AsterDriveWriter, ResolvedBlob, ResolvedFile, ResolvedFileVersion, ResolvedFolder,
-    ResolvedPolicyGroup, ResolvedShare, ResolvedShareTarget, ResolvedUser,
+    AsterDriveWriter, ResolvedBlob, ResolvedDirectLink, ResolvedEntityTarget, ResolvedFile,
+    ResolvedFileVersion, ResolvedFolder, ResolvedPolicyGroup, ResolvedProperty, ResolvedShare,
+    ResolvedShareTarget, ResolvedTag, ResolvedTagAssignment, ResolvedUser,
 };
 use cloudreve_adapter::{
-    CloudreveBlobRecord, CloudreveConverter, CloudreveFileRecord, CloudreveFolderRecord,
-    CloudrevePolicyGroupRecord, CloudreveShareRecord, CloudreveStoragePolicyRecord,
-    CloudreveUserRecord,
+    CloudreveBlobRecord, CloudreveConverter, CloudreveDirectLinkRecord, CloudreveFileRecord,
+    CloudreveFolderRecord, CloudreveMetadataRecord, CloudrevePolicyGroupRecord,
+    CloudreveShareRecord, CloudreveStoragePolicyRecord, CloudreveUserRecord,
 };
 
 pub(super) async fn migrate_policies(
@@ -394,128 +396,186 @@ pub(super) async fn migrate_metadata(
     context: &MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
+    #[derive(Debug)]
+    struct WrittenTag {
+        id: i64,
+        name: String,
+        color: String,
+        source_metadata_id: i64,
+        conflict_reported: bool,
+    }
+
     let source_file_ids = source
         .metadata
         .iter()
         .map(|metadata| metadata.file_id)
         .collect::<Vec<_>>();
     let source_files = load_source_files(source_db, &source_file_ids).await?;
-    let mut tags: HashMap<(i64, String), i64> = HashMap::new();
-    for metadata in &source.metadata {
-        let Some(source_file) = source_files.get(&metadata.file_id) else {
-            report.record_skip(
-                "metadata",
-                Some(metadata.id),
-                format!("source file {} does not exist", metadata.file_id),
-            );
-            continue;
-        };
-        let target_entity = if source_file.r#type == 0 {
-            file_mappings
-                .get(&metadata.file_id)
-                .copied()
-                .map(|id| (EntityType::File, id))
-        } else {
-            context
-                .folders
-                .get(&metadata.file_id)
-                .copied()
-                .map(|id| (EntityType::Folder, id))
-        };
-        let Some((entity_type, entity_id)) = target_entity else {
-            report.record_skip(
-                "metadata",
-                Some(metadata.id),
-                format!("source entity {} was not migrated", metadata.file_id),
-            );
-            continue;
-        };
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
+    let mut tags: HashMap<(i64, String), WrittenTag> = HashMap::new();
+    let mut assignments = HashSet::new();
+    let mut metadata_rows = source.metadata.iter().collect::<Vec<_>>();
+    metadata_rows.sort_by_key(|metadata| (metadata.created_at, metadata.id));
 
-        if let Some(source_tag_name) = tag_name(&metadata.name) {
-            let Some(owner_user_id) = context.users.get(&source_file.owner_id).copied() else {
-                report.record_skip(
-                    "tag_assignment",
-                    Some(metadata.id),
-                    format!("owner user {} was not migrated", source_file.owner_id),
-                );
-                continue;
-            };
-            let name = target_tag_name(source_tag_name);
-            if name.is_empty() {
-                report.record_skip(
-                    "tag_assignment",
-                    Some(metadata.id),
-                    "tag name is empty after normalization",
-                );
+    for metadata in metadata_rows {
+        let conversion = converter.convert(
+            CloudreveMetadataRecord {
+                metadata: metadata.clone(),
+                target: source_files.get(&metadata.file_id).cloned(),
+            },
+            &conversion_context,
+        )?;
+        let converted = match conversion {
+            Conversion::Ready(converted) => converted,
+            Conversion::Skipped(reason) => {
+                report.record_skip("metadata", Some(metadata.id), reason.message);
                 continue;
             }
-            let normalized_name = normalize_tag_name(&name);
-            let tag_id = match tags.get(&(owner_user_id, normalized_name.clone())) {
-                Some(tag_id) => *tag_id,
-                None => {
-                    let tag = aster_drive_schema::entities::tag::ActiveModel {
-                        scope_type: Set(TagScopeType::Personal),
-                        owner_user_id: Set(Some(owner_user_id)),
-                        team_id: Set(None),
-                        name: Set(name),
-                        normalized_name: Set(normalized_name.clone()),
-                        color: Set(target_tag_color(&metadata.value)),
-                        sort_order: Set(0),
-                        created_at: Set(target_time(metadata.created_at)),
-                        updated_at: Set(target_time(metadata.updated_at)),
-                        ..Default::default()
+        };
+
+        match converted {
+            MigrationMetadata::Property(property) => {
+                let Some((target, _, _)) =
+                    resolve_metadata_target(property.target, file_mappings, &context.folders)
+                else {
+                    report.record_skip(
+                        "metadata",
+                        Some(property.source_metadata_id),
+                        format!(
+                            "source entity {} was not migrated",
+                            property.target.source_id
+                        ),
+                    );
+                    continue;
+                };
+                writer
+                    .write_property(ResolvedProperty {
+                        source_metadata_id: property.source_metadata_id,
+                        target,
+                        namespace: property.namespace,
+                        name: property.name,
+                        value: property.value,
+                    })
+                    .await?;
+                report.migrated_properties += 1;
+            }
+            MigrationMetadata::TagAssignment(tag) => {
+                let Some(owner_user_id) = context.users.get(&tag.owner_source_id).copied() else {
+                    report.record_skip(
+                        "tag_assignment",
+                        Some(tag.source_metadata_id),
+                        format!("owner user {} was not migrated", tag.owner_source_id),
+                    );
+                    continue;
+                };
+                let Some((target, entity_type, entity_id)) =
+                    resolve_metadata_target(tag.target, file_mappings, &context.folders)
+                else {
+                    report.record_skip(
+                        "tag_assignment",
+                        Some(tag.source_metadata_id),
+                        format!("source entity {} was not migrated", tag.target.source_id),
+                    );
+                    continue;
+                };
+
+                let tag_key = (owner_user_id, tag.normalized_name.clone());
+                let tag_id = if let Some(written) = tags.get_mut(&tag_key) {
+                    if (written.name != tag.name || written.color != tag.color)
+                        && !written.conflict_reported
+                    {
+                        report.warnings.push(format!(
+                            "Cloudreve metadata {} and {} define personal tag '{}' with conflicting display names or colors; the earliest definition '{}' ({}) is used",
+                            written.source_metadata_id,
+                            tag.source_metadata_id,
+                            tag.normalized_name,
+                            written.name,
+                            written.color
+                        ));
+                        written.conflict_reported = true;
                     }
-                    .insert(transaction)
-                    .await
-                    .wrap_err_with(|| format!("migrate tag metadata {}", metadata.id))?;
-                    tags.insert((owner_user_id, normalized_name), tag.id);
+                    written.id
+                } else {
+                    let tag_id = writer
+                        .write_tag(ResolvedTag {
+                            source_metadata_id: tag.source_metadata_id,
+                            owner_id: owner_user_id,
+                            name: tag.name.clone(),
+                            normalized_name: tag.normalized_name.clone(),
+                            color: tag.color.clone(),
+                            created_at: tag.created_at,
+                            updated_at: tag.updated_at,
+                        })
+                        .await?;
+                    tags.insert(
+                        tag_key,
+                        WrittenTag {
+                            id: tag_id,
+                            name: tag.name.clone(),
+                            color: tag.color.clone(),
+                            source_metadata_id: tag.source_metadata_id,
+                            conflict_reported: false,
+                        },
+                    );
                     report.migrated_tags += 1;
-                    tag.id
-                }
-            };
-            aster_drive_schema::entities::entity_property::ActiveModel {
-                entity_type: Set(entity_type),
-                entity_id: Set(entity_id),
-                namespace: Set("system.tags".to_string()),
-                name: Set(tag_id.to_string()),
-                value: Set(None),
-                ..Default::default()
-            }
-            .insert(transaction)
-            .await
-            .wrap_err_with(|| format!("attach migrated tag for metadata {}", metadata.id))?;
-            report.migrated_properties += 1;
-            report.migrated_tag_assignments += 1;
-            report.tag_assignments.push(TagAssignmentReport {
-                source_metadata_id: metadata.id,
-                source_entity_id: metadata.file_id,
-                target_entity_type: entity_type.as_str().to_string(),
-                target_entity_id: entity_id,
-                target_tag_id: tag_id,
-                tag_name: source_tag_name.to_string(),
-            });
-            continue;
-        }
+                    tag_id
+                };
 
-        let namespace = if metadata.is_public {
-            "cloudreve.public"
-        } else {
-            "cloudreve.private"
-        };
-        aster_drive_schema::entities::entity_property::ActiveModel {
-            entity_type: Set(entity_type),
-            entity_id: Set(entity_id),
-            namespace: Set(namespace.to_string()),
-            name: Set(metadata.name.clone()),
-            value: Set(Some(metadata.value.clone())),
-            ..Default::default()
+                if !assignments.insert((target, tag_id)) {
+                    report.record_skip(
+                        "tag_assignment",
+                        Some(tag.source_metadata_id),
+                        format!(
+                            "source entity {} already has the normalized tag '{}'",
+                            tag.target.source_id, tag.normalized_name
+                        ),
+                    );
+                    continue;
+                }
+                writer
+                    .write_tag_assignment(ResolvedTagAssignment {
+                        source_metadata_id: tag.source_metadata_id,
+                        target,
+                        tag_id,
+                    })
+                    .await?;
+                report.migrated_properties += 1;
+                report.migrated_tag_assignments += 1;
+                report.tag_assignments.push(TagAssignmentReport {
+                    source_metadata_id: tag.source_metadata_id,
+                    source_entity_id: tag.target.source_id,
+                    target_entity_type: entity_type.to_string(),
+                    target_entity_id: entity_id,
+                    target_tag_id: tag_id,
+                    tag_name: tag.name,
+                });
+            }
         }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("migrate metadata {}", metadata.id))?;
-        report.migrated_properties += 1;
     }
     Ok(())
+}
+
+fn resolve_metadata_target(
+    target: MigrationEntityRef,
+    file_mappings: &HashMap<i64, i64>,
+    folder_mappings: &HashMap<i64, i64>,
+) -> Option<(ResolvedEntityTarget, &'static str, i64)> {
+    match target.kind {
+        MigrationEntityKind::File => {
+            let target_id = file_mappings.get(&target.source_id).copied()?;
+            Some((ResolvedEntityTarget::File { target_id }, "file", target_id))
+        }
+        MigrationEntityKind::Folder => {
+            let target_id = folder_mappings.get(&target.source_id).copied()?;
+            Some((
+                ResolvedEntityTarget::Folder { target_id },
+                "folder",
+                target_id,
+            ))
+        }
+    }
 }
 
 pub(super) async fn migrate_direct_links(
@@ -530,195 +590,93 @@ pub(super) async fn migrate_direct_links(
     if source.direct_links.is_empty() {
         return Ok(());
     }
-    let Some(secret) = direct_link_secret else {
-        for link in &source.direct_links {
-            report.record_skip(
-                "direct_link",
-                Some(link.id),
-                if link.deleted_at.is_some() {
-                    "source direct link is deleted and must not be reactivated"
-                } else {
-                    "AD direct_link_secret was not supplied"
-                },
-            );
-        }
-        report.warnings.push(format!(
-            "{} Cloudreve direct links were not regenerated because --direct-link-secret was not supplied",
-            source.direct_links.len()
-        ));
-        return Ok(());
-    };
     let source_file_ids = source
         .direct_links
         .iter()
         .map(|link| link.file_id)
         .collect::<Vec<_>>();
     let source_files = load_source_files(source_db, &source_file_ids).await?;
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
+    let mut missing_secret_count = 0_usize;
     for link in &source.direct_links {
-        if link.deleted_at.is_some() {
+        let conversion = converter.convert(
+            CloudreveDirectLinkRecord {
+                direct_link: link.clone(),
+                target: source_files.get(&link.file_id).cloned(),
+            },
+            &conversion_context,
+        )?;
+        let direct_link = match conversion {
+            Conversion::Ready(direct_link) => direct_link,
+            Conversion::Skipped(reason) => {
+                report.record_skip("direct_link", Some(link.id), reason.message);
+                continue;
+            }
+        };
+        let Some(file_id) = file_mappings.get(&direct_link.file_source_id).copied() else {
             report.record_skip(
                 "direct_link",
-                Some(link.id),
-                "source direct link is deleted and must not be reactivated",
-            );
-            continue;
-        }
-        let Some(source_file) = source_files.get(&link.file_id) else {
-            report.record_skip(
-                "direct_link",
-                Some(link.id),
-                format!("source file {} does not exist", link.file_id),
+                Some(direct_link.source_id),
+                format!(
+                    "source file {} was not migrated",
+                    direct_link.file_source_id
+                ),
             );
             continue;
         };
-        let Some(file_id) = file_mappings.get(&link.file_id).copied() else {
+        let Some(owner_user_id) = context.users.get(&direct_link.owner_source_id).copied() else {
             report.record_skip(
                 "direct_link",
-                Some(link.id),
-                format!("source file {} was not migrated", link.file_id),
+                Some(direct_link.source_id),
+                format!(
+                    "owner user {} was not migrated",
+                    direct_link.owner_source_id
+                ),
             );
             continue;
         };
-        let Some(owner_user_id) = context.users.get(&source_file.owner_id).copied() else {
+        let Some(secret) = direct_link_secret else {
+            missing_secret_count += 1;
             report.record_skip(
                 "direct_link",
-                Some(link.id),
-                format!("owner user {} was not migrated", source_file.owner_id),
+                Some(direct_link.source_id),
+                "AD direct_link_secret was not supplied",
             );
             continue;
         };
-        let url = direct_link_url(file_id, owner_user_id, &source_file.name, secret)?;
-        aster_drive_schema::entities::entity_property::ActiveModel {
-            entity_type: Set(EntityType::File),
-            entity_id: Set(file_id),
-            namespace: Set("cloudreve.direct_links".to_string()),
-            name: Set(link.id.to_string()),
-            value: Set(Some(
-                json!({
-                    "url": url.clone(),
-                    "source_direct_link_id": link.id,
-                    "source_file_id": link.file_id,
-                    "source_name": link.name,
-                    "source_downloads": link.downloads,
-                    "source_speed_limit": link.speed,
-                })
-                .to_string(),
-            )),
-            ..Default::default()
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("archive direct link {} mapping", link.id))?;
+        let source_file_id = direct_link.file_source_id;
+        let source_name = direct_link.source_name.clone();
+        let source_downloads = direct_link.source_downloads;
+        let source_speed_limit = direct_link.source_speed_limit;
+        let source_direct_link_id = direct_link.source_id;
+        let written = writer
+            .write_direct_link(
+                ResolvedDirectLink {
+                    direct_link,
+                    target_file_id: file_id,
+                    target_owner_id: owner_user_id,
+                },
+                secret,
+            )
+            .await?;
         report.migrated_properties += 1;
         report.migrated_direct_links += 1;
         report.direct_links.push(DirectLinkReport {
-            source_direct_link_id: link.id,
-            source_file_id: link.file_id,
+            source_direct_link_id,
+            source_file_id,
             target_file_id: file_id,
-            source_name: link.name.clone(),
-            source_downloads: link.downloads,
-            source_speed_limit: link.speed,
-            url,
+            source_name,
+            source_downloads,
+            source_speed_limit,
+            url: written.url,
         });
     }
-    Ok(())
-}
-
-pub(super) async fn migrate_tasks(
-    transaction: &DatabaseTransaction,
-    source: &SourceData,
-    context: &mut MigrationContext,
-    report: &mut MigrationReport,
-) -> Result<()> {
-    let active_count = source
-        .tasks
-        .iter()
-        .filter(|task| source_task_was_active(&task.status))
-        .count();
-    if active_count > 0 {
+    if missing_secret_count > 0 {
         report.warnings.push(format!(
-            "{active_count} active Cloudreve tasks were archived as canceled terminal records and were not resumed"
+            "{missing_secret_count} Cloudreve direct links were not regenerated because --direct-link-secret was not supplied"
         ));
-    }
-
-    for task in &source.tasks {
-        let status = match archived_task_status(&task.status) {
-            "succeeded" => BackgroundTaskStatus::Succeeded,
-            "failed" => BackgroundTaskStatus::Failed,
-            _ => BackgroundTaskStatus::Canceled,
-        };
-        let duration_ms = (task.updated_at - task.created_at)
-            .num_milliseconds()
-            .max(0);
-        let task_name = format!(
-            "cloudreve-legacy-{}",
-            task.r#type
-                .replace(|character: char| !character.is_ascii_alphanumeric(), "-")
-        );
-        let result = json!({
-            "duration_ms": duration_ms,
-            "summary": format!("Archived Cloudreve {} task with source status {}", task.r#type, task.status),
-        });
-        let runtime = json!({
-            "source": "cloudreve",
-            "source_task_id": task.id,
-            "source_type": task.r#type,
-            "source_status": task.status,
-            "source_public_state": task.public_state,
-            "source_private_state": task.private_state,
-            "source_correlation_id": task.correlation_id,
-            "source_deleted_at": task.deleted_at,
-            "archived_without_resume": true,
-        });
-        let started_at =
-            (!matches!(task.status.as_str(), "queued")).then(|| target_time(task.created_at));
-        let expires_at = task
-            .updated_at
-            .checked_add_signed(chrono::Duration::days(36_500))
-            .unwrap_or(task.updated_at);
-        let target = aster_drive_schema::entities::background_task::ActiveModel {
-            kind: Set(BackgroundTaskKind::SystemRuntime),
-            status: Set(status),
-            creator_user_id: Set(task
-                .user_tasks
-                .and_then(|user_id| context.users.get(&user_id).copied())),
-            team_id: Set(None),
-            share_id: Set(None),
-            display_name: Set(format!("Cloudreve task: {}", task.r#type)),
-            payload_json: Set(StoredTaskPayload::from(
-                json!({"task_name": task_name}).to_string(),
-            )),
-            result_json: Set(Some(StoredTaskResult::from(result.to_string()))),
-            steps_json: Set(Some(StoredTaskSteps::from("[]".to_string()))),
-            progress_current: Set(i64::from(status == BackgroundTaskStatus::Succeeded)),
-            progress_total: Set(1),
-            status_text: Set(Some(format!(
-                "Archived from Cloudreve with source status {}; execution was not resumed",
-                task.status
-            ))),
-            attempt_count: Set(0),
-            max_attempts: Set(1),
-            next_run_at: Set(target_time(task.updated_at)),
-            processing_token: Set(0),
-            processing_started_at: Set(None),
-            last_heartbeat_at: Set(None),
-            lease_expires_at: Set(None),
-            started_at: Set(started_at),
-            finished_at: Set(Some(target_time(task.updated_at))),
-            last_error: Set((status == BackgroundTaskStatus::Failed)
-                .then(|| "Cloudreve task ended with status error".to_string())),
-            failure_can_retry: Set(Some(false)),
-            expires_at: Set(target_time(expires_at)),
-            created_at: Set(target_time(task.created_at)),
-            updated_at: Set(target_time(task.updated_at)),
-            runtime_json: Set(Some(StoredTaskRuntime::from(runtime.to_string()))),
-            ..Default::default()
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("archive Cloudreve task {}", task.id))?;
-        context.tasks.insert(task.id, target.id);
-        report.migrated_tasks += 1;
     }
     Ok(())
 }

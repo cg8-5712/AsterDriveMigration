@@ -361,21 +361,6 @@ Cloudreve 直链并非“完全不能迁移”，但不能原样复制。Cloudre
 
 即使使用 `--include-deleted`，已软删除的 Cloudreve direct-link 也不会重新签发，以免把已经撤销的公开入口重新激活。
 
-### `tasks` -> AD 终态历史归档
-
-Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行的历史记录。迁移使用 AD `kind=system_runtime` 的合法 payload，并把 Cloudreve 原始字段保存在 `runtime_json`；所有记录均写成终态，`lease_expires_at=NULL`，不会被 worker 领取。
-
-| Cloudreve `status` | AD `status` | 规则 |
-|---|---|---|
-| `completed` | `succeeded` | 保存为已完成历史 |
-| `error` | `failed` | `failure_can_retry=false`，不允许在 AD 重试源任务 |
-| `canceled` | `canceled` | 保存原终态 |
-| `queued` | `canceled` | 仅归档，明确不恢复执行 |
-| `processing` | `canceled` | 仅归档，明确不恢复执行 |
-| `suspending` | `canceled` | 仅归档，明确不恢复执行 |
-
-`runtime_json` 保存源 task ID、type、status、public_state、private_state、correlation_id、deleted_at 和 `archived_without_resume=true`。这保留了排查历史，但不承诺 Cloudreve payload 能被 AD UI 或执行器理解。
-
 ## 10. 不能原样迁移的 Cloudreve 表
 
 | Cloudreve 表 | 最接近的 AD 表 | 建议 | 原因 |
@@ -388,7 +373,7 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | `oauth_grants` | 无直接等价 | 跳过 | grant、scope 和 client 都是 Cloudreve 安全域数据 |
 | `passkeys` | `passkeys` | 要求重新注册 | credential JSON、user_handle、签名计数和序列化格式不同，直接复制可能导致认证失败或安全风险 |
 | `settings` | `system_config` | 只迁移白名单键 | AD 需要 value type、namespace、category、visibility、sensitive 等元数据 |
-| `tasks` | `background_tasks` | 只归档终态历史 | 不复制成可执行任务；活动任务统一归档为 canceled |
+| `tasks` | 无目标写入 | 跳过并统计 | 运行时状态不具备跨系统迁移意义 |
 
 ## 11. AD 新增但 Cloudreve 没有的数据域
 
@@ -398,7 +383,7 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 |---|---|---|
 | 登录会话 | `auth_sessions` | 不迁移，所有用户重新登录 |
 | 审计 | `audit_logs` | 可选生成一条“从 Cloudreve 迁移”审计记录，不伪造历史审计 |
-| 后台任务 | `background_tasks`、`storage_migration_checkpoints` | Cloudreve 旧任务仅写成 `system_runtime` 终态历史；不创建 checkpoint，不恢复执行 |
+| 后台任务 | `background_tasks`、`storage_migration_checkpoints` | 保持为空，由 AD 运行时按自身业务生成 |
 | 邮件 | `mail_outbox` | 不迁移 |
 | 邮箱验证 | `contact_verification_tokens`、`external_auth_email_verification_flows` | 不迁移临时 token |
 | 外部登录 | `external_auth_providers`、`external_auth_identities`、`external_auth_login_flows` | 由管理员重新配置 IdP，用户重新绑定 |
@@ -502,7 +487,7 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | Direct link | 重新签发 AD v2 URL / 跳过 / 建旧 URL 兼容层 | 提供 `--direct-link-secret` 时重新签发并存档 source ID -> URL 映射；旧 `/f/...` 失效 |
 | Cloudreve metadata | 全量存档 / 白名单迁移 | `metadata` 表全量迁移到带命名空间的 property；`files.props` 暂不迁移 |
 | Cloudreve 标签 | 从 `tag:*` 生成 AD 原生标签 / 仅按普通 property 存档 | 当前生成 `tags` 定义和 `system.tags` 关联 |
-| Cloudreve 任务 | 跳过 / 历史归档 / 尝试恢复执行 | 当前全部历史归档；活动任务归档为 canceled，绝不恢复执行 |
+| Cloudreve 任务 | 跳过 / 历史归档 / 尝试恢复执行 | 当前跳过，仅在报告中统计数量 |
 | 不兼容策略 | 中止 / 跳过策略和依赖文件 / 解密导出后再迁移 | 默认中止；显式参数可跳过 |
 | Passkey/MFA/WebDAV | 尝试转换 / 要求重新绑定 | 要求重新绑定 |
 | 系统设置 | 全量复制 / 白名单映射 / 不迁移 | 当前不迁移，建议单独制作配置键白名单 |
@@ -519,7 +504,6 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | 分享验证 | 文件分享、目录分享、密码分享、过期分享、下载次数限制 |
 | 标签验证 | 每个 `tag:*` 元数据有对应 AD tag；`system.tags` 关联指向正确 file/folder 和 scope |
 | 直链验证 | 使用与 AD 相同的 `auth.direct_link_secret` 请求新 `/d/v2...` URL；核对映射属性数量 |
-| 任务验证 | 所有导入任务均为 `succeeded/failed/canceled`，无 `pending/retry/processing`，`lease_expires_at` 为空 |
 | AD 启动后 | 重新生成媒体元数据、缩略图和搜索索引；检查 storage_used 汇总 |
 | 切换前 | 冻结 Cloudreve 写入，再跑最终迁移或增量校验，备份目标库 |
 
@@ -533,7 +517,7 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | `migrated_*` | 本次写入 AD 的各类对象数量 |
 | `skipped_by_type` | 按 `file`、`blob`、`share`、`direct_link` 等类型聚合的跳过数量 |
 | `skipped_objects` | 每条跳过记录的对象类型、Cloudreve source ID 和明确原因 |
-| `mappings` | policy、policy group、user、folder、blob、file、share、task 的排序 source ID -> target ID |
+| `mappings` | policy、policy group、user、folder、blob、file、share 的排序 source ID -> target ID |
 | `tag_assignments` | Cloudreve metadata ID、源 file/folder ID、AD entity ID、AD tag ID 和标签名 |
 | `direct_links` | Cloudreve direct-link/file ID、AD file ID、新 URL、原名称、下载次数和限速 |
 | `validation` | 是否执行/通过，以及每项检查的 expected、actual 和失败信息 |
@@ -541,7 +525,7 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | `resumed` | 本次执行是否从已有 checkpoint 恢复 |
 | `completed_stages` | 已原子提交完成的迁移阶段列表 |
 
-当前提交后校验覆盖核心表增量数量、导入任务是否全为终态且无 lease、`system.tags` 关联是否存在、`cloudreve.direct_links` 属性中的 URL 是否与报告一致。报告不会保存数据库密码、存储密钥或 Cloudreve task private state，但会包含新 direct-link URL，因此必须限制报告文件访问权限。
+当前提交后校验覆盖核心表增量数量、`system.tags` 关联是否存在、`cloudreve.direct_links` 属性中的 URL 是否与报告一致。报告不会保存数据库密码或存储密钥，但会包含新 direct-link URL，因此必须限制报告文件访问权限。
 
 ## 17. 有限断点续传语义
 
@@ -560,4 +544,4 @@ Cloudreve 任务不能恢复到 AD 执行器中，但可以保存为不可执行
 | stage 内分页 cursor | blobs 使用 `entities.id`、files 使用 `files.id` keyset cursor；其他 stage 尚未实现 |
 | 对象上传断点 | 尚未实现 |
 
-由于源指纹不能检测数量不变的内容修改，断点恢复期间仍必须冻结 Cloudreve 写入。blobs 可从最后提交的 entity ID 继续，files 可从最后提交的 file ID 继续，批大小由 `--blob-batch-size` 和 `--file-batch-size` 控制，默认均为 500；folders、metadata、shares、direct links 和 tasks 等其他 stage 仍会从 stage 起点重跑。对象字节复制/上传仍未实现，因此也没有对象存储分片上传续传。
+由于源指纹不能检测数量不变的内容修改，断点恢复期间仍必须冻结 Cloudreve 写入。blobs 可从最后提交的 entity ID 继续，files 可从最后提交的 file ID 继续，批大小由 `--blob-batch-size` 和 `--file-batch-size` 控制，默认均为 500；folders、metadata、shares 和 direct links 等其他 stage 仍会从 stage 起点重跑。对象字节复制/上传仍未实现，因此也没有对象存储分片上传续传。

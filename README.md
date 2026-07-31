@@ -15,11 +15,10 @@ Database migration tool for moving a Cloudreve v4 installation to AsterDrive (AD
 - folders, files, physical entities/blobs and version history
 - file/folder metadata, including Cloudreve v4 `tag:*` metadata as AD tags
 - public shares and regenerated AD v2 direct-link mappings
-- Cloudreve background tasks as non-executable terminal history
 
 Cloudreve password hashes are not compatible with AD. The migration assigns the supplied temporary password to every migrated user and sets `must_change_password = true`. Passkeys, WebDAV credentials, two-factor secrets, OAuth grants, sessions and filesystem events are not migrated.
 
-Cloudreve tasks are preserved only as terminal AD `system_runtime` history. Completed/error/canceled statuses are mapped to terminal AD statuses; queued/processing/suspending tasks are archived as canceled and are never resumed.
+Cloudreve tasks are runtime state rather than portable business data. The migration reports their source count and intentionally leaves AD `background_tasks` empty so AD can create its own runtime tasks.
 
 By default the tool reuses existing storage objects. For local storage, pass the directory from which Cloudreve entity paths should be resolved. Object-storage policies keep their existing bucket, endpoint, credentials and object keys. This is a zero-copy migration and is the preferred choice when AD can safely access the same storage backend.
 
@@ -40,7 +39,7 @@ cargo run -- check `
 
 The URLs can also be provided through `CLOUDREVE_DATABASE_URL` and `ASTERDRIVE_DATABASE_URL`. SQLite, MySQL and PostgreSQL URLs supported by SeaORM can be used.
 
-`check` now performs source preflight before reporting compatibility. It checks folder cycles, orphaned file/entity/metadata/share/direct-link/task relations, missing storage policies, negative sizes/counters and duplicate active-user emails. Failed checks are included in the JSON report; `migrate` runs the same checks again and refuses to write the target database until they pass.
+`check` now performs source preflight before reporting compatibility. It checks folder cycles, orphaned file/entity/metadata/share/direct-link relations, missing storage policies, negative sizes/counters and duplicate active-user emails. Failed checks are included in the JSON report; `migrate` runs the same checks again and refuses to write the target database until they pass.
 
 ## Run migration
 
@@ -89,7 +88,7 @@ The migration writes database metadata and preserves each compatible Cloudreve o
 
 ## Limited resume
 
-Migration stages run in this order: policies, policy groups, users, folders, blobs, files, metadata, shares, direct links and tasks. Most stages are committed as one transaction. Blobs use keyset pages ordered by Cloudreve `entities.id`, while files use keyset pages ordered by Cloudreve `files.id`; each page writes target records, object mappings, its cursor and report progress in one target transaction.
+Migration stages run in this order: policies, policy groups, users, folders, blobs, files, metadata, shares and direct links. Most stages are committed as one transaction. Blobs use keyset pages ordered by Cloudreve `entities.id`, while files use keyset pages ordered by Cloudreve `files.id`; each page writes target records, object mappings, its cursor and report progress in one target transaction.
 
 Use a stable run ID for an operational migration. If a stage fails, fix the external cause and rerun the same command with `--resume`:
 
@@ -111,7 +110,7 @@ Resume verifies the source URL/count fingerprint, target URL fingerprint and mig
 
 During migration the CLI writes progress to stderr: each stage emits start/completed markers, while committed blob/file pages include processed source rows, the exact stage total, batch row count and batch bytes. Progress is printed only after the corresponding target transaction commits, so it never claims an uncommitted page as complete.
 
-Folders, metadata, shares, direct links and tasks are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. Object-byte transfer remains outside the migration process.
+Folders, metadata, shares and direct links are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. Object-byte transfer remains outside the migration process.
 
 ## JSON migration report
 
@@ -119,10 +118,10 @@ Folders, metadata, shares, direct links and tasks are still stage-level only: a 
 
 - source and migrated counts for every supported object type
 - skipped counts grouped by type, plus source ID and reason for every skipped object
-- sorted source-to-target ID mappings for policies, groups, users, folders, blobs, files, shares and archived tasks
+- sorted source-to-target ID mappings for policies, groups, users, folders, blobs, files and shares
 - every Cloudreve tag metadata assignment and its AD tag/entity IDs
 - every regenerated direct-link URL and its Cloudreve/AD file IDs
-- post-commit database count checks, imported-task terminal-state checks, tag-binding checks and direct-link property checks
+- post-commit database count checks, tag-binding checks and direct-link property checks
 - final relation checks for folders, blobs, files, versions and shares; automatic `ref_count` and `storage_used` recalculation using AD's current-file-plus-history accounting rule
 - when `--verify-local-storage` is used, local AD object open/read and size checks
 - run ID, whether the execution resumed, and the list of completed stages

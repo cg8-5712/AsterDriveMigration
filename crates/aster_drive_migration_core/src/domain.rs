@@ -139,3 +139,53 @@ pub struct MigrationShare {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MigrationEntityKind {
+    File,
+    Folder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MigrationEntityRef {
+    pub kind: MigrationEntityKind,
+    pub source_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationProperty {
+    pub source_metadata_id: i64,
+    pub target: MigrationEntityRef,
+    pub namespace: String,
+    pub name: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationTagAssignment {
+    pub source_metadata_id: i64,
+    pub owner_source_id: i64,
+    pub target: MigrationEntityRef,
+    pub name: String,
+    pub normalized_name: String,
+    pub color: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationMetadata {
+    Property(MigrationProperty),
+    TagAssignment(MigrationTagAssignment),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDirectLink {
+    pub source_id: i64,
+    pub file_source_id: i64,
+    pub owner_source_id: i64,
+    pub file_name: String,
+    pub source_name: String,
+    pub source_downloads: i64,
+    pub source_speed_limit: i64,
+}

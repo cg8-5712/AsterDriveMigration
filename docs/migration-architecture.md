@@ -180,10 +180,9 @@ planned -> running -> verifying -> completed
 | 9 | `shares` | 分享和新 token |
 | 10 | `metadata_tags` | properties、Cloudreve `tag:*` 到 AD 原生标签及关联 |
 | 11 | `direct_links` | 使用 AD secret 重新签发 v2 URL，保存 source link -> URL 映射 |
-| 12 | `task_history` | 将 Cloudreve 任务写成不可领取的终态历史记录 |
-| 13 | `recalculate` | ref_count、storage_used、配额和统计重算 |
-| 14 | `verify` | 数量、关系、哈希、直链签名、任务终态和可读性校验 |
-| 15 | `finalize` | 最终报告和运行状态 |
+| 12 | `recalculate` | ref_count、storage_used、配额和统计重算 |
+| 13 | `verify` | 数量、关系、哈希、直链签名和可读性校验 |
+| 14 | `finalize` | 最终报告和运行状态 |
 
 ### Plan Builder
 
@@ -270,12 +269,11 @@ checkpoint 必须在目标记录成功提交后更新，不能先推进 cursor �
 - 各对象类型迁移数量
 - 按对象类型聚合的跳过数量
 - 每个跳过对象的 source ID 和原因
-- policy、policy group、user、folder、blob、file、share、task 的 source ID -> target ID
+- policy、policy group、user、folder、blob、file、share 的 source ID -> target ID
 - Cloudreve tag metadata -> AD tag/entity 关联
 - Cloudreve direct-link ID -> AD file ID/new URL
 - 不兼容能力和人工处理项
 - 提交后重新查询 AD 得到的数量校验
-- 导入任务终态/lease 校验
 - `system.tags` 和 `cloudreve.direct_links` property 校验
 - 错误和警告摘要
 
@@ -305,7 +303,7 @@ trait SourceAdapter {
 
 | 组件 | 职责 |
 |---|---|
-| Cloudreve DB Reader | 读取 users、groups、files、entities、file_entities、shares、metadata、direct_links、tasks 和 policies |
+| Cloudreve DB Reader | 读取 users、groups、files、entities、file_entities、shares、metadata、direct_links 和 policies，并只统计 tasks 数量 |
 | Cloudreve Storage Resolver | 解析 policy、driver、physical location 和对象是否存在 |
 | Cloudreve Model Decoder | 解码 JSON、boolset、版本关系、文件类型和软删除状态 |
 | Cloudreve -> Domain Converter | 转成 ExternalUser/Folder/File/Blob/Share，并规范化字段 |
@@ -320,7 +318,7 @@ Cloudreve 特有逻辑示例：
 - Cloudreve password、MFA、Passkey 和 share password 格式识别
 - 从 `metadata.name=tag:*` 提取标签，在用户个人 scope 内去重，并生成 AD `system.tags` 关联
 - 将 Cloudreve `/f/{hashid}/{name}` 语义转换为 AD `/d/v2...` 重新签发映射，而不是复制旧 token
-- 将 Cloudreve 任务作为终态历史归档；queued/processing/suspending 不进入 AD 可执行队列
+- 只统计 Cloudreve task 数量并写入迁移报告，不产出领域对象或目标写入
 
 ### Future Adapters
 
@@ -551,7 +549,7 @@ checkpoint 表保存在 AD 数据库中，以便迁移进程重启后恢复。�
 | `created_at` | DateTime | 创建时间 |
 | `updated_at` | DateTime | 最后更新时间 |
 
-当前阶段顺序为 policies、policy_groups、users、folders、blobs、files、metadata、shares、direct_links、tasks。除 blobs/files 外，每个阶段使用独立目标事务；目标数据和 `last_completed_stage/context_json/report_json` 在同一事务中提交。blobs 按 Cloudreve `entities.id`、files 按 Cloudreve `files.id` keyset 分页；每页独立事务提交目标记录、逐行 mapping、cursor 和报告进度。
+当前阶段顺序为 policies、policy_groups、users、folders、blobs、files、metadata、shares、direct_links。除 blobs/files 外，每个阶段使用独立目标事务；目标数据和 `last_completed_stage/context_json/report_json` 在同一事务中提交。blobs 按 Cloudreve `entities.id`、files 按 Cloudreve `files.id` keyset 分页；每页独立事务提交目标记录、逐行 mapping、cursor 和报告进度。
 
 当前 source fingerprint 使用数据库 URL 摘要和各源表记录数量，只能防止明显连错源或数量变化，不能检测“数量不变但内容变化”。生产迁移仍应冻结 Cloudreve 写入。
 
@@ -744,7 +742,7 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | 用户、策略组、目录、文件、blob、版本、分享、metadata | policy/group/user/folder 已通过独立 adapter/domain/writer crates；其余已实现基础迁移 | 继续迁移其余对象转换并分页 stage |
 | Cloudreve v4 标签 | 已从 `tag:*` metadata 生成 AD `tags` 和 `system.tags` 文件/目录关联 | 增加跨批次持久化去重和冲突报告 |
 | Direct links | 提供 AD `direct_link_secret` 时生成 v2 URL，并以 `cloudreve.direct_links` property 保存源 ID 映射 | 增加独立 JSON/CSV 报告和可选旧 URL 重定向层 |
-| Cloudreve 任务 | 已全部写成 AD `system_runtime` 终态历史；活动任务归档为 canceled | 后续可增加独立 legacy task archive 表，避免占用运维任务列表 |
+| Cloudreve 任务 | 仅统计数量并跳过，不写入 `background_tasks` | 保持为源 inventory 信息，不进入领域模型或 Writer |
 | 目标事务 | blobs/files 已按 page 提交；其他 stage 独立事务 | folders、metadata、shares 等 stage 继续分页，增加对象上传事务补偿 |
 | ID mapping | blob/file 使用独立 object mapping 表；其他映射仍在 `context_json` | 将 folders、shares 等映射也迁入独立表 |
 | 断点续传 | blobs/files 已支持 source ID cursor；其他 stage 为阶段级恢复 | folders 等 cursor、对象存储上传恢复和并行 worker checkpoint |
@@ -753,7 +751,7 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | 对象字节搬运 | 迁移器不搬运；复用兼容引用，跨根目录/bucket 由外部工具完成 | 补充外部搬运清单、校验记录与运行手册 |
 | ref_count 重算 | 最终事务按 `files + file_versions` 统一重算并回写，再复核无漂移 | 大型库的数据库端聚合优化 |
 | storage_used 重算 | 最终事务按 AD 当前文件 + 历史版本、个人/团队 scope 统一重算并回写，再复核无漂移 | 大型库的数据库端聚合优化 |
-| 验证编排 | 提交后重查核心表数量、导入任务终态、标签绑定、直链 property、folder/blob/file/version/share 关系和目录环；`--verify-local-storage` 打开并读取本地 AD 对象；有 SQLite 端到端测试 | AD HTTP 下载/分享/直链验证与远端对象存储可读性验证 |
+| 验证编排 | 提交后重查核心表数量、标签绑定、直链 property、folder/blob/file/version/share 关系和目录环；`--verify-local-storage` 打开并读取本地 AD 对象；有 SQLite 端到端测试 | AD HTTP 下载/分享/直链验证与远端对象存储可读性验证 |
 | 报告 | 已支持终端摘要和 `--report-path` JSON，包含分类跳过原因、核心 ID 映射、标签/直链记录和校验结果 | 增加失败中间态、stage 进度、吞吐量、字节数和独立 CSV 导出 |
 | TUI | 未接入新迁移核心 | 可选进度视图 |
 | 多源系统插件 | 未实现 | SourceAdapter 插件化 |
