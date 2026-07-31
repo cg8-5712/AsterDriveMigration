@@ -30,21 +30,9 @@ pub(super) async fn create_source_schema(db: &DatabaseConnection) -> Result<()> 
 }
 
 pub(super) async fn create_target_schema(db: &DatabaseConnection) -> Result<()> {
-    create_table(db, ad::managed_followers::Entity).await?;
-    create_table(db, ad::storage_policy_groups::Entity).await?;
-    create_table(db, ad::storage_policies::Entity).await?;
-    create_table(db, ad::storage_policy_group_items::Entity).await?;
-    create_table(db, ad::users::Entity).await?;
-    create_table(db, ad::user_profiles::Entity).await?;
-    create_table(db, ad::folders::Entity).await?;
-    create_table(db, ad::file_blobs::Entity).await?;
-    create_table(db, ad::files::Entity).await?;
-    create_table(db, ad::file_versions::Entity).await?;
-    create_table(db, ad::entity_properties::Entity).await?;
-    create_table(db, ad::shares::Entity).await?;
-    create_table(db, ad::teams::Entity).await?;
-    create_table(db, ad::tags::Entity).await?;
-    create_table(db, ad::background_tasks::Entity).await?;
+    aster_drive_schema_migration::Migrator::up(db, None)
+        .await
+        .wrap_err("apply upstream AsterDrive schema migrations for test target")?;
     Ok(())
 }
 

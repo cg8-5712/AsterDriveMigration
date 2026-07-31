@@ -1,4 +1,5 @@
 use super::super::*;
+use aster_drive_model::types::DriverType;
 
 #[test]
 fn classifies_common_file_types() {
@@ -12,9 +13,9 @@ fn classifies_common_file_types() {
 
 #[test]
 fn maps_supported_storage_drivers_conservatively() {
-    assert_eq!(map_driver_type("local"), Some("local"));
-    assert_eq!(map_driver_type("oss"), Some("s3"));
-    assert_eq!(map_driver_type("cos"), Some("tencent_cos"));
+    assert_eq!(map_driver_type("local"), Some(DriverType::Local));
+    assert_eq!(map_driver_type("oss"), Some(DriverType::S3));
+    assert_eq!(map_driver_type("cos"), Some(DriverType::TencentCos));
     assert_eq!(map_driver_type("onedrive"), None);
     assert_eq!(map_driver_type("qiniu"), None);
 }

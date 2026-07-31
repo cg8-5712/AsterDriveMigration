@@ -17,8 +17,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use asterdrive_entities as ad;
+use aster_drive_model::entities as ad;
+use aster_drive_model::types::{
+    AvatarSource, BackgroundTaskKind, BackgroundTaskStatus, DriverType, EntityType,
+    StoredStoragePolicyAllowedTypes, StoredStoragePolicyOptions, StoredTaskPayload,
+    StoredTaskResult, StoredTaskRuntime, StoredTaskSteps, StoredUserConfig, TagScopeType, UserRole,
+    UserStatus,
+};
+use aster_drive_schema_migration::{MigrationTrack, inspect_migration_history};
 use cloudreve_entities as cr;
+
+fn target_time(value: chrono::DateTime<chrono::FixedOffset>) -> chrono::DateTime<chrono::Utc> {
+    value.with_timezone(&chrono::Utc)
+}
+
+fn target_optional_time(
+    value: Option<chrono::DateTime<chrono::FixedOffset>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    value.map(target_time)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum StorageMode {
@@ -2030,27 +2047,41 @@ async fn connect(url: &str, label: &str) -> Result<DatabaseConnection> {
 }
 
 async fn validate_target_schema(db: &DatabaseConnection) -> Result<()> {
-    ad::users::Entity::find()
+    let history = inspect_migration_history(db)
+        .await
+        .wrap_err("inspect AsterDrive database migration history")?;
+    if history.track != MigrationTrack::Current || !history.effective_pending().is_empty() {
+        let pending = history.effective_pending();
+        let status = if history.track == MigrationTrack::Unknown {
+            "contains an unknown or incompatible migration history".to_string()
+        } else {
+            format!("is missing current migrations: {}", pending.join(", "))
+        };
+        bail!(
+            "AsterDrive target database {status}; apply the migrations from the matching aster_drive_migration dependency before importing data"
+        );
+    }
+    ad::user::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive schema is unavailable; run AD database migrations first")?;
-    ad::storage_policies::Entity::find()
+    ad::storage_policy::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive storage_policies table is unavailable")?;
-    ad::files::Entity::find()
+    ad::file::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive files table is unavailable")?;
-    ad::entity_properties::Entity::find()
+    ad::entity_property::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive entity_properties table is unavailable")?;
-    ad::tags::Entity::find()
+    ad::tag::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive tags table is unavailable")?;
-    ad::background_tasks::Entity::find()
+    ad::background_task::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive background_tasks table is unavailable")?;
@@ -2064,36 +2095,33 @@ async fn ensure_target_safe(db: &DatabaseConnection, allow_non_empty: bool) -> R
     let counts = [
         (
             "storage_policies",
-            ad::storage_policies::Entity::find().count(db).await?,
+            ad::storage_policy::Entity::find().count(db).await?,
         ),
         (
             "storage_policy_groups",
-            ad::storage_policy_groups::Entity::find().count(db).await?,
+            ad::storage_policy_group::Entity::find().count(db).await?,
         ),
-        ("users", ad::users::Entity::find().count(db).await?),
+        ("users", ad::user::Entity::find().count(db).await?),
         (
             "user_profiles",
-            ad::user_profiles::Entity::find().count(db).await?,
+            ad::user_profile::Entity::find().count(db).await?,
         ),
-        ("folders", ad::folders::Entity::find().count(db).await?),
-        ("files", ad::files::Entity::find().count(db).await?),
-        (
-            "file_blobs",
-            ad::file_blobs::Entity::find().count(db).await?,
-        ),
+        ("folders", ad::folder::Entity::find().count(db).await?),
+        ("files", ad::file::Entity::find().count(db).await?),
+        ("file_blobs", ad::file_blob::Entity::find().count(db).await?),
         (
             "file_versions",
-            ad::file_versions::Entity::find().count(db).await?,
+            ad::file_version::Entity::find().count(db).await?,
         ),
-        ("shares", ad::shares::Entity::find().count(db).await?),
+        ("shares", ad::share::Entity::find().count(db).await?),
         (
             "entity_properties",
-            ad::entity_properties::Entity::find().count(db).await?,
+            ad::entity_property::Entity::find().count(db).await?,
         ),
-        ("tags", ad::tags::Entity::find().count(db).await?),
+        ("tags", ad::tag::Entity::find().count(db).await?),
         (
             "background_tasks",
-            ad::background_tasks::Entity::find().count(db).await?,
+            ad::background_task::Entity::find().count(db).await?,
         ),
     ];
     let occupied: Vec<String> = counts
@@ -2129,18 +2157,18 @@ struct TargetCounts {
 impl TargetCounts {
     async fn load(db: &DatabaseConnection) -> Result<Self> {
         Ok(Self {
-            policies: ad::storage_policies::Entity::find().count(db).await?,
-            policy_groups: ad::storage_policy_groups::Entity::find().count(db).await?,
-            users: ad::users::Entity::find().count(db).await?,
-            user_profiles: ad::user_profiles::Entity::find().count(db).await?,
-            folders: ad::folders::Entity::find().count(db).await?,
-            blobs: ad::file_blobs::Entity::find().count(db).await?,
-            files: ad::files::Entity::find().count(db).await?,
-            versions: ad::file_versions::Entity::find().count(db).await?,
-            shares: ad::shares::Entity::find().count(db).await?,
-            properties: ad::entity_properties::Entity::find().count(db).await?,
-            tags: ad::tags::Entity::find().count(db).await?,
-            tasks: ad::background_tasks::Entity::find().count(db).await?,
+            policies: ad::storage_policy::Entity::find().count(db).await?,
+            policy_groups: ad::storage_policy_group::Entity::find().count(db).await?,
+            users: ad::user::Entity::find().count(db).await?,
+            user_profiles: ad::user_profile::Entity::find().count(db).await?,
+            folders: ad::folder::Entity::find().count(db).await?,
+            blobs: ad::file_blob::Entity::find().count(db).await?,
+            files: ad::file::Entity::find().count(db).await?,
+            versions: ad::file_version::Entity::find().count(db).await?,
+            shares: ad::share::Entity::find().count(db).await?,
+            properties: ad::entity_property::Entity::find().count(db).await?,
+            tags: ad::tag::Entity::find().count(db).await?,
+            tasks: ad::background_task::Entity::find().count(db).await?,
         })
     }
 }
@@ -2165,7 +2193,7 @@ fn add_storage_usage(
     Ok(())
 }
 
-fn file_storage_owner(file: &ad::files::Model) -> Option<StorageOwner> {
+fn file_storage_owner(file: &ad::file::Model) -> Option<StorageOwner> {
     file.team_id
         .map(StorageOwner::Team)
         .or_else(|| file.owner_user_id.map(StorageOwner::User))
@@ -2173,13 +2201,13 @@ fn file_storage_owner(file: &ad::files::Model) -> Option<StorageOwner> {
 
 async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()> {
     let mut file_owners = HashMap::new();
-    let mut ref_counts = HashMap::<i64, i64>::new();
+    let mut ref_counts = HashMap::<i64, i32>::new();
     let mut usage = HashMap::<StorageOwner, i64>::new();
     let mut last_file_id = 0;
     loop {
-        let files = ad::files::Entity::find()
-            .filter(ad::files::Column::Id.gt(last_file_id))
-            .order_by_asc(ad::files::Column::Id)
+        let files = ad::file::Entity::find()
+            .filter(ad::file::Column::Id.gt(last_file_id))
+            .order_by_asc(ad::file::Column::Id)
             .limit(INTEGRITY_BATCH_SIZE)
             .all(transaction)
             .await?;
@@ -2190,15 +2218,18 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
                 add_storage_usage(&mut usage, owner, file.size)?;
                 file_owners.insert(file.id, owner);
             }
-            *ref_counts.entry(file.blob_id).or_insert(0) += 1;
+            let count = ref_counts.entry(file.blob_id).or_insert(0);
+            *count = (*count)
+                .checked_add(1)
+                .ok_or_else(|| color_eyre::eyre::eyre!("blob reference count exceeds i32"))?;
         }
     }
 
     let mut last_version_id = 0;
     loop {
-        let versions = ad::file_versions::Entity::find()
-            .filter(ad::file_versions::Column::Id.gt(last_version_id))
-            .order_by_asc(ad::file_versions::Column::Id)
+        let versions = ad::file_version::Entity::find()
+            .filter(ad::file_version::Column::Id.gt(last_version_id))
+            .order_by_asc(ad::file_version::Column::Id)
             .limit(INTEGRITY_BATCH_SIZE)
             .all(transaction)
             .await?;
@@ -2210,16 +2241,19 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
             if let Some(owner) = file_owners.get(&version.file_id).copied() {
                 add_storage_usage(&mut usage, owner, version.size)?;
             }
-            *ref_counts.entry(version.blob_id).or_insert(0) += 1;
+            let count = ref_counts.entry(version.blob_id).or_insert(0);
+            *count = (*count)
+                .checked_add(1)
+                .ok_or_else(|| color_eyre::eyre::eyre!("blob reference count exceeds i32"))?;
         }
     }
 
-    let now = chrono::Utc::now().fixed_offset();
+    let now = chrono::Utc::now();
     let mut last_blob_id = 0;
     loop {
-        let blobs = ad::file_blobs::Entity::find()
-            .filter(ad::file_blobs::Column::Id.gt(last_blob_id))
-            .order_by_asc(ad::file_blobs::Column::Id)
+        let blobs = ad::file_blob::Entity::find()
+            .filter(ad::file_blob::Column::Id.gt(last_blob_id))
+            .order_by_asc(ad::file_blob::Column::Id)
             .limit(INTEGRITY_BATCH_SIZE)
             .all(transaction)
             .await?;
@@ -2235,7 +2269,7 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
             }
         }
     }
-    for user in ad::users::Entity::find().all(transaction).await? {
+    for user in ad::user::Entity::find().all(transaction).await? {
         let actual = usage
             .get(&StorageOwner::User(user.id))
             .copied()
@@ -2247,7 +2281,7 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
             active.update(transaction).await?;
         }
     }
-    for team in ad::teams::Entity::find().all(transaction).await? {
+    for team in ad::team::Entity::find().all(transaction).await? {
         let actual = usage
             .get(&StorageOwner::Team(team.id))
             .copied()
@@ -2611,8 +2645,8 @@ async fn validate_migration_result(
     let mut imported_tasks = Vec::new();
     for chunk in task_ids.chunks(500) {
         imported_tasks.extend(
-            ad::background_tasks::Entity::find()
-                .filter(ad::background_tasks::Column::Id.is_in(chunk.iter().copied()))
+            ad::background_task::Entity::find()
+                .filter(ad::background_task::Column::Id.is_in(chunk.iter().copied()))
                 .all(db)
                 .await?,
         );
@@ -2637,8 +2671,8 @@ async fn validate_migration_result(
         "imported tasks must be terminal and have no active lease",
     ));
 
-    let tag_properties = ad::entity_properties::Entity::find()
-        .filter(ad::entity_properties::Column::Namespace.eq("system.tags"))
+    let tag_properties = ad::entity_property::Entity::find()
+        .filter(ad::entity_property::Column::Namespace.eq("system.tags"))
         .all(db)
         .await?;
     let tag_binding_keys = tag_properties
@@ -2649,11 +2683,13 @@ async fn validate_migration_result(
         .tag_assignments
         .iter()
         .filter(|assignment| {
-            tag_binding_keys.contains(&(
-                assignment.target_entity_type.clone(),
-                assignment.target_entity_id,
-                assignment.target_tag_id.to_string(),
-            ))
+            tag_binding_keys
+                .iter()
+                .any(|(entity_type, entity_id, name)| {
+                    entity_type.as_str() == assignment.target_entity_type
+                        && *entity_id == assignment.target_entity_id
+                        && *name == assignment.target_tag_id.to_string()
+                })
         })
         .count();
     checks.push(invariant_check(
@@ -2663,8 +2699,8 @@ async fn validate_migration_result(
         "one or more system.tags bindings are missing",
     ));
 
-    let direct_link_properties = ad::entity_properties::Entity::find()
-        .filter(ad::entity_properties::Column::Namespace.eq("cloudreve.direct_links"))
+    let direct_link_properties = ad::entity_property::Entity::find()
+        .filter(ad::entity_property::Column::Namespace.eq("cloudreve.direct_links"))
         .all(db)
         .await?;
     let direct_link_values = direct_link_properties
@@ -2702,25 +2738,25 @@ async fn validate_target_integrity(
     db: &DatabaseConnection,
     options: &MigrationOptions,
 ) -> Result<Vec<ValidationCheck>> {
-    let users = ad::users::Entity::find().all(db).await?;
+    let users = ad::user::Entity::find().all(db).await?;
     let user_ids = users.iter().map(|user| user.id).collect::<HashSet<_>>();
-    let teams = ad::teams::Entity::find().all(db).await?;
+    let teams = ad::team::Entity::find().all(db).await?;
     let team_ids = teams.iter().map(|team| team.id).collect::<HashSet<_>>();
-    let policies = ad::storage_policies::Entity::find().all(db).await?;
+    let policies = ad::storage_policy::Entity::find().all(db).await?;
     let policies_by_id = policies
         .iter()
         .map(|policy| (policy.id, policy))
         .collect::<HashMap<_, _>>();
     let policy_ids = policies_by_id.keys().copied().collect::<HashSet<_>>();
-    let blobs = ad::file_blobs::Entity::find().all(db).await?;
+    let blobs = ad::file_blob::Entity::find().all(db).await?;
     let blob_ids = blobs.iter().map(|blob| blob.id).collect::<HashSet<_>>();
-    let folders = ad::folders::Entity::find().all(db).await?;
+    let folders = ad::folder::Entity::find().all(db).await?;
     let folders_by_id = folders
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
     let folder_ids = folders_by_id.keys().copied().collect::<HashSet<_>>();
-    let files = ad::files::Entity::find().all(db).await?;
+    let files = ad::file::Entity::find().all(db).await?;
     let file_ids = files.iter().map(|file| file.id).collect::<HashSet<_>>();
 
     let invalid_folders = folders
@@ -2786,7 +2822,7 @@ async fn validate_target_integrity(
         "files contain an orphan relation or invalid personal/team scope",
     ));
 
-    let versions = ad::file_versions::Entity::find().all(db).await?;
+    let versions = ad::file_version::Entity::find().all(db).await?;
     let invalid_versions = versions
         .iter()
         .filter(|version| {
@@ -2800,7 +2836,7 @@ async fn validate_target_integrity(
         "file_versions contain an orphan file or blob",
     ));
 
-    let shares = ad::shares::Entity::find().all(db).await?;
+    let shares = ad::share::Entity::find().all(db).await?;
     let invalid_shares = shares
         .iter()
         .filter(|share| {
@@ -2866,21 +2902,27 @@ async fn validate_target_integrity(
 }
 
 fn expected_statistics(
-    files: &[ad::files::Model],
-    versions: &[ad::file_versions::Model],
-) -> Result<(HashMap<i64, i64>, HashMap<StorageOwner, i64>)> {
-    let mut refs = HashMap::new();
+    files: &[ad::file::Model],
+    versions: &[ad::file_version::Model],
+) -> Result<(HashMap<i64, i32>, HashMap<StorageOwner, i64>)> {
+    let mut refs = HashMap::<i64, i32>::new();
     let mut usage = HashMap::new();
     let mut owners = HashMap::new();
     for file in files {
-        *refs.entry(file.blob_id).or_insert(0) += 1;
+        let count = refs.entry(file.blob_id).or_insert(0);
+        *count = (*count)
+            .checked_add(1)
+            .ok_or_else(|| color_eyre::eyre::eyre!("blob reference count exceeds i32"))?;
         if let Some(owner) = file_storage_owner(file) {
             add_storage_usage(&mut usage, owner, file.size)?;
             owners.insert(file.id, owner);
         }
     }
     for version in versions {
-        *refs.entry(version.blob_id).or_insert(0) += 1;
+        let count = refs.entry(version.blob_id).or_insert(0);
+        *count = (*count)
+            .checked_add(1)
+            .ok_or_else(|| color_eyre::eyre::eyre!("blob reference count exceeds i32"))?;
         if let Some(owner) = owners.get(&version.file_id).copied() {
             add_storage_usage(&mut usage, owner, version.size)?;
         }
@@ -2888,7 +2930,7 @@ fn expected_statistics(
     Ok((refs, usage))
 }
 
-fn folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &ad::folders::Model>) -> bool {
+fn folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &ad::folder::Model>) -> bool {
     let mut visited = HashSet::new();
     let mut current = Some(folder_id);
     while let Some(id) = current {
@@ -2901,8 +2943,8 @@ fn folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &ad::folders::Model>)
 }
 
 fn verify_local_runtime_readability(
-    blobs: &[ad::file_blobs::Model],
-    policies: &HashMap<i64, &ad::storage_policies::Model>,
+    blobs: &[ad::file_blob::Model],
+    policies: &HashMap<i64, &ad::storage_policy::Model>,
     options: &MigrationOptions,
 ) -> ValidationCheck {
     let mut checked = 0usize;
@@ -2912,7 +2954,7 @@ fn verify_local_runtime_readability(
         let Some(policy) = policies.get(&blob.policy_id) else {
             continue;
         };
-        if policy.driver_type != "local" {
+        if policy.driver_type != DriverType::Local {
             continue;
         }
         checked += 1;
@@ -3141,11 +3183,11 @@ where
     }
 }
 
-fn map_driver_type(source: &str) -> Option<&'static str> {
+fn map_driver_type(source: &str) -> Option<DriverType> {
     match source {
-        "local" => Some("local"),
-        "s3" | "oss" | "ks3" | "obs" => Some("s3"),
-        "cos" => Some("tencent_cos"),
+        "local" => Some(DriverType::Local),
+        "s3" | "oss" | "ks3" | "obs" => Some(DriverType::S3),
+        "cos" => Some(DriverType::TencentCos),
         _ => None,
     }
 }
@@ -3168,7 +3210,7 @@ fn source_settings(value: &Option<Value>) -> Value {
     value.clone().unwrap_or_else(|| json!({}))
 }
 
-fn policy_options(policy: &cr::storage_policies::Model) -> String {
+fn policy_options(policy: &cr::storage_policies::Model) -> StoredStoragePolicyOptions {
     let settings = source_settings(&policy.settings);
     let path_style = settings
         .get("s3_path_style")
@@ -3182,14 +3224,16 @@ fn policy_options(policy: &cr::storage_policies::Model) -> String {
         "cloudreve_policy_type": policy.r#type,
     })
     .to_string()
+    .into()
 }
 
-fn allowed_types(policy: &cr::storage_policies::Model) -> String {
+fn allowed_types(policy: &cr::storage_policies::Model) -> StoredStoragePolicyAllowedTypes {
     source_settings(&policy.settings)
         .get("file_type")
         .cloned()
         .unwrap_or_else(|| json!([]))
         .to_string()
+        .into()
 }
 
 fn chunk_size(policy: &cr::storage_policies::Model) -> i64 {

@@ -4,7 +4,7 @@
 
 - Cloudreve v4：[`cloudreve/cloudreve`](https://github.com/cloudreve/cloudreve) ，Ent 实际表定义位于 `ent/migrate/schema.go`
 - AsterDrive：[`AsterCommunity/AsterDrive`](https://github.com/AsterCommunity/AsterDrive)，SeaORM Entity 位于 `src/entities/`
-- 迁移工具：当前仓库 `crates/cloudreve-entities` 和 `crates/asterdrive-entities`
+- 迁移工具：当前仓库 `crates/cloudreve-entities`，以及 AsterDrive Git 仓库提供的 `aster_drive_model` 和 `aster_drive_migration`
 
 本文档的目标不是假设所有数据都应原样复制，而是明确：
 

@@ -29,9 +29,9 @@ pub(super) async fn migrate_policies(
         } else {
             String::new()
         };
-        let model = ad::storage_policies::ActiveModel {
+        let model = ad::storage_policy::ActiveModel {
             name: Set(policy.name.clone()),
-            driver_type: Set(driver_type.to_string()),
+            driver_type: Set(driver_type),
             endpoint: Set(policy.server.clone().unwrap_or_default()),
             bucket: Set(policy.bucket_name.clone().unwrap_or_default()),
             access_key: Set(policy.access_key.clone().unwrap_or_default()),
@@ -43,8 +43,8 @@ pub(super) async fn migrate_policies(
             options: Set(policy_options(policy)),
             is_default: Set(!default_assigned),
             chunk_size: Set(chunk_size(policy)),
-            created_at: Set(policy.created_at),
-            updated_at: Set(policy.updated_at),
+            created_at: Set(target_time(policy.created_at)),
+            updated_at: Set(target_time(policy.updated_at)),
             remote_storage_target_key: Set(None),
             ..Default::default()
         }
@@ -65,13 +65,13 @@ pub(super) async fn migrate_policy_groups(
     report: &mut MigrationReport,
 ) -> Result<()> {
     for group in &source.groups {
-        let target_group = ad::storage_policy_groups::ActiveModel {
+        let target_group = ad::storage_policy_group::ActiveModel {
             name: Set(group.name.clone()),
             description: Set(format!("Migrated from Cloudreve group {}", group.id)),
             is_enabled: Set(true),
             is_default: Set(false),
-            created_at: Set(group.created_at),
-            updated_at: Set(group.updated_at),
+            created_at: Set(target_time(group.created_at)),
+            updated_at: Set(target_time(group.updated_at)),
             ..Default::default()
         }
         .insert(transaction)
@@ -83,13 +83,13 @@ pub(super) async fn migrate_policy_groups(
         if let Some(source_policy_id) = group.storage_policy_id
             && let Some(target_policy_id) = context.policies.get(&source_policy_id)
         {
-            ad::storage_policy_group_items::ActiveModel {
+            ad::storage_policy_group_item::ActiveModel {
                 group_id: Set(target_group.id),
                 policy_id: Set(*target_policy_id),
                 priority: Set(0),
                 min_file_size: Set(0),
                 max_file_size: Set(0),
-                created_at: Set(group.created_at),
+                created_at: Set(target_time(group.created_at)),
                 ..Default::default()
             }
             .insert(transaction)
@@ -126,21 +126,32 @@ pub(super) async fn migrate_users(
         } else {
             "disabled"
         };
-        let target = ad::users::ActiveModel {
+        let target = ad::user::ActiveModel {
             username: Set(username.clone()),
             email: Set(user.email.clone()),
             password_hash: Set(password_hash.to_string()),
-            role: Set(role.to_string()),
-            status: Set(status.to_string()),
+            role: Set(if role == "admin" {
+                UserRole::Admin
+            } else {
+                UserRole::User
+            }),
+            status: Set(if status == "active" {
+                UserStatus::Active
+            } else {
+                UserStatus::Disabled
+            }),
             session_version: Set(1),
-            email_verified_at: Set((status == "active").then_some(user.created_at)),
+            email_verified_at: Set((status == "active").then(|| target_time(user.created_at))),
             pending_email: Set(None),
             storage_used: Set(user.storage),
             storage_quota: Set(group.and_then(|group| group.max_storage).unwrap_or(0)),
             policy_group_id: Set(context.policy_groups.get(&user.group_users).copied()),
-            created_at: Set(user.created_at),
-            updated_at: Set(user.updated_at),
-            config: Set(user.settings.as_ref().map(Value::to_string)),
+            created_at: Set(target_time(user.created_at)),
+            updated_at: Set(target_time(user.updated_at)),
+            config: Set(user
+                .settings
+                .as_ref()
+                .map(|settings| StoredUserConfig::from(settings.to_string()))),
             must_change_password: Set(true),
             ..Default::default()
         }
@@ -156,15 +167,19 @@ pub(super) async fn migrate_users(
         } else {
             "upload"
         };
-        ad::user_profiles::ActiveModel {
+        ad::user_profile::ActiveModel {
             user_id: Set(target.id),
             display_name: Set(Some(user.nick.clone())),
             wopi_user_info: Set(None),
-            avatar_source: Set(avatar_source.to_string()),
+            avatar_source: Set(match avatar_source {
+                "none" => AvatarSource::None,
+                "gravatar" => AvatarSource::Gravatar,
+                _ => AvatarSource::Upload,
+            }),
             avatar_key: Set((!avatar.is_empty()).then_some(avatar)),
             avatar_version: Set(0),
-            created_at: Set(user.created_at),
-            updated_at: Set(user.updated_at),
+            created_at: Set(target_time(user.created_at)),
+            updated_at: Set(target_time(user.updated_at)),
         }
         .insert(transaction)
         .await
@@ -213,7 +228,7 @@ pub(super) async fn migrate_folders(
                 );
                 continue;
             };
-            let target = ad::folders::ActiveModel {
+            let target = ad::folder::ActiveModel {
                 name: Set(folder.name.clone()),
                 parent_id: Set(parent.and_then(|id| context.folders.get(&id).copied())),
                 team_id: Set(None),
@@ -227,8 +242,8 @@ pub(super) async fn migrate_folders(
                 policy_id: Set(folder
                     .storage_policy_files
                     .and_then(|id| context.policies.get(&id).copied())),
-                created_at: Set(folder.created_at),
-                updated_at: Set(folder.updated_at),
+                created_at: Set(target_time(folder.created_at)),
+                updated_at: Set(target_time(folder.updated_at)),
                 deleted_at: Set(None),
                 is_locked: Set(false),
                 ..Default::default()
@@ -274,14 +289,15 @@ pub(super) async fn migrate_blob_batch(
             );
             continue;
         };
-        let reference_count = reference_counts.get(&entity.id).copied().unwrap_or(1);
+        let reference_count = i32::try_from(reference_counts.get(&entity.id).copied().unwrap_or(1))
+            .wrap_err("blob reference count exceeds i32")?;
         let copied_local_object = copied_local_objects.get(&entity.id);
         let thumbnail_path = if copied_local_object.is_some() {
             None
         } else {
             thumbnail_paths.get(&entity.id).cloned()
         };
-        let target = ad::file_blobs::ActiveModel {
+        let target = ad::file_blob::ActiveModel {
             hash: Set(copied_local_object
                 .map(|object| object.sha256.clone())
                 .unwrap_or_else(|| opaque_blob_key(entity.id))),
@@ -294,8 +310,8 @@ pub(super) async fn migrate_blob_batch(
             thumbnail_processor: Set(None),
             thumbnail_version: Set(None),
             ref_count: Set(reference_count),
-            created_at: Set(entity.created_at),
-            updated_at: Set(entity.updated_at),
+            created_at: Set(target_time(entity.created_at)),
+            updated_at: Set(target_time(entity.updated_at)),
             ..Default::default()
         }
         .insert(transaction)
@@ -359,7 +375,7 @@ pub(super) async fn migrate_file_batch(
         };
         let blob_id = blob_mappings[&primary_entity_id];
         let (mime_type, compound_extension, extension, category) = file_classification(&file.name);
-        let target = ad::files::ActiveModel {
+        let target = ad::file::ActiveModel {
             name: Set(file.name.clone()),
             folder_id: Set(file
                 .file_children
@@ -375,13 +391,14 @@ pub(super) async fn migrate_file_batch(
                 .cloned()
                 .unwrap_or_default()),
             mime_type: Set(mime_type),
-            created_at: Set(file.created_at),
-            updated_at: Set(file.updated_at),
+            created_at: Set(target_time(file.created_at)),
+            updated_at: Set(target_time(file.updated_at)),
             deleted_at: Set(None),
             is_locked: Set(false),
             extension: Set(extension),
             compound_extension: Set(compound_extension),
-            file_category: Set(category),
+            file_category: Set(serde_json::from_value(Value::String(category))
+                .wrap_err("decode AsterDrive file category")?),
             ..Default::default()
         }
         .insert(transaction)
@@ -395,12 +412,12 @@ pub(super) async fn migrate_file_batch(
             .filter(|entity| entity.id != primary_entity_id)
             .collect();
         for (index, entity) in historical.into_iter().enumerate() {
-            ad::file_versions::ActiveModel {
+            ad::file_version::ActiveModel {
                 file_id: Set(target.id),
                 blob_id: Set(blob_mappings[&entity.id]),
-                version: Set((index + 1) as i64),
+                version: Set(i32::try_from(index + 1).wrap_err("file version exceeds i32")?),
                 size: Set(entity.size),
-                created_at: Set(entity.created_at),
+                created_at: Set(target_time(entity.created_at)),
                 ..Default::default()
             }
             .insert(transaction)
@@ -440,13 +457,13 @@ pub(super) async fn migrate_metadata(
             file_mappings
                 .get(&metadata.file_id)
                 .copied()
-                .map(|id| ("file", id))
+                .map(|id| (EntityType::File, id))
         } else {
             context
                 .folders
                 .get(&metadata.file_id)
                 .copied()
-                .map(|id| ("folder", id))
+                .map(|id| (EntityType::Folder, id))
         };
         let Some((entity_type, entity_id)) = target_entity else {
             report.record_skip(
@@ -479,16 +496,16 @@ pub(super) async fn migrate_metadata(
             let tag_id = match tags.get(&(owner_user_id, normalized_name.clone())) {
                 Some(tag_id) => *tag_id,
                 None => {
-                    let tag = ad::tags::ActiveModel {
-                        scope_type: Set("personal".to_string()),
+                    let tag = ad::tag::ActiveModel {
+                        scope_type: Set(TagScopeType::Personal),
                         owner_user_id: Set(Some(owner_user_id)),
                         team_id: Set(None),
                         name: Set(name),
                         normalized_name: Set(normalized_name.clone()),
                         color: Set(target_tag_color(&metadata.value)),
                         sort_order: Set(0),
-                        created_at: Set(metadata.created_at),
-                        updated_at: Set(metadata.updated_at),
+                        created_at: Set(target_time(metadata.created_at)),
+                        updated_at: Set(target_time(metadata.updated_at)),
                         ..Default::default()
                     }
                     .insert(transaction)
@@ -499,8 +516,8 @@ pub(super) async fn migrate_metadata(
                     tag.id
                 }
             };
-            ad::entity_properties::ActiveModel {
-                entity_type: Set(entity_type.to_string()),
+            ad::entity_property::ActiveModel {
+                entity_type: Set(entity_type),
                 entity_id: Set(entity_id),
                 namespace: Set("system.tags".to_string()),
                 name: Set(tag_id.to_string()),
@@ -515,7 +532,7 @@ pub(super) async fn migrate_metadata(
             report.tag_assignments.push(TagAssignmentReport {
                 source_metadata_id: metadata.id,
                 source_entity_id: metadata.file_id,
-                target_entity_type: entity_type.to_string(),
+                target_entity_type: entity_type.as_str().to_string(),
                 target_entity_id: entity_id,
                 target_tag_id: tag_id,
                 tag_name: source_tag_name.to_string(),
@@ -528,8 +545,8 @@ pub(super) async fn migrate_metadata(
         } else {
             "cloudreve.private"
         };
-        ad::entity_properties::ActiveModel {
-            entity_type: Set(entity_type.to_string()),
+        ad::entity_property::ActiveModel {
+            entity_type: Set(entity_type),
             entity_id: Set(entity_id),
             namespace: Set(namespace.to_string()),
             name: Set(metadata.name.clone()),
@@ -614,8 +631,8 @@ pub(super) async fn migrate_direct_links(
             continue;
         };
         let url = direct_link_url(file_id, owner_user_id, &source_file.name, secret)?;
-        ad::entity_properties::ActiveModel {
-            entity_type: Set("file".to_string()),
+        ad::entity_property::ActiveModel {
+            entity_type: Set(EntityType::File),
             entity_id: Set(file_id),
             namespace: Set("cloudreve.direct_links".to_string()),
             name: Set(link.id.to_string()),
@@ -668,7 +685,11 @@ pub(super) async fn migrate_tasks(
     }
 
     for task in &source.tasks {
-        let status = archived_task_status(&task.status);
+        let status = match archived_task_status(&task.status) {
+            "succeeded" => BackgroundTaskStatus::Succeeded,
+            "failed" => BackgroundTaskStatus::Failed,
+            _ => BackgroundTaskStatus::Canceled,
+        };
         let duration_ms = (task.updated_at - task.created_at)
             .num_milliseconds()
             .max(0);
@@ -692,24 +713,27 @@ pub(super) async fn migrate_tasks(
             "source_deleted_at": task.deleted_at,
             "archived_without_resume": true,
         });
-        let started_at = (!matches!(task.status.as_str(), "queued")).then_some(task.created_at);
+        let started_at =
+            (!matches!(task.status.as_str(), "queued")).then(|| target_time(task.created_at));
         let expires_at = task
             .updated_at
             .checked_add_signed(chrono::Duration::days(36_500))
             .unwrap_or(task.updated_at);
-        let target = ad::background_tasks::ActiveModel {
-            kind: Set("system_runtime".to_string()),
-            status: Set(status.to_string()),
+        let target = ad::background_task::ActiveModel {
+            kind: Set(BackgroundTaskKind::SystemRuntime),
+            status: Set(status),
             creator_user_id: Set(task
                 .user_tasks
                 .and_then(|user_id| context.users.get(&user_id).copied())),
             team_id: Set(None),
             share_id: Set(None),
             display_name: Set(format!("Cloudreve task: {}", task.r#type)),
-            payload_json: Set(json!({"task_name": task_name}).to_string()),
-            result_json: Set(Some(result.to_string())),
-            steps_json: Set(Some("[]".to_string())),
-            progress_current: Set(i64::from(status == "succeeded")),
+            payload_json: Set(StoredTaskPayload::from(
+                json!({"task_name": task_name}).to_string(),
+            )),
+            result_json: Set(Some(StoredTaskResult::from(result.to_string()))),
+            steps_json: Set(Some(StoredTaskSteps::from("[]".to_string()))),
+            progress_current: Set(i64::from(status == BackgroundTaskStatus::Succeeded)),
             progress_total: Set(1),
             status_text: Set(Some(format!(
                 "Archived from Cloudreve with source status {}; execution was not resumed",
@@ -717,21 +741,20 @@ pub(super) async fn migrate_tasks(
             ))),
             attempt_count: Set(0),
             max_attempts: Set(1),
-            next_run_at: Set(task.updated_at),
+            next_run_at: Set(target_time(task.updated_at)),
             processing_token: Set(0),
             processing_started_at: Set(None),
             last_heartbeat_at: Set(None),
             lease_expires_at: Set(None),
             started_at: Set(started_at),
-            finished_at: Set(Some(task.updated_at)),
-            last_error: Set(
-                (status == "failed").then(|| "Cloudreve task ended with status error".to_string())
-            ),
+            finished_at: Set(Some(target_time(task.updated_at))),
+            last_error: Set((status == BackgroundTaskStatus::Failed)
+                .then(|| "Cloudreve task ended with status error".to_string())),
             failure_can_retry: Set(Some(false)),
-            expires_at: Set(expires_at),
-            created_at: Set(task.created_at),
-            updated_at: Set(task.updated_at),
-            runtime_json: Set(Some(runtime.to_string())),
+            expires_at: Set(target_time(expires_at)),
+            created_at: Set(target_time(task.created_at)),
+            updated_at: Set(target_time(task.updated_at)),
+            runtime_json: Set(Some(StoredTaskRuntime::from(runtime.to_string()))),
             ..Default::default()
         }
         .insert(transaction)
@@ -797,19 +820,19 @@ pub(super) async fn migrate_shares(
             .remain_downloads
             .map(|remaining| share.downloads.saturating_add(remaining))
             .unwrap_or(0);
-        let target = ad::shares::ActiveModel {
+        let target = ad::share::ActiveModel {
             token: Set(share_token(share.id)),
             user_id: Set(user_id),
             team_id: Set(None),
             file_id: Set(file_id),
             folder_id: Set(folder_id),
             password: Set(password),
-            expires_at: Set(share.expires),
+            expires_at: Set(target_optional_time(share.expires)),
             max_downloads: Set(max_downloads),
             download_count: Set(share.downloads),
             view_count: Set(share.views),
-            created_at: Set(share.created_at),
-            updated_at: Set(share.updated_at),
+            created_at: Set(target_time(share.created_at)),
+            updated_at: Set(target_time(share.updated_at)),
             ..Default::default()
         }
         .insert(transaction)

@@ -55,7 +55,7 @@ async fn reuses_and_verifies_local_storage_per_policy_root() -> Result<()> {
     assert!(report.validation.passed);
 
     let target = Database::connect(&target_url).await?;
-    let policy = ad::storage_policies::Entity::find()
+    let policy = ad::storage_policy::Entity::find()
         .one(&target)
         .await?
         .expect("migrated storage policy");
@@ -123,10 +123,7 @@ async fn rejects_local_storage_size_mismatch() -> Result<()> {
     assert!(format!("{error:?}").contains("size mismatch"));
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(
-        ad::storage_policies::Entity::find().count(&target).await?,
-        0
-    );
+    assert_eq!(ad::storage_policy::Entity::find().count(&target).await?, 0);
     target.close().await?;
 
     let _ = std::fs::remove_file(source_path);
@@ -279,12 +276,12 @@ async fn copies_local_objects_to_target_root_and_uses_content_hashes() -> Result
     );
 
     let target = Database::connect(&target_url).await?;
-    let policy = ad::storage_policies::Entity::find()
+    let policy = ad::storage_policy::Entity::find()
         .one(&target)
         .await?
         .expect("copied local policy");
     assert_eq!(policy.base_path, target_root.to_string_lossy());
-    let blob = ad::file_blobs::Entity::find()
+    let blob = ad::file_blob::Entity::find()
         .one(&target)
         .await?
         .expect("copied blob");
