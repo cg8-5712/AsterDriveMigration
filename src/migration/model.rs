@@ -225,10 +225,6 @@ pub(super) fn source_settings(value: &Option<Value>) -> Value {
     value.clone().unwrap_or_else(|| json!({}))
 }
 
-pub(super) fn opaque_blob_key(entity_id: i64) -> String {
-    format!("cloudreve-{entity_id:016x}")
-}
-
 pub(super) fn share_token(share_id: i64) -> String {
     let digest = Sha256::digest(format!("cloudreve-share-{share_id}").as_bytes());
     format!("cr-{share_id}-{}", &format!("{digest:x}")[..16])
@@ -349,63 +345,10 @@ pub(super) fn unique_username(source: &str, source_id: i64, used: &mut HashSet<S
     candidate
 }
 
-pub(super) fn file_classification(name: &str) -> (String, Option<String>, String, String) {
-    let mime = mime_guess::from_path(name)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
-    let lowercase = name.to_ascii_lowercase();
-    let extension = lowercase
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_string())
-        .unwrap_or_default();
-    let compound_extension = ["tar.gz", "tar.bz2", "tar.xz", "user.js"]
-        .into_iter()
-        .find(|candidate| lowercase.ends_with(candidate))
-        .map(str::to_string);
-    let category = if mime.starts_with("image/") {
-        "image"
-    } else if mime.starts_with("video/") {
-        "video"
-    } else if mime.starts_with("audio/") {
-        "audio"
-    } else if ["zip", "rar", "7z", "gz", "bz2", "xz", "tar"].contains(&extension.as_str()) {
-        "archive"
-    } else if ["xls", "xlsx", "csv", "ods"].contains(&extension.as_str()) {
-        "spreadsheet"
-    } else if ["ppt", "pptx", "odp"].contains(&extension.as_str()) {
-        "presentation"
-    } else if [
-        "rs", "go", "js", "ts", "py", "java", "c", "cpp", "html", "css", "json", "yaml", "yml",
-        "toml",
-    ]
-    .contains(&extension.as_str())
-    {
-        "code"
-    } else if mime.starts_with("text/")
-        || ["pdf", "doc", "docx", "odt", "md"].contains(&extension.as_str())
-    {
-        "document"
-    } else {
-        "other"
-    };
-    (mime, compound_extension, extension, category.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aster_drive_model::types::DriverType;
-
-    #[test]
-    fn classifies_common_file_types() {
-        assert_eq!(file_classification("photo.JPG").3, "image");
-        assert_eq!(
-            file_classification("backup.tar.gz").1.as_deref(),
-            Some("tar.gz")
-        );
-        assert_eq!(file_classification("main.rs").3, "code");
-    }
 
     #[test]
     fn maps_supported_storage_drivers_conservatively() {

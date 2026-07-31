@@ -325,7 +325,6 @@ dependencies = [
  "cloudreve_schema",
  "color-eyre",
  "hmac 0.12.1",
- "mime_guess",
  "sea-orm",
  "serde",
  "serde_json",
@@ -377,11 +376,15 @@ dependencies = [
 name = "aster_drive_writer"
 version = "0.1.0"
 dependencies = [
+ "aster_drive_migration 0.4.0",
  "aster_drive_migration_core",
  "aster_drive_model",
+ "chrono",
  "color-eyre",
+ "mime_guess",
  "sea-orm",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

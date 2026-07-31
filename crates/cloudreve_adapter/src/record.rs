@@ -20,3 +20,15 @@ pub struct CloudreveUserRecord {
 pub struct CloudreveFolderRecord {
     pub folder: cloudreve_schema::files::Model,
 }
+
+#[derive(Debug, Clone)]
+pub struct CloudreveBlobRecord {
+    pub entity: cloudreve_schema::entities::Model,
+    pub reference_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudreveFileRecord {
+    pub file: cloudreve_schema::files::Model,
+    pub entities: Vec<cloudreve_schema::entities::Model>,
+}

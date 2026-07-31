@@ -4,13 +4,14 @@ use color_eyre::eyre::{Result, bail};
 use serde_json::{Value, json};
 
 use super::{
-    CloudreveFolderRecord, CloudrevePolicyGroupRecord, CloudreveStoragePolicyRecord,
-    CloudreveUserRecord,
+    CloudreveBlobRecord, CloudreveFileRecord, CloudreveFolderRecord, CloudrevePolicyGroupRecord,
+    CloudreveStoragePolicyRecord, CloudreveUserRecord,
 };
 use aster_drive_migration_core::{
-    Conversion, ConversionContext, MigrationAvatarSource, MigrationFolder, MigrationPolicyGroup,
-    MigrationStorageDriver, MigrationStoragePolicy, MigrationUser, MigrationUserRole,
-    MigrationUserStatus, SkipReason, SourceConverter,
+    Conversion, ConversionContext, MigrationAvatarSource, MigrationBlob, MigrationFile,
+    MigrationFileVersion, MigrationFolder, MigrationPolicyGroup, MigrationStorageDriver,
+    MigrationStoragePolicy, MigrationUser, MigrationUserRole, MigrationUserStatus, SkipReason,
+    SourceConverter,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -228,6 +229,122 @@ impl SourceConverter<CloudreveFolderRecord> for CloudreveConverter {
     }
 }
 
+impl SourceConverter<CloudreveBlobRecord> for CloudreveConverter {
+    type Output = MigrationBlob;
+    type Error = color_eyre::Report;
+
+    fn convert(
+        &self,
+        source: CloudreveBlobRecord,
+        _: &ConversionContext,
+    ) -> Result<Conversion<Self::Output>> {
+        let entity = source.entity;
+        if entity.r#type != 0 {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "not_a_blob",
+                message: format!("Cloudreve entity {} is not an original object", entity.id),
+            }));
+        }
+        if entity.size < 0 {
+            bail!(
+                "Cloudreve entity {} has negative size {}",
+                entity.id,
+                entity.size
+            );
+        }
+        if entity.source.is_empty() {
+            bail!("Cloudreve entity {} has an empty storage path", entity.id);
+        }
+        let reference_count = i32::try_from(source.reference_count)
+            .map_err(|_| color_eyre::eyre::eyre!("blob reference count exceeds i32"))?;
+        if reference_count < 0 {
+            bail!(
+                "Cloudreve entity {} has a negative reference count",
+                entity.id
+            );
+        }
+        Ok(Conversion::Ready(MigrationBlob {
+            source_id: entity.id,
+            policy_source_id: entity.storage_policy_entities,
+            opaque_key: format!("cloudreve-{:016x}", entity.id),
+            storage_path: entity.source,
+            size: entity.size,
+            reference_count,
+            created_at: target_time(entity.created_at),
+            updated_at: target_time(entity.updated_at),
+        }))
+    }
+}
+
+impl SourceConverter<CloudreveFileRecord> for CloudreveConverter {
+    type Output = MigrationFile;
+    type Error = color_eyre::Report;
+
+    fn convert(
+        &self,
+        source: CloudreveFileRecord,
+        _: &ConversionContext,
+    ) -> Result<Conversion<Self::Output>> {
+        let file = source.file;
+        if file.r#type != 0 {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "not_a_file",
+                message: format!("Cloudreve file {} is not a regular file", file.id),
+            }));
+        }
+        if file.is_symbolic {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "symbolic_file",
+                message: "symbolic/placeholder files are not representable in AD".to_string(),
+            }));
+        }
+        if file.size < 0 {
+            bail!("Cloudreve file {} has negative size {}", file.id, file.size);
+        }
+        if file.primary_entity.is_none() {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "missing_primary_entity",
+                message: format!("Cloudreve file {} has no current entity", file.id),
+            }));
+        }
+
+        let mut entities = source
+            .entities
+            .into_iter()
+            .filter(|entity| entity.r#type == 0)
+            .collect::<Vec<_>>();
+        entities.sort_by_key(|entity| (entity.created_at, entity.id));
+        let versions = entities
+            .into_iter()
+            .map(|entity| {
+                if entity.size < 0 {
+                    bail!(
+                        "Cloudreve entity {} for file {} has negative size {}",
+                        entity.id,
+                        file.id,
+                        entity.size
+                    );
+                }
+                Ok(MigrationFileVersion {
+                    blob_source_id: entity.id,
+                    size: entity.size,
+                    created_at: target_time(entity.created_at),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Conversion::Ready(MigrationFile {
+            source_id: file.id,
+            name: file.name,
+            owner_source_id: file.owner_id,
+            folder_source_id: file.file_children,
+            preferred_blob_source_id: file.primary_entity,
+            versions,
+            created_at: target_time(file.created_at),
+            updated_at: target_time(file.updated_at),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +421,23 @@ mod tests {
             file_children: Some(2),
             storage_policy_files: Some(7),
             owner_id: 9,
+        }
+    }
+
+    fn entity(id: i64, entity_type: i64, size: i64) -> cloudreve_schema::entities::Model {
+        cloudreve_schema::entities::Model {
+            id,
+            created_at: now() + chrono::TimeDelta::seconds(id),
+            updated_at: now(),
+            deleted_at: None,
+            r#type: entity_type,
+            source: format!("objects/{id}"),
+            size,
+            reference_count: 1,
+            upload_session_id: None,
+            recycle_options: None,
+            storage_policy_entities: 7,
+            created_by: Some(9),
         }
     }
 
@@ -468,6 +602,113 @@ mod tests {
             panic!("expected non-folder row to be skipped");
         };
         assert_eq!(reason.code, "not_a_folder");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_blob_and_orders_file_versions() -> Result<()> {
+        let blob = ready(CloudreveConverter.convert(
+            CloudreveBlobRecord {
+                entity: entity(12, 0, 512),
+                reference_count: 3,
+            },
+            &ConversionContext,
+        )?);
+        assert_eq!(blob.source_id, 12);
+        assert_eq!(blob.opaque_key, "cloudreve-000000000000000c");
+        assert_eq!(blob.storage_path, "objects/12");
+        assert_eq!(blob.reference_count, 3);
+
+        let mut file = folder(0);
+        file.id = 20;
+        file.name = "archive.tar.gz".to_string();
+        file.size = 512;
+        file.primary_entity = Some(12);
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveFileRecord {
+                file,
+                entities: vec![entity(12, 0, 512), entity(11, 0, 256)],
+            },
+            &ConversionContext,
+        )?);
+        assert_eq!(converted.preferred_blob_source_id, Some(12));
+        assert_eq!(
+            converted
+                .versions
+                .iter()
+                .map(|version| version.blob_source_id)
+                .collect::<Vec<_>>(),
+            [11, 12]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handles_blob_and_file_boundaries() -> Result<()> {
+        let conversion = CloudreveConverter.convert(
+            CloudreveBlobRecord {
+                entity: entity(12, 1, 512),
+                reference_count: 1,
+            },
+            &ConversionContext,
+        )?;
+        assert!(matches!(conversion, Conversion::Skipped(reason) if reason.code == "not_a_blob"));
+
+        let mut invalid_blob = entity(12, 0, 512);
+        invalid_blob.source.clear();
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveBlobRecord {
+                        entity: invalid_blob,
+                        reference_count: 1,
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("empty storage path")
+        );
+
+        let mut symbolic = folder(0);
+        symbolic.is_symbolic = true;
+        let conversion = CloudreveConverter.convert(
+            CloudreveFileRecord {
+                file: symbolic,
+                entities: vec![],
+            },
+            &ConversionContext,
+        )?;
+        assert!(
+            matches!(conversion, Conversion::Skipped(reason) if reason.code == "symbolic_file")
+        );
+
+        let conversion = CloudreveConverter.convert(
+            CloudreveFileRecord {
+                file: folder(0),
+                entities: vec![],
+            },
+            &ConversionContext,
+        )?;
+        assert!(
+            matches!(conversion, Conversion::Skipped(reason) if reason.code == "missing_primary_entity")
+        );
+
+        let mut negative_version_file = folder(0);
+        negative_version_file.primary_entity = Some(13);
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveFileRecord {
+                        file: negative_version_file,
+                        entities: vec![entity(13, 0, -1)],
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("negative size")
+        );
         Ok(())
     }
 }

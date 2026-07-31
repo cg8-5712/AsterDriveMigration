@@ -1,4 +1,15 @@
 //! AsterDrive database writer for resolved migration-domain values.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::unreachable,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented,
+        clippy::todo
+    )
+)]
 
 use color_eyre::eyre::{Result, WrapErr};
 use sea_orm::{ActiveModelTrait, DatabaseTransaction, Set};
@@ -11,8 +22,9 @@ use aster_drive_model::types::{
 };
 
 use aster_drive_migration_core::{
-    MigrationAvatarSource, MigrationFolder, MigrationPolicyGroup, MigrationStorageDriver,
-    MigrationStoragePolicy, MigrationUser, MigrationUserRole, MigrationUserStatus,
+    MigrationAvatarSource, MigrationBlob, MigrationFile, MigrationFolder, MigrationPolicyGroup,
+    MigrationStorageDriver, MigrationStoragePolicy, MigrationUser, MigrationUserRole,
+    MigrationUserStatus,
 };
 
 pub struct ResolvedPolicyGroup {
@@ -31,6 +43,33 @@ pub struct ResolvedFolder {
     pub owner_id: i64,
     pub owner_username: String,
     pub policy_id: Option<i64>,
+}
+
+pub struct ResolvedBlob {
+    pub blob: MigrationBlob,
+    pub policy_id: i64,
+}
+
+pub struct ResolvedFileVersion {
+    pub blob_id: i64,
+    pub size: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct ResolvedFile {
+    pub file: MigrationFile,
+    pub folder_id: Option<i64>,
+    pub owner_id: i64,
+    pub owner_username: String,
+    pub primary_blob_id: i64,
+    pub primary_blob_size: i64,
+    pub historical_versions: Vec<ResolvedFileVersion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrittenFile {
+    pub target_id: i64,
+    pub version_count: usize,
 }
 
 pub struct AsterDriveWriter<'a> {
@@ -212,5 +251,339 @@ impl<'a> AsterDriveWriter<'a> {
         .await
         .wrap_err_with(|| format!("migrate Cloudreve folder {source_id}"))?;
         Ok(target.id)
+    }
+
+    pub async fn write_blob(&self, resolved: ResolvedBlob) -> Result<i64> {
+        let ResolvedBlob { blob, policy_id } = resolved;
+        let source_id = blob.source_id;
+        let target = aster_drive_schema::entities::file_blob::ActiveModel {
+            hash: Set(blob.opaque_key),
+            size: Set(blob.size),
+            policy_id: Set(policy_id),
+            storage_path: Set(blob.storage_path),
+            // Cloudreve thumbnails do not carry AsterDrive's processor/version cache contract.
+            thumbnail_path: Set(None),
+            thumbnail_processor: Set(None),
+            thumbnail_version: Set(None),
+            ref_count: Set(blob.reference_count),
+            created_at: Set(blob.created_at),
+            updated_at: Set(blob.updated_at),
+            ..Default::default()
+        }
+        .insert(self.transaction)
+        .await
+        .wrap_err_with(|| format!("migrate Cloudreve entity {source_id}"))?;
+        Ok(target.id)
+    }
+
+    pub async fn write_file(&self, resolved: ResolvedFile) -> Result<WrittenFile> {
+        let ResolvedFile {
+            file,
+            folder_id,
+            owner_id,
+            owner_username,
+            primary_blob_id,
+            primary_blob_size,
+            historical_versions,
+        } = resolved;
+        let source_id = file.source_id;
+        // Cloudreve v4 has no stable MIME column. Use the filename only as the MIME hint;
+        // AsterDrive's ActiveModelBehavior delegates classification to the Forge crate.
+        let mime_type = mime_guess::from_path(&file.name)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        let target = aster_drive_schema::entities::file::ActiveModel {
+            name: Set(file.name),
+            folder_id: Set(folder_id),
+            team_id: Set(None),
+            blob_id: Set(primary_blob_id),
+            size: Set(primary_blob_size),
+            owner_user_id: Set(Some(owner_id)),
+            created_by_user_id: Set(Some(owner_id)),
+            created_by_username: Set(owner_username),
+            mime_type: Set(mime_type),
+            created_at: Set(file.created_at),
+            updated_at: Set(file.updated_at),
+            deleted_at: Set(None),
+            is_locked: Set(false),
+            ..Default::default()
+        }
+        .insert(self.transaction)
+        .await
+        .wrap_err_with(|| format!("migrate Cloudreve file {source_id}"))?;
+
+        let version_count = historical_versions.len();
+        for (index, version) in historical_versions.into_iter().enumerate() {
+            aster_drive_schema::entities::file_version::ActiveModel {
+                file_id: Set(target.id),
+                blob_id: Set(version.blob_id),
+                version: Set(i32::try_from(index + 1).wrap_err("file version exceeds i32")?),
+                size: Set(version.size),
+                created_at: Set(version.created_at),
+                ..Default::default()
+            }
+            .insert(self.transaction)
+            .await
+            .wrap_err_with(|| format!("migrate version {} for file {source_id}", index + 1))?;
+        }
+        Ok(WrittenFile {
+            target_id: target.id,
+            version_count,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use aster_drive_migration_core::{
+        MigrationAvatarSource, MigrationFileVersion, MigrationStorageDriver, MigrationUserRole,
+        MigrationUserStatus,
+    };
+    use sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
+        TransactionTrait,
+    };
+
+    use super::*;
+
+    async fn database() -> Result<DatabaseConnection> {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let database = Database::connect(options)
+            .await
+            .wrap_err("connect writer test database")?;
+        database
+            .execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .wrap_err("enable SQLite foreign keys")?;
+        aster_drive_schema_migration::Migrator::up(&database, None)
+            .await
+            .wrap_err("apply AsterDrive schema migrations")?;
+        Ok(database)
+    }
+
+    async fn write_prerequisites(transaction: &DatabaseTransaction) -> Result<(i64, i64, i64)> {
+        let now = chrono::Utc::now();
+        let writer = AsterDriveWriter::new(transaction);
+        let policy_id = writer
+            .write_policy(
+                MigrationStoragePolicy {
+                    source_id: 1,
+                    name: "Local".to_string(),
+                    driver: MigrationStorageDriver::Local,
+                    endpoint: String::new(),
+                    bucket: String::new(),
+                    access_key: String::new(),
+                    secret_key: String::new(),
+                    base_path: "/storage".to_string(),
+                    max_file_size: 0,
+                    allowed_types: Vec::new(),
+                    s3_path_style: true,
+                    extensions: BTreeMap::new(),
+                    chunk_size: 0,
+                    created_at: now,
+                    updated_at: now,
+                },
+                true,
+            )
+            .await?;
+        let user_id = writer
+            .write_user(
+                ResolvedUser {
+                    user: MigrationUser {
+                        source_id: 2,
+                        username: "owner".to_string(),
+                        email: "owner@example.test".to_string(),
+                        display_name: "Owner".to_string(),
+                        role: MigrationUserRole::User,
+                        status: MigrationUserStatus::Active,
+                        storage_used: 0,
+                        storage_quota: 0,
+                        policy_group_source_id: 0,
+                        config: None,
+                        avatar_source: MigrationAvatarSource::None,
+                        avatar_key: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    policy_group_id: None,
+                },
+                "migration-test-password-hash",
+            )
+            .await?;
+        let folder_id = writer
+            .write_folder(ResolvedFolder {
+                folder: MigrationFolder {
+                    source_id: 3,
+                    name: "Documents".to_string(),
+                    parent_source_id: None,
+                    owner_source_id: 2,
+                    policy_source_id: Some(1),
+                    created_at: now,
+                    updated_at: now,
+                },
+                parent_id: None,
+                owner_id: user_id,
+                owner_username: "owner".to_string(),
+                policy_id: Some(policy_id),
+            })
+            .await?;
+        Ok((policy_id, user_id, folder_id))
+    }
+
+    fn blob(source_id: i64, storage_path: &str, size: i64, reference_count: i32) -> MigrationBlob {
+        let now = chrono::Utc::now();
+        MigrationBlob {
+            source_id,
+            policy_source_id: 1,
+            opaque_key: format!("cloudreve-{source_id:016x}"),
+            storage_path: storage_path.to_string(),
+            size,
+            reference_count,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn file(source_id: i64) -> MigrationFile {
+        let now = chrono::Utc::now();
+        MigrationFile {
+            source_id,
+            name: "archive.tar.gz".to_string(),
+            owner_source_id: 2,
+            folder_source_id: Some(3),
+            preferred_blob_source_id: Some(11),
+            versions: vec![MigrationFileVersion {
+                blob_source_id: 11,
+                size: 512,
+                created_at: now,
+            }],
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_blob_file_and_versions_with_asterdrive_semantics() -> Result<()> {
+        let database = database().await?;
+        let transaction = database.begin().await?;
+        let (policy_id, user_id, folder_id) = write_prerequisites(&transaction).await?;
+        let writer = AsterDriveWriter::new(&transaction);
+        let historical_blob_id = writer
+            .write_blob(ResolvedBlob {
+                blob: blob(10, "objects/history", 256, 1),
+                policy_id,
+            })
+            .await?;
+        let current_blob_id = writer
+            .write_blob(ResolvedBlob {
+                blob: blob(11, "objects/current", 512, 1),
+                policy_id,
+            })
+            .await?;
+        let historical_created_at = chrono::Utc::now() - chrono::Duration::days(1);
+        let written = writer
+            .write_file(ResolvedFile {
+                file: file(20),
+                folder_id: Some(folder_id),
+                owner_id: user_id,
+                owner_username: "owner".to_string(),
+                primary_blob_id: current_blob_id,
+                primary_blob_size: 512,
+                historical_versions: vec![ResolvedFileVersion {
+                    blob_id: historical_blob_id,
+                    size: 256,
+                    created_at: historical_created_at,
+                }],
+            })
+            .await?;
+        transaction.commit().await?;
+
+        assert_eq!(written.version_count, 1);
+        let stored_file = aster_drive_schema::entities::file::Entity::find_by_id(written.target_id)
+            .one(&database)
+            .await?
+            .expect("written file");
+        assert_eq!(stored_file.blob_id, current_blob_id);
+        assert_eq!(stored_file.size, 512);
+        assert_eq!(stored_file.folder_id, Some(folder_id));
+        assert_eq!(stored_file.mime_type, "application/gzip");
+        assert_eq!(stored_file.extension, "gz");
+        assert_eq!(stored_file.compound_extension.as_deref(), Some("tar.gz"));
+        assert_eq!(stored_file.file_category.as_str(), "archive");
+
+        let versions = aster_drive_schema::entities::file_version::Entity::find()
+            .all(&database)
+            .await?;
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].file_id, written.target_id);
+        assert_eq!(versions[0].blob_id, historical_blob_id);
+        assert_eq!(versions[0].version, 1);
+        assert_eq!(versions[0].size, 256);
+        assert_eq!(versions[0].created_at, historical_created_at);
+
+        let current_blob =
+            aster_drive_schema::entities::file_blob::Entity::find_by_id(current_blob_id)
+                .one(&database)
+                .await?
+                .expect("current blob");
+        assert_eq!(current_blob.hash, "cloudreve-000000000000000b");
+        assert_eq!(current_blob.storage_path, "objects/current");
+        assert_eq!(current_blob.size, 512);
+        assert_eq!(current_blob.ref_count, 1);
+        assert_eq!(current_blob.thumbnail_path, None);
+        assert_eq!(current_blob.thumbnail_processor, None);
+        assert_eq!(current_blob.thumbnail_version, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_and_versions_remain_atomic_when_a_version_blob_is_missing() -> Result<()> {
+        let database = database().await?;
+        let setup = database.begin().await?;
+        let (policy_id, user_id, folder_id) = write_prerequisites(&setup).await?;
+        let current_blob_id = AsterDriveWriter::new(&setup)
+            .write_blob(ResolvedBlob {
+                blob: blob(11, "objects/current", 512, 1),
+                policy_id,
+            })
+            .await?;
+        setup.commit().await?;
+
+        let transaction = database.begin().await?;
+        let result = AsterDriveWriter::new(&transaction)
+            .write_file(ResolvedFile {
+                file: file(21),
+                folder_id: Some(folder_id),
+                owner_id: user_id,
+                owner_username: "owner".to_string(),
+                primary_blob_id: current_blob_id,
+                primary_blob_size: 512,
+                historical_versions: vec![ResolvedFileVersion {
+                    blob_id: i64::MAX,
+                    size: 256,
+                    created_at: chrono::Utc::now(),
+                }],
+            })
+            .await;
+        assert!(result.is_err());
+        transaction.rollback().await?;
+
+        assert_eq!(
+            aster_drive_schema::entities::file::Entity::find()
+                .count(&database)
+                .await?,
+            0
+        );
+        assert_eq!(
+            aster_drive_schema::entities::file_version::Entity::find()
+                .count(&database)
+                .await?,
+            0
+        );
+        Ok(())
     }
 }

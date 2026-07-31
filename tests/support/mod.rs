@@ -133,7 +133,8 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
         updated_at: Set(now),
         r#type: Set(0),
         name: Set("hello.txt".to_string()),
-        size: Set(128),
+        // Deliberately stale: the target file size must follow the current entity/blob.
+        size: Set(9_999),
         primary_entity: Set(Some(entity.id)),
         is_symbolic: Set(false),
         props: Set(None),

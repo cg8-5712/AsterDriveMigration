@@ -2,10 +2,13 @@ use super::*;
 use sea_orm::DatabaseTransaction;
 
 use aster_drive_migration_core::{Conversion, ConversionContext, SourceConverter};
-use aster_drive_writer::{AsterDriveWriter, ResolvedFolder, ResolvedPolicyGroup, ResolvedUser};
+use aster_drive_writer::{
+    AsterDriveWriter, ResolvedBlob, ResolvedFile, ResolvedFileVersion, ResolvedFolder,
+    ResolvedPolicyGroup, ResolvedUser,
+};
 use cloudreve_adapter::{
-    CloudreveConverter, CloudreveFolderRecord, CloudrevePolicyGroupRecord,
-    CloudreveStoragePolicyRecord, CloudreveUserRecord,
+    CloudreveBlobRecord, CloudreveConverter, CloudreveFileRecord, CloudreveFolderRecord,
+    CloudrevePolicyGroupRecord, CloudreveStoragePolicyRecord, CloudreveUserRecord,
 };
 
 pub(super) async fn migrate_policies(
@@ -57,15 +60,19 @@ pub(super) async fn migrate_policy_groups(
     let conversion_context = ConversionContext;
     let writer = AsterDriveWriter::new(transaction);
     for group in &source.groups {
-        let converted = converter
-            .convert(
-                CloudrevePolicyGroupRecord {
-                    group: group.clone(),
-                },
-                &conversion_context,
-            )?
-            .into_ready()
-            .expect("Cloudreve policy-group conversion never skips");
+        let converted = match converter.convert(
+            CloudrevePolicyGroupRecord {
+                group: group.clone(),
+            },
+            &conversion_context,
+        )? {
+            Conversion::Ready(converted) => converted,
+            Conversion::Skipped(reason) => bail!(
+                "Cloudreve policy group {} was unexpectedly skipped: {}",
+                group.id,
+                reason.message
+            ),
+        };
         let source_id = converted.source_id;
         let policy_id = converted
             .policy_source_id
@@ -100,17 +107,21 @@ pub(super) async fn migrate_users(
     let mut used_usernames = HashSet::new();
     for user in &source.users {
         let username = unique_username(&user.nick, user.id, &mut used_usernames);
-        let converted = converter
-            .convert(
-                CloudreveUserRecord {
-                    user: user.clone(),
-                    group: groups.get(&user.group_users).map(|group| (*group).clone()),
-                    username: username.clone(),
-                },
-                &conversion_context,
-            )?
-            .into_ready()
-            .expect("Cloudreve user conversion never skips");
+        let converted = match converter.convert(
+            CloudreveUserRecord {
+                user: user.clone(),
+                group: groups.get(&user.group_users).map(|group| (*group).clone()),
+                username: username.clone(),
+            },
+            &conversion_context,
+        )? {
+            Conversion::Ready(converted) => converted,
+            Conversion::Skipped(reason) => bail!(
+                "Cloudreve user {} was unexpectedly skipped: {}",
+                user.id,
+                reason.message
+            ),
+        };
         let source_id = converted.source_id;
         let policy_group_id = context
             .policy_groups
@@ -218,46 +229,39 @@ pub(super) async fn migrate_blob_batch(
     transaction: &DatabaseTransaction,
     entities: &[cloudreve_schema::entities::Model],
     reference_counts: &HashMap<i64, i64>,
-    thumbnail_paths: &HashMap<i64, String>,
     context: &MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<Vec<(i64, i64)>> {
     let mut mappings = Vec::with_capacity(entities.len());
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
     for entity in entities {
-        let Some(policy_id) = context
-            .policies
-            .get(&entity.storage_policy_entities)
-            .copied()
-        else {
+        let conversion = converter.convert(
+            CloudreveBlobRecord {
+                entity: entity.clone(),
+                reference_count: reference_counts.get(&entity.id).copied().unwrap_or(0),
+            },
+            &conversion_context,
+        )?;
+        let blob = match conversion {
+            Conversion::Ready(blob) => blob,
+            Conversion::Skipped(reason) => {
+                report.record_skip("blob", Some(entity.id), reason.message);
+                continue;
+            }
+        };
+        let Some(policy_id) = context.policies.get(&blob.policy_source_id).copied() else {
             report.record_skip(
                 "blob",
-                Some(entity.id),
-                format!(
-                    "storage policy {} was not migrated",
-                    entity.storage_policy_entities
-                ),
+                Some(blob.source_id),
+                format!("storage policy {} was not migrated", blob.policy_source_id),
             );
             continue;
         };
-        let reference_count = i32::try_from(reference_counts.get(&entity.id).copied().unwrap_or(1))
-            .wrap_err("blob reference count exceeds i32")?;
-        let target = aster_drive_schema::entities::file_blob::ActiveModel {
-            hash: Set(opaque_blob_key(entity.id)),
-            size: Set(entity.size),
-            policy_id: Set(policy_id),
-            storage_path: Set(entity.source.clone()),
-            thumbnail_path: Set(thumbnail_paths.get(&entity.id).cloned()),
-            thumbnail_processor: Set(None),
-            thumbnail_version: Set(None),
-            ref_count: Set(reference_count),
-            created_at: Set(target_time(entity.created_at)),
-            updated_at: Set(target_time(entity.updated_at)),
-            ..Default::default()
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("migrate Cloudreve entity {}", entity.id))?;
-        mappings.push((entity.id, target.id));
+        let source_id = blob.source_id;
+        let target_id = writer.write_blob(ResolvedBlob { blob, policy_id }).await?;
+        mappings.push((source_id, target_id));
         report.migrated_blobs += 1;
     }
     Ok(mappings)
@@ -273,98 +277,108 @@ pub(super) async fn migrate_file_batch(
     report: &mut MigrationReport,
 ) -> Result<Vec<(i64, i64)>> {
     let mut mappings = Vec::with_capacity(files.len());
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
     for file in files {
-        if file.is_symbolic {
-            report.record_skip(
-                "file",
-                Some(file.id),
-                "symbolic/placeholder files are not representable in AD",
-            );
-            continue;
+        let mut source_entity_ids = associations.get(&file.id).cloned().unwrap_or_default();
+        if let Some(primary_entity) = file.primary_entity
+            && !source_entity_ids.contains(&primary_entity)
+        {
+            source_entity_ids.push(primary_entity);
         }
-        let Some(owner_id) = context.users.get(&file.owner_id).copied() else {
-            report.record_skip(
-                "file",
-                Some(file.id),
-                format!("owner user {} was not migrated", file.owner_id),
-            );
-            continue;
-        };
-        let mut version_entities: Vec<&cloudreve_schema::entities::Model> = associations
-            .get(&file.id)
-            .into_iter()
-            .flatten()
-            .filter_map(|entity_id| entities.get(entity_id))
-            .filter(|entity| entity.r#type == 0 && blob_mappings.contains_key(&entity.id))
-            .collect();
-        version_entities.sort_by_key(|entity| entity.created_at);
-        let primary_entity_id = file
-            .primary_entity
-            .filter(|id| blob_mappings.contains_key(id))
-            .or_else(|| version_entities.last().map(|entity| entity.id));
-        let Some(primary_entity_id) = primary_entity_id else {
-            report.record_skip(
-                "file",
-                Some(file.id),
-                "file has no migratable version entity",
-            );
-            report
-                .warnings
-                .push(format!("file {} has no migratable version entity", file.id));
-            continue;
-        };
-        let blob_id = blob_mappings[&primary_entity_id];
-        let (mime_type, compound_extension, extension, category) = file_classification(&file.name);
-        let target = aster_drive_schema::entities::file::ActiveModel {
-            name: Set(file.name.clone()),
-            folder_id: Set(file
-                .file_children
-                .and_then(|folder_id| context.folders.get(&folder_id).copied())),
-            team_id: Set(None),
-            blob_id: Set(blob_id),
-            size: Set(file.size),
-            owner_user_id: Set(Some(owner_id)),
-            created_by_user_id: Set(Some(owner_id)),
-            created_by_username: Set(context
-                .usernames
-                .get(&file.owner_id)
-                .cloned()
-                .unwrap_or_default()),
-            mime_type: Set(mime_type),
-            created_at: Set(target_time(file.created_at)),
-            updated_at: Set(target_time(file.updated_at)),
-            deleted_at: Set(None),
-            is_locked: Set(false),
-            extension: Set(extension),
-            compound_extension: Set(compound_extension),
-            file_category: Set(serde_json::from_value(Value::String(category))
-                .wrap_err("decode AsterDrive file category")?),
-            ..Default::default()
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("migrate Cloudreve file {}", file.id))?;
-        mappings.push((file.id, target.id));
-        report.migrated_files += 1;
-
-        let historical: Vec<&cloudreve_schema::entities::Model> = version_entities
-            .into_iter()
-            .filter(|entity| entity.id != primary_entity_id)
-            .collect();
-        for (index, entity) in historical.into_iter().enumerate() {
-            aster_drive_schema::entities::file_version::ActiveModel {
-                file_id: Set(target.id),
-                blob_id: Set(blob_mappings[&entity.id]),
-                version: Set(i32::try_from(index + 1).wrap_err("file version exceeds i32")?),
-                size: Set(entity.size),
-                created_at: Set(target_time(entity.created_at)),
-                ..Default::default()
+        let conversion = converter.convert(
+            CloudreveFileRecord {
+                file: file.clone(),
+                entities: source_entity_ids
+                    .into_iter()
+                    .filter_map(|entity_id| entities.get(&entity_id).cloned())
+                    .collect(),
+            },
+            &conversion_context,
+        )?;
+        let migrated_file = match conversion {
+            Conversion::Ready(file) => file,
+            Conversion::Skipped(reason) => {
+                report.record_skip("file", Some(file.id), reason.message);
+                continue;
             }
-            .insert(transaction)
-            .await
-            .wrap_err_with(|| format!("migrate version {} for file {}", entity.id, file.id))?;
-            report.migrated_versions += 1;
+        };
+        let Some(owner_id) = context.users.get(&migrated_file.owner_source_id).copied() else {
+            report.record_skip(
+                "file",
+                Some(migrated_file.source_id),
+                format!(
+                    "owner user {} was not migrated",
+                    migrated_file.owner_source_id
+                ),
+            );
+            continue;
+        };
+        let Some(primary_entity_id) = migrated_file.preferred_blob_source_id else {
+            bail!(
+                "converted Cloudreve file {} has no primary entity",
+                migrated_file.source_id
+            );
+        };
+        if !blob_mappings.contains_key(&primary_entity_id) {
+            report.record_skip(
+                "file",
+                Some(migrated_file.source_id),
+                format!("current entity {primary_entity_id} was not migrated"),
+            );
+            report.warnings.push(format!(
+                "file {} current entity {primary_entity_id} was not migrated",
+                migrated_file.source_id,
+            ));
+            continue;
         }
+        let historical_versions = migrated_file
+            .versions
+            .iter()
+            .filter(|version| version.blob_source_id != primary_entity_id)
+            .filter_map(|version| {
+                blob_mappings
+                    .get(&version.blob_source_id)
+                    .copied()
+                    .map(|blob_id| ResolvedFileVersion {
+                        blob_id,
+                        size: version.size,
+                        created_at: version.created_at,
+                    })
+            })
+            .collect();
+        let source_id = migrated_file.source_id;
+        let Some(primary_blob_size) = migrated_file
+            .versions
+            .iter()
+            .find(|version| version.blob_source_id == primary_entity_id)
+            .map(|version| version.size)
+        else {
+            bail!(
+                "converted Cloudreve file {} is missing current entity {primary_entity_id} in its version set",
+                migrated_file.source_id
+            );
+        };
+        let resolved = ResolvedFile {
+            folder_id: migrated_file
+                .folder_source_id
+                .and_then(|folder_id| context.folders.get(&folder_id).copied()),
+            owner_id,
+            owner_username: context
+                .usernames
+                .get(&migrated_file.owner_source_id)
+                .cloned()
+                .unwrap_or_default(),
+            primary_blob_id: blob_mappings[&primary_entity_id],
+            primary_blob_size,
+            historical_versions,
+            file: migrated_file,
+        };
+        let written = writer.write_file(resolved).await?;
+        mappings.push((source_id, written.target_id));
+        report.migrated_files += 1;
+        report.migrated_versions += written.version_count;
     }
     Ok(mappings)
 }

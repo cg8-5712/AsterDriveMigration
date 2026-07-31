@@ -88,3 +88,34 @@ pub struct MigrationFolder {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationBlob {
+    pub source_id: i64,
+    pub policy_source_id: i64,
+    pub opaque_key: String,
+    pub storage_path: String,
+    pub size: i64,
+    pub reference_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationFileVersion {
+    pub blob_source_id: i64,
+    pub size: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationFile {
+    pub source_id: i64,
+    pub name: String,
+    pub owner_source_id: i64,
+    pub folder_source_id: Option<i64>,
+    pub preferred_blob_source_id: Option<i64>,
+    pub versions: Vec<MigrationFileVersion>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

@@ -105,13 +105,12 @@ impl MigrationStage {
         }
     }
 
-    fn plan() -> aster_drive_migration_core::StagePlan {
-        aster_drive_migration_core::StagePlan::new(
+    fn plan() -> Result<aster_drive_migration_core::StagePlan> {
+        Ok(aster_drive_migration_core::StagePlan::new(
             Self::ALL
                 .into_iter()
                 .map(|stage| aster_drive_migration_core::StageId::borrowed(stage.as_str())),
-        )
-        .expect("static migration stages form a valid plan")
+        )?)
     }
 }
 
@@ -273,7 +272,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
 
     let password_hash = hash_password(&options.default_password)?;
 
-    let stage_plan = MigrationStage::plan();
+    let stage_plan = MigrationStage::plan()?;
     for (stage_index, stage) in MigrationStage::ALL.into_iter().enumerate() {
         if !stage_plan.should_run_after(
             &aster_drive_migration_core::StageId::borrowed(stage.as_str()),
@@ -591,7 +590,9 @@ pub(super) async fn migrate_blobs_batched(
 
         let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
         let association_info = load_blob_association_info(inputs.source, &entity_ids).await?;
-        let last_entity_id = entities.last().expect("non-empty blob batch").id;
+        let Some(last_entity_id) = entities.last().map(|entity| entity.id) else {
+            bail!("blob batch query returned no rows after the empty-batch check");
+        };
         let transaction = inputs.target.begin().await.wrap_err("begin blobs batch")?;
         let report_before_batch = report.clone();
         let batch_result: Result<Vec<(i64, i64)>> = async {
@@ -599,7 +600,6 @@ pub(super) async fn migrate_blobs_batched(
                 &transaction,
                 &entities,
                 &association_info.reference_counts,
-                &association_info.thumbnail_paths,
                 inputs.context,
                 report,
             )
@@ -709,7 +709,9 @@ pub(super) async fn migrate_files_batched(
 
         let (associations, entities) =
             load_file_batch_data(inputs.source, inputs.source_data.include_deleted, &files).await?;
-        let last_file_id = files.last().expect("non-empty file batch").id;
+        let Some(last_file_id) = files.last().map(|file| file.id) else {
+            bail!("file batch query returned no rows after the empty-batch check");
+        };
         let transaction = inputs.target.begin().await.wrap_err("begin files batch")?;
         let mappings = migrate_file_batch(
             &transaction,
@@ -794,7 +796,6 @@ pub(super) async fn load_file_batch_data(
 
 pub(super) struct BlobAssociationInfo {
     reference_counts: HashMap<i64, i64>,
-    thumbnail_paths: HashMap<i64, String>,
 }
 
 pub(super) async fn load_blob_association_info(
@@ -804,7 +805,6 @@ pub(super) async fn load_blob_association_info(
     if blob_ids.is_empty() {
         return Ok(BlobAssociationInfo {
             reference_counts: HashMap::new(),
-            thumbnail_paths: HashMap::new(),
         });
     }
     let relations = cloudreve_schema::file_entities::Entity::find()
@@ -823,38 +823,23 @@ pub(super) async fn load_blob_association_info(
     if file_ids.is_empty() {
         return Ok(BlobAssociationInfo {
             reference_counts: HashMap::new(),
-            thumbnail_paths: HashMap::new(),
         });
     }
-    let all_relations = cloudreve_schema::file_entities::Entity::find()
-        .filter(cloudreve_schema::file_entities::Column::FileId.is_in(file_ids.iter().copied()))
-        .all(source)
-        .await?;
-    let thumbnail_ids = all_relations
-        .iter()
-        .map(|relation| relation.entity_id)
-        .collect::<HashSet<_>>();
-    let thumbnails = cloudreve_schema::entities::Entity::find()
-        .filter(cloudreve_schema::entities::Column::Id.is_in(thumbnail_ids.iter().copied()))
-        .filter(cloudreve_schema::entities::Column::Type.eq(1))
-        .all(source)
-        .await?
-        .into_iter()
-        .map(|entity| (entity.id, entity.source))
-        .collect::<HashMap<_, _>>();
-    let relations_by_file =
-        all_relations
-            .into_iter()
-            .fold(HashMap::<i64, Vec<i64>>::new(), |mut values, relation| {
-                values
-                    .entry(relation.file_id)
-                    .or_default()
-                    .push(relation.entity_id);
-                values
-            });
+    let mut migratable_file_ids = HashSet::new();
+    for file_ids in file_ids.iter().copied().collect::<Vec<_>>().chunks(500) {
+        migratable_file_ids.extend(
+            cloudreve_schema::files::Entity::find()
+                .filter(cloudreve_schema::files::Column::Id.is_in(file_ids.iter().copied()))
+                .filter(cloudreve_schema::files::Column::Type.eq(0))
+                .filter(cloudreve_schema::files::Column::IsSymbolic.eq(false))
+                .all(source)
+                .await?
+                .into_iter()
+                .map(|file| file.id),
+        );
+    }
     let blob_id_set = blob_ids.iter().copied().collect::<HashSet<_>>();
     let mut file_blob_pairs = HashSet::new();
-    let mut thumbnail_paths = HashMap::new();
     for (blob_id, file_id) in relations
         .into_iter()
         .map(|relation| (relation.entity_id, relation.file_id))
@@ -864,28 +849,15 @@ pub(super) async fn load_blob_association_info(
                 .filter_map(|file| file.primary_entity.map(|entity_id| (entity_id, file.id))),
         )
     {
-        if blob_id_set.contains(&blob_id) {
+        if blob_id_set.contains(&blob_id) && migratable_file_ids.contains(&file_id) {
             file_blob_pairs.insert((file_id, blob_id));
-        }
-        if let Some(path) = relations_by_file
-            .get(&file_id)
-            .into_iter()
-            .flatten()
-            .find_map(|entity_id| thumbnails.get(entity_id))
-        {
-            thumbnail_paths
-                .entry(blob_id)
-                .or_insert_with(|| path.clone());
         }
     }
     let mut reference_counts = HashMap::new();
     for (_, blob_id) in file_blob_pairs {
         *reference_counts.entry(blob_id).or_insert(0) += 1;
     }
-    Ok(BlobAssociationInfo {
-        reference_counts,
-        thumbnail_paths,
-    })
+    Ok(BlobAssociationInfo { reference_counts })
 }
 
 pub(super) fn validate_run_id(run_id: &str) -> Result<()> {
@@ -956,6 +928,7 @@ pub(super) fn plan_fingerprint(options: &MigrationOptions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ConnectionTrait, DbBackend, Schema};
     use std::time::Instant;
 
     #[test]
@@ -963,5 +936,79 @@ mod tests {
         let timing = progress_timing(50, 100, Instant::now());
         assert!(timing.contains("rows_per_sec="));
         assert!(timing.contains("eta_secs="));
+    }
+
+    #[tokio::test]
+    async fn blob_reference_counts_match_distinct_file_blob_relations() -> Result<()> {
+        let database = Database::connect("sqlite::memory:").await?;
+        database
+            .execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await?;
+        let schema = Schema::new(DbBackend::Sqlite);
+        for statement in [
+            schema.create_table_from_entity(cloudreve_schema::files::Entity),
+            schema.create_table_from_entity(cloudreve_schema::entities::Entity),
+            schema.create_table_from_entity(cloudreve_schema::file_entities::Entity),
+        ] {
+            database.execute(&statement).await?;
+        }
+
+        let now = chrono::Utc::now().fixed_offset();
+        for id in [10, 11, 12] {
+            cloudreve_schema::entities::ActiveModel {
+                id: Set(id),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                r#type: Set(0),
+                source: Set(format!("objects/{id}")),
+                size: Set(128),
+                reference_count: Set(99),
+                upload_session_id: Set(None),
+                recycle_options: Set(None),
+                storage_policy_entities: Set(1),
+                created_by: Set(Some(1)),
+            }
+            .insert(&database)
+            .await?;
+        }
+        for (id, primary_entity, is_symbolic) in [
+            (20, Some(10), false),
+            (21, Some(10), false),
+            (22, Some(10), true),
+        ] {
+            cloudreve_schema::files::ActiveModel {
+                id: Set(id),
+                created_at: Set(now),
+                updated_at: Set(now),
+                r#type: Set(0),
+                name: Set(format!("file-{id}.bin")),
+                size: Set(128),
+                primary_entity: Set(primary_entity),
+                is_symbolic: Set(is_symbolic),
+                props: Set(None),
+                file_children: Set(None),
+                storage_policy_files: Set(Some(1)),
+                owner_id: Set(1),
+            }
+            .insert(&database)
+            .await?;
+        }
+        for (file_id, entity_id) in [(20, 10), (20, 11)] {
+            cloudreve_schema::file_entities::ActiveModel {
+                file_id: Set(file_id),
+                entity_id: Set(entity_id),
+            }
+            .insert(&database)
+            .await?;
+        }
+
+        let counts = load_blob_association_info(&database, &[10, 11, 12])
+            .await?
+            .reference_counts;
+        assert_eq!(counts.get(&10), Some(&2));
+        assert_eq!(counts.get(&11), Some(&1));
+        assert_eq!(counts.get(&12), None);
+        Ok(())
     }
 }

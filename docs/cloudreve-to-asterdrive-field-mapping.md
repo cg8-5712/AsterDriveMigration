@@ -213,7 +213,7 @@ Cloudreve `files.type`：
 | `owner_id` | `created_by_user_id` | 生成/转换 | 没有独立创建者时使用 owner |
 | `owner_id -> username` | `created_by_username` | 生成 | 保存迁移后的 AD username |
 | `primary_entity` | `blob_id` | 转换 | 先将主 entity 迁移为 `file_blobs` |
-| `size` | `size` | 直接 | 建议同时与主 entity.size 校验 |
+| `size` | 无直接写入 | 校验 | 仅校验源值非负；目标 `files.size` 使用当前 `primary_entity` 对应的 `entities.size` |
 | `created_at` | `created_at` | 直接 | 保留 |
 | `updated_at` | `updated_at` | 直接 | 保留 |
 | `props` | 无直接字段 | 决策 | 可存入 `entity_properties` |
@@ -251,7 +251,7 @@ AD 使用：
 |---|---|---|---|
 | `id` | 新生成 `id` | 转换 | 保存 entity ID -> blob ID 映射 |
 | `type=0` | 创建 `file_blobs` | 转换 | 普通版本实体 |
-| `type=1` | `thumbnail_path` | 合并 | 找到同一文件的缩略图 entity，将其 `source` 写入主 blob |
+| `type=1` | 不迁移 | 重建 | Cloudreve 缩略图没有 AD 的 processor/version 缓存契约；三个缩略图缓存字段均写 `NULL`，由 AD 重建 |
 | `type=2` | 无直接字段 | 决策 | 可作为额外 blob + property，当前 AD 无 Live Photo 专用关系 |
 | `source` | `storage_path` | 直接/关键 | 复用旧对象时必须原样保留 |
 | `size` | `size` | 直接 | 保留 |
@@ -280,6 +280,8 @@ AD 使用：
 | `entities.size` | `file_versions.size` | 保留 |
 | `entities.created_at` | `file_versions.created_at` | 保留 |
 | 无明确版本号 | `file_versions.version` | 按历史 entity 创建时间生成 `1..N` |
+
+普通文件缺少 `primary_entity`，或该 entity 因软删除/策略不兼容而未迁移时，整条文件记录跳过并报告；不会按创建时间把某个历史 entity 猜成当前版本。
 
 ## 8. 元数据映射
 

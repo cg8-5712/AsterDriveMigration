@@ -7,7 +7,9 @@ use aster_drive_model::types::{
 };
 use color_eyre::eyre::Result;
 use sea_orm::ConnectionTrait;
-use sea_orm::{ActiveModelTrait, Database, EntityTrait, PaginatorTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set,
+};
 use support::{
     create_source_schema, create_target_schema, seed_extra_blob_entities, seed_extra_files,
     seed_source, sqlite_url,
@@ -226,13 +228,25 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
         .one(&target)
         .await?
         .unwrap();
+    assert_eq!(blob.hash, "cloudreve-0000000000000001");
+    assert_eq!(blob.size, 128);
     assert_eq!(blob.storage_path, "uploads/object.bin");
+    assert_eq!(blob.thumbnail_path, None);
+    assert_eq!(blob.thumbnail_processor, None);
+    assert_eq!(blob.thumbnail_version, None);
     let files = aster_drive_schema::entities::file::Entity::find()
         .all(&target)
         .await?;
     let versions = aster_drive_schema::entities::file_version::Entity::find()
         .all(&target)
         .await?;
+    assert_eq!(files[0].blob_id, blob.id);
+    assert_eq!(files[0].size, blob.size);
+    assert_eq!(files[0].mime_type, "text/plain");
+    assert_eq!(files[0].extension, "txt");
+    assert_eq!(files[0].compound_extension, None);
+    assert_eq!(files[0].file_category.as_str(), "document");
+    assert!(versions.is_empty());
     let expected_ref_count = i32::try_from(
         files.iter().filter(|file| file.blob_id == blob.id).count()
             + versions
@@ -671,6 +685,37 @@ async fn resumes_files_from_last_committed_batch() -> Result<()> {
             .await?,
         1
     );
+    let first_file = aster_drive_schema::entities::file::Entity::find()
+        .filter(aster_drive_schema::entities::file::Column::Name.eq("extra-0.txt"))
+        .one(&target)
+        .await?
+        .expect("first resumed file");
+    let first_current_blob =
+        aster_drive_schema::entities::file_blob::Entity::find_by_id(first_file.blob_id)
+            .one(&target)
+            .await?
+            .expect("first file current blob");
+    assert_eq!(
+        first_current_blob.hash,
+        format!("cloudreve-{:016x}", extra_blob_ids[0])
+    );
+    assert_eq!(first_current_blob.ref_count, 1);
+    let historical_version = aster_drive_schema::entities::file_version::Entity::find()
+        .one(&target)
+        .await?
+        .expect("first file historical version");
+    assert_eq!(historical_version.file_id, first_file.id);
+    assert_eq!(historical_version.version, 1);
+    let historical_blob =
+        aster_drive_schema::entities::file_blob::Entity::find_by_id(historical_version.blob_id)
+            .one(&target)
+            .await?
+            .expect("historical blob");
+    assert_eq!(
+        historical_blob.hash,
+        format!("cloudreve-{:016x}", extra_blob_ids[1])
+    );
+    assert_eq!(historical_blob.ref_count, 2);
     let completed_checkpoint = migration_run_status(&target_url, &run_id).await?;
     assert_eq!(completed_checkpoint.status, "completed");
     target.close().await?;
