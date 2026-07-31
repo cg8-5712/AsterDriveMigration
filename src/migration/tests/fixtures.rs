@@ -15,17 +15,17 @@ pub(super) async fn create_table<E: EntityTrait>(db: &DatabaseConnection, entity
 }
 
 pub(super) async fn create_source_schema(db: &DatabaseConnection) -> Result<()> {
-    create_table(db, cr::nodes::Entity).await?;
-    create_table(db, cr::groups::Entity).await?;
-    create_table(db, cr::users::Entity).await?;
-    create_table(db, cr::storage_policies::Entity).await?;
-    create_table(db, cr::files::Entity).await?;
-    create_table(db, cr::entities::Entity).await?;
-    create_table(db, cr::file_entities::Entity).await?;
-    create_table(db, cr::shares::Entity).await?;
-    create_table(db, cr::metadata::Entity).await?;
-    create_table(db, cr::direct_links::Entity).await?;
-    create_table(db, cr::tasks::Entity).await?;
+    create_table(db, cloudreve_schema::nodes::Entity).await?;
+    create_table(db, cloudreve_schema::groups::Entity).await?;
+    create_table(db, cloudreve_schema::users::Entity).await?;
+    create_table(db, cloudreve_schema::storage_policies::Entity).await?;
+    create_table(db, cloudreve_schema::files::Entity).await?;
+    create_table(db, cloudreve_schema::entities::Entity).await?;
+    create_table(db, cloudreve_schema::file_entities::Entity).await?;
+    create_table(db, cloudreve_schema::shares::Entity).await?;
+    create_table(db, cloudreve_schema::metadata::Entity).await?;
+    create_table(db, cloudreve_schema::direct_links::Entity).await?;
+    create_table(db, cloudreve_schema::tasks::Entity).await?;
     Ok(())
 }
 
@@ -38,7 +38,7 @@ pub(super) async fn create_target_schema(db: &DatabaseConnection) -> Result<()> 
 
 pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     let now = chrono::Utc::now().fixed_offset();
-    let policy = cr::storage_policies::ActiveModel {
+    let policy = cloudreve_schema::storage_policies::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -58,7 +58,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    let group = cr::groups::ActiveModel {
+    let group = cloudreve_schema::groups::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -72,7 +72,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    let user = cr::users::ActiveModel {
+    let user = cloudreve_schema::users::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -89,7 +89,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    let folder = cr::files::ActiveModel {
+    let folder = cloudreve_schema::files::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         r#type: Set(1),
@@ -105,7 +105,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    let entity = cr::entities::ActiveModel {
+    let entity = cloudreve_schema::entities::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -121,7 +121,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    let file = cr::files::ActiveModel {
+    let file = cloudreve_schema::files::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         r#type: Set(0),
@@ -137,13 +137,13 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    cr::file_entities::ActiveModel {
+    cloudreve_schema::file_entities::ActiveModel {
         file_id: Set(file.id),
         entity_id: Set(entity.id),
     }
     .insert(db)
     .await?;
-    cr::metadata::ActiveModel {
+    cloudreve_schema::metadata::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -155,7 +155,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    cr::metadata::ActiveModel {
+    cloudreve_schema::metadata::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -167,7 +167,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    cr::shares::ActiveModel {
+    cloudreve_schema::shares::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -183,7 +183,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     }
     .insert(db)
     .await?;
-    cr::direct_links::ActiveModel {
+    cloudreve_schema::direct_links::ActiveModel {
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -196,7 +196,7 @@ pub(super) async fn seed_source(db: &DatabaseConnection) -> Result<()> {
     .insert(db)
     .await?;
     for status in ["completed", "processing"] {
-        cr::tasks::ActiveModel {
+        cloudreve_schema::tasks::ActiveModel {
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
@@ -219,19 +219,19 @@ pub(super) async fn seed_extra_blob_entities(
     count: usize,
 ) -> Result<Vec<i64>> {
     let now = chrono::Utc::now().fixed_offset();
-    let policy_id = cr::storage_policies::Entity::find()
+    let policy_id = cloudreve_schema::storage_policies::Entity::find()
         .one(db)
         .await?
         .expect("seeded storage policy")
         .id;
-    let user_id = cr::users::Entity::find()
+    let user_id = cloudreve_schema::users::Entity::find()
         .one(db)
         .await?
         .expect("seeded user")
         .id;
     let mut ids = Vec::with_capacity(count);
     for index in 0..count {
-        let entity = cr::entities::ActiveModel {
+        let entity = cloudreve_schema::entities::ActiveModel {
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
@@ -257,25 +257,25 @@ pub(super) async fn seed_extra_files(
     entity_ids: &[i64],
 ) -> Result<Vec<i64>> {
     let now = chrono::Utc::now().fixed_offset();
-    let policy_id = cr::storage_policies::Entity::find()
+    let policy_id = cloudreve_schema::storage_policies::Entity::find()
         .one(db)
         .await?
         .expect("seeded storage policy")
         .id;
-    let user_id = cr::users::Entity::find()
+    let user_id = cloudreve_schema::users::Entity::find()
         .one(db)
         .await?
         .expect("seeded user")
         .id;
-    let folder_id = cr::files::Entity::find()
-        .filter(cr::files::Column::Type.eq(1))
+    let folder_id = cloudreve_schema::files::Entity::find()
+        .filter(cloudreve_schema::files::Column::Type.eq(1))
         .one(db)
         .await?
         .expect("seeded folder")
         .id;
     let mut ids = Vec::with_capacity(entity_ids.len());
     for (index, entity_id) in entity_ids.iter().copied().enumerate() {
-        let file = cr::files::ActiveModel {
+        let file = cloudreve_schema::files::ActiveModel {
             created_at: Set(now),
             updated_at: Set(now),
             r#type: Set(0),
@@ -291,7 +291,7 @@ pub(super) async fn seed_extra_files(
         }
         .insert(db)
         .await?;
-        cr::file_entities::ActiveModel {
+        cloudreve_schema::file_entities::ActiveModel {
             file_id: Set(file.id),
             entity_id: Set(entity_id),
         }
@@ -300,7 +300,7 @@ pub(super) async fn seed_extra_files(
         ids.push(file.id);
     }
     if entity_ids.len() >= 2 {
-        cr::file_entities::ActiveModel {
+        cloudreve_schema::file_entities::ActiveModel {
             file_id: Set(ids[0]),
             entity_id: Set(entity_ids[1]),
         }

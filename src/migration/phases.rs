@@ -29,7 +29,7 @@ pub(super) async fn migrate_policies(
         } else {
             String::new()
         };
-        let model = ad::storage_policy::ActiveModel {
+        let model = aster_drive_schema::entities::storage_policy::ActiveModel {
             name: Set(policy.name.clone()),
             driver_type: Set(driver_type),
             endpoint: Set(policy.server.clone().unwrap_or_default()),
@@ -65,7 +65,7 @@ pub(super) async fn migrate_policy_groups(
     report: &mut MigrationReport,
 ) -> Result<()> {
     for group in &source.groups {
-        let target_group = ad::storage_policy_group::ActiveModel {
+        let target_group = aster_drive_schema::entities::storage_policy_group::ActiveModel {
             name: Set(group.name.clone()),
             description: Set(format!("Migrated from Cloudreve group {}", group.id)),
             is_enabled: Set(true),
@@ -83,7 +83,7 @@ pub(super) async fn migrate_policy_groups(
         if let Some(source_policy_id) = group.storage_policy_id
             && let Some(target_policy_id) = context.policies.get(&source_policy_id)
         {
-            ad::storage_policy_group_item::ActiveModel {
+            aster_drive_schema::entities::storage_policy_group_item::ActiveModel {
                 group_id: Set(target_group.id),
                 policy_id: Set(*target_policy_id),
                 priority: Set(0),
@@ -107,7 +107,7 @@ pub(super) async fn migrate_users(
     context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
-    let groups: HashMap<i64, &cr::groups::Model> = source
+    let groups: HashMap<i64, &cloudreve_schema::groups::Model> = source
         .groups
         .iter()
         .map(|group| (group.id, group))
@@ -126,7 +126,7 @@ pub(super) async fn migrate_users(
         } else {
             "disabled"
         };
-        let target = ad::user::ActiveModel {
+        let target = aster_drive_schema::entities::user::ActiveModel {
             username: Set(username.clone()),
             email: Set(user.email.clone()),
             password_hash: Set(password_hash.to_string()),
@@ -167,7 +167,7 @@ pub(super) async fn migrate_users(
         } else {
             "upload"
         };
-        ad::user_profile::ActiveModel {
+        aster_drive_schema::entities::user_profile::ActiveModel {
             user_id: Set(target.id),
             display_name: Set(Some(user.nick.clone())),
             wopi_user_info: Set(None),
@@ -198,7 +198,7 @@ pub(super) async fn migrate_folders(
     context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
-    let mut pending: Vec<&cr::files::Model> = source
+    let mut pending: Vec<&cloudreve_schema::files::Model> = source
         .folders
         .iter()
         .filter(|file| file.r#type == 1)
@@ -228,7 +228,7 @@ pub(super) async fn migrate_folders(
                 );
                 continue;
             };
-            let target = ad::folder::ActiveModel {
+            let target = aster_drive_schema::entities::folder::ActiveModel {
                 name: Set(folder.name.clone()),
                 parent_id: Set(parent.and_then(|id| context.folders.get(&id).copied())),
                 team_id: Set(None),
@@ -265,7 +265,7 @@ pub(super) async fn migrate_folders(
 
 pub(super) async fn migrate_blob_batch(
     transaction: &DatabaseTransaction,
-    entities: &[cr::entities::Model],
+    entities: &[cloudreve_schema::entities::Model],
     reference_counts: &HashMap<i64, i64>,
     thumbnail_paths: &HashMap<i64, String>,
     copied_local_objects: &HashMap<i64, CopiedLocalObject>,
@@ -297,7 +297,7 @@ pub(super) async fn migrate_blob_batch(
         } else {
             thumbnail_paths.get(&entity.id).cloned()
         };
-        let target = ad::file_blob::ActiveModel {
+        let target = aster_drive_schema::entities::file_blob::ActiveModel {
             hash: Set(copied_local_object
                 .map(|object| object.sha256.clone())
                 .unwrap_or_else(|| opaque_blob_key(entity.id))),
@@ -325,9 +325,9 @@ pub(super) async fn migrate_blob_batch(
 
 pub(super) async fn migrate_file_batch(
     transaction: &DatabaseTransaction,
-    files: &[cr::files::Model],
+    files: &[cloudreve_schema::files::Model],
     associations: &HashMap<i64, Vec<i64>>,
-    entities: &HashMap<i64, cr::entities::Model>,
+    entities: &HashMap<i64, cloudreve_schema::entities::Model>,
     blob_mappings: &HashMap<i64, i64>,
     context: &MigrationContext,
     report: &mut MigrationReport,
@@ -350,7 +350,7 @@ pub(super) async fn migrate_file_batch(
             );
             continue;
         };
-        let mut version_entities: Vec<&cr::entities::Model> = associations
+        let mut version_entities: Vec<&cloudreve_schema::entities::Model> = associations
             .get(&file.id)
             .into_iter()
             .flatten()
@@ -375,7 +375,7 @@ pub(super) async fn migrate_file_batch(
         };
         let blob_id = blob_mappings[&primary_entity_id];
         let (mime_type, compound_extension, extension, category) = file_classification(&file.name);
-        let target = ad::file::ActiveModel {
+        let target = aster_drive_schema::entities::file::ActiveModel {
             name: Set(file.name.clone()),
             folder_id: Set(file
                 .file_children
@@ -407,12 +407,12 @@ pub(super) async fn migrate_file_batch(
         mappings.push((file.id, target.id));
         report.migrated_files += 1;
 
-        let historical: Vec<&cr::entities::Model> = version_entities
+        let historical: Vec<&cloudreve_schema::entities::Model> = version_entities
             .into_iter()
             .filter(|entity| entity.id != primary_entity_id)
             .collect();
         for (index, entity) in historical.into_iter().enumerate() {
-            ad::file_version::ActiveModel {
+            aster_drive_schema::entities::file_version::ActiveModel {
                 file_id: Set(target.id),
                 blob_id: Set(blob_mappings[&entity.id]),
                 version: Set(i32::try_from(index + 1).wrap_err("file version exceeds i32")?),
@@ -496,7 +496,7 @@ pub(super) async fn migrate_metadata(
             let tag_id = match tags.get(&(owner_user_id, normalized_name.clone())) {
                 Some(tag_id) => *tag_id,
                 None => {
-                    let tag = ad::tag::ActiveModel {
+                    let tag = aster_drive_schema::entities::tag::ActiveModel {
                         scope_type: Set(TagScopeType::Personal),
                         owner_user_id: Set(Some(owner_user_id)),
                         team_id: Set(None),
@@ -516,7 +516,7 @@ pub(super) async fn migrate_metadata(
                     tag.id
                 }
             };
-            ad::entity_property::ActiveModel {
+            aster_drive_schema::entities::entity_property::ActiveModel {
                 entity_type: Set(entity_type),
                 entity_id: Set(entity_id),
                 namespace: Set("system.tags".to_string()),
@@ -545,7 +545,7 @@ pub(super) async fn migrate_metadata(
         } else {
             "cloudreve.private"
         };
-        ad::entity_property::ActiveModel {
+        aster_drive_schema::entities::entity_property::ActiveModel {
             entity_type: Set(entity_type),
             entity_id: Set(entity_id),
             namespace: Set(namespace.to_string()),
@@ -631,7 +631,7 @@ pub(super) async fn migrate_direct_links(
             continue;
         };
         let url = direct_link_url(file_id, owner_user_id, &source_file.name, secret)?;
-        ad::entity_property::ActiveModel {
+        aster_drive_schema::entities::entity_property::ActiveModel {
             entity_type: Set(EntityType::File),
             entity_id: Set(file_id),
             namespace: Set("cloudreve.direct_links".to_string()),
@@ -719,7 +719,7 @@ pub(super) async fn migrate_tasks(
             .updated_at
             .checked_add_signed(chrono::Duration::days(36_500))
             .unwrap_or(task.updated_at);
-        let target = ad::background_task::ActiveModel {
+        let target = aster_drive_schema::entities::background_task::ActiveModel {
             kind: Set(BackgroundTaskKind::SystemRuntime),
             status: Set(status),
             creator_user_id: Set(task
@@ -820,7 +820,7 @@ pub(super) async fn migrate_shares(
             .remain_downloads
             .map(|remaining| share.downloads.saturating_add(remaining))
             .unwrap_or(0);
-        let target = ad::share::ActiveModel {
+        let target = aster_drive_schema::entities::share::ActiveModel {
             token: Set(share_token(share.id)),
             user_id: Set(user_id),
             team_id: Set(None),
@@ -847,15 +847,15 @@ pub(super) async fn migrate_shares(
 pub(super) async fn load_source_files(
     source_db: &DatabaseConnection,
     source_ids: &[i64],
-) -> Result<HashMap<i64, cr::files::Model>> {
+) -> Result<HashMap<i64, cloudreve_schema::files::Model>> {
     const QUERY_ID_BATCH_SIZE: usize = 500;
 
     let source_ids = source_ids.iter().copied().collect::<HashSet<_>>();
     let mut files = HashMap::with_capacity(source_ids.len());
     let source_ids = source_ids.into_iter().collect::<Vec<_>>();
     for source_ids in source_ids.chunks(QUERY_ID_BATCH_SIZE) {
-        for file in cr::files::Entity::find()
-            .filter(cr::files::Column::Id.is_in(source_ids.iter().copied()))
+        for file in cloudreve_schema::files::Entity::find()
+            .filter(cloudreve_schema::files::Column::Id.is_in(source_ids.iter().copied()))
             .all(source_db)
             .await?
         {
@@ -866,8 +866,8 @@ pub(super) async fn load_source_files(
 }
 
 pub(super) fn associations(
-    files: &[cr::files::Model],
-    file_entities: &[cr::file_entities::Model],
+    files: &[cloudreve_schema::files::Model],
+    file_entities: &[cloudreve_schema::file_entities::Model],
 ) -> HashMap<i64, Vec<i64>> {
     let mut result: HashMap<i64, Vec<i64>> = HashMap::new();
     for relation in file_entities {

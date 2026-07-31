@@ -17,7 +17,7 @@ async fn preflight_rejects_orphan_source_relations() -> Result<()> {
     source
         .execute_unprepared("PRAGMA foreign_keys = OFF")
         .await?;
-    cr::file_entities::ActiveModel {
+    cloudreve_schema::file_entities::ActiveModel {
         file_id: Set(999_001),
         entity_id: Set(999_002),
     }
@@ -102,15 +102,57 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
     assert_eq!(report.tag_assignments[0].target_entity_type, "file");
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::user::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::folder::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::file::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::file_blob::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::share::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::tag::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::background_task::Entity::find().count(&target).await?, 2);
-    assert_eq!(ad::entity_property::Entity::find().count(&target).await?, 3);
-    let properties = ad::entity_property::Entity::find().all(&target).await?;
+    assert_eq!(
+        aster_drive_schema::entities::user::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::folder::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::file::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::file_blob::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::share::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::tag::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::background_task::Entity::find()
+            .count(&target)
+            .await?,
+        2
+    );
+    assert_eq!(
+        aster_drive_schema::entities::entity_property::Entity::find()
+            .count(&target)
+            .await?,
+        3
+    );
+    let properties = aster_drive_schema::entities::entity_property::Entity::find()
+        .all(&target)
+        .await?;
     assert!(
         properties
             .iter()
@@ -122,7 +164,9 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
         .and_then(|property| property.value.as_deref())
         .expect("migrated direct link mapping");
     assert!(direct_link.contains("/d/v2."));
-    let tasks = ad::background_task::Entity::find().all(&target).await?;
+    let tasks = aster_drive_schema::entities::background_task::Entity::find()
+        .all(&target)
+        .await?;
     assert!(tasks.iter().all(|task| {
         matches!(task.status.as_str(), "succeeded" | "failed" | "canceled")
             && task.kind == BackgroundTaskKind::SystemRuntime
@@ -138,10 +182,17 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
             .iter()
             .any(|task| task.status == BackgroundTaskStatus::Canceled)
     );
-    let blob = ad::file_blob::Entity::find().one(&target).await?.unwrap();
+    let blob = aster_drive_schema::entities::file_blob::Entity::find()
+        .one(&target)
+        .await?
+        .unwrap();
     assert_eq!(blob.storage_path, "uploads/object.bin");
-    let files = ad::file::Entity::find().all(&target).await?;
-    let versions = ad::file_version::Entity::find().all(&target).await?;
+    let files = aster_drive_schema::entities::file::Entity::find()
+        .all(&target)
+        .await?;
+    let versions = aster_drive_schema::entities::file_version::Entity::find()
+        .all(&target)
+        .await?;
     let expected_ref_count = i32::try_from(
         files.iter().filter(|file| file.blob_id == blob.id).count()
             + versions
@@ -150,7 +201,10 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
                 .count(),
     )?;
     assert_eq!(blob.ref_count, expected_ref_count);
-    let user = ad::user::Entity::find().one(&target).await?.unwrap();
+    let user = aster_drive_schema::entities::user::Entity::find()
+        .one(&target)
+        .await?
+        .unwrap();
     assert!(user.must_change_password);
     assert_eq!(user.role, UserRole::Admin);
     let expected_storage_used = files.iter().map(|file| file.size).sum::<i64>()
@@ -227,9 +281,24 @@ async fn resumes_from_last_completed_stage() -> Result<()> {
     assert!(error.to_string().contains(&run_id));
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::storage_policy::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::user::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::folder::Entity::find().count(&target).await?, 0);
+    assert_eq!(
+        aster_drive_schema::entities::storage_policy::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::user::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::folder::Entity::find()
+            .count(&target)
+            .await?,
+        0
+    );
     let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
         .one(&target)
         .await?
@@ -256,9 +325,24 @@ async fn resumes_from_last_completed_stage() -> Result<()> {
     assert_eq!(report.migrated_folders, 1);
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::user::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::folder::Entity::find().count(&target).await?, 1);
-    assert_eq!(ad::file::Entity::find().count(&target).await?, 1);
+    assert_eq!(
+        aster_drive_schema::entities::user::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::folder::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::file::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
     let completed_checkpoint = checkpoint::Entity::find_by_id(run_id)
         .one(&target)
         .await?
@@ -329,7 +413,12 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
     assert!(error.to_string().contains("blobs"));
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::file_blob::Entity::find().count(&target).await?, 2);
+    assert_eq!(
+        aster_drive_schema::entities::file_blob::Entity::find()
+            .count(&target)
+            .await?,
+        2
+    );
     let cursor = checkpoint::load_stage_cursor(&target, &run_id, "blobs")
         .await?
         .expect("committed blob cursor");
@@ -370,7 +459,12 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
     assert!(report.validation.passed);
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::file_blob::Entity::find().count(&target).await?, 4);
+    assert_eq!(
+        aster_drive_schema::entities::file_blob::Entity::find()
+            .count(&target)
+            .await?,
+        4
+    );
     assert_eq!(
         checkpoint::object_map::Entity::find()
             .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
@@ -444,8 +538,18 @@ async fn resumes_files_from_last_committed_batch() -> Result<()> {
     assert!(error.to_string().contains("files"));
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::file::Entity::find().count(&target).await?, 2);
-    assert_eq!(ad::file_version::Entity::find().count(&target).await?, 1);
+    assert_eq!(
+        aster_drive_schema::entities::file::Entity::find()
+            .count(&target)
+            .await?,
+        2
+    );
+    assert_eq!(
+        aster_drive_schema::entities::file_version::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
     let cursor = checkpoint::load_stage_cursor(&target, &run_id, "files")
         .await?
         .expect("committed file cursor");
@@ -488,8 +592,18 @@ async fn resumes_files_from_last_committed_batch() -> Result<()> {
     assert!(report.validation.passed);
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::file::Entity::find().count(&target).await?, 4);
-    assert_eq!(ad::file_version::Entity::find().count(&target).await?, 1);
+    assert_eq!(
+        aster_drive_schema::entities::file::Entity::find()
+            .count(&target)
+            .await?,
+        4
+    );
+    assert_eq!(
+        aster_drive_schema::entities::file_version::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
     assert_eq!(
         checkpoint::object_map::Entity::find()
             .filter(checkpoint::object_map::Column::RunId.eq(&run_id))

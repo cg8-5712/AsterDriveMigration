@@ -1,16 +1,14 @@
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde_json::Value;
 
-use cloudreve_entities as cr;
-
 const S3_COMPATIBLE_DRIVERS: &[&str] = &["s3", "oss", "ks3", "obs", "cos"];
 
-pub(super) fn supports_s3_validation(policy: &cr::storage_policies::Model) -> bool {
+pub(super) fn supports_s3_validation(policy: &cloudreve_schema::storage_policies::Model) -> bool {
     S3_COMPATIBLE_DRIVERS.contains(&policy.r#type.as_str()) && !encryption_enabled(policy)
 }
 
 pub(super) async fn verify_object(
-    policy: &cr::storage_policies::Model,
+    policy: &cloudreve_schema::storage_policies::Model,
     storage_path: &str,
     expected_size: i64,
     entity_id: i64,
@@ -65,7 +63,7 @@ pub(super) async fn verify_object(
     Ok(())
 }
 
-fn client(policy: &cr::storage_policies::Model) -> Result<aws_sdk_s3::Client> {
+fn client(policy: &cloudreve_schema::storage_policies::Model) -> Result<aws_sdk_s3::Client> {
     let endpoint = required(&policy.server, "endpoint", policy.id)?;
     let access_key = required(&policy.access_key, "access key", policy.id)?;
     let secret_key = required(&policy.secret_key, "secret key", policy.id)?;
@@ -89,7 +87,7 @@ fn client(policy: &cr::storage_policies::Model) -> Result<aws_sdk_s3::Client> {
 }
 
 fn storage_region(
-    policy: &cr::storage_policies::Model,
+    policy: &cloudreve_schema::storage_policies::Model,
     endpoint: &str,
     settings: &Value,
 ) -> Result<String> {
@@ -112,7 +110,7 @@ fn storage_region(
     Ok("us-east-1".to_string())
 }
 
-fn force_path_style(policy: &cr::storage_policies::Model, settings: &Value) -> bool {
+fn force_path_style(policy: &cloudreve_schema::storage_policies::Model, settings: &Value) -> bool {
     if policy.r#type == "cos" {
         // Tencent COS recommends virtual-hosted-style URLs, and newer buckets require them.
         false
@@ -141,7 +139,7 @@ fn cos_region_from_endpoint(endpoint: &str) -> Option<String> {
     (suffix == ["myqcloud", "com"] && !region.is_empty()).then(|| region.to_string())
 }
 
-fn encryption_enabled(policy: &cr::storage_policies::Model) -> bool {
+fn encryption_enabled(policy: &cloudreve_schema::storage_policies::Model) -> bool {
     policy
         .settings
         .as_ref()
@@ -163,7 +161,7 @@ mod tests {
 
     #[test]
     fn only_allows_supported_s3_compatible_drivers() {
-        let mut policy = cr::storage_policies::Model {
+        let mut policy = cloudreve_schema::storage_policies::Model {
             id: 1,
             created_at: chrono::Utc::now().fixed_offset(),
             updated_at: chrono::Utc::now().fixed_offset(),
@@ -193,7 +191,7 @@ mod tests {
 
     #[test]
     fn derives_cos_region_and_uses_virtual_hosted_style() -> Result<()> {
-        let policy = cr::storage_policies::Model {
+        let policy = cloudreve_schema::storage_policies::Model {
             id: 7,
             created_at: chrono::Utc::now().fixed_offset(),
             updated_at: chrono::Utc::now().fixed_offset(),

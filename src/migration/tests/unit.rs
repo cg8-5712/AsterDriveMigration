@@ -21,7 +21,7 @@ fn maps_supported_storage_drivers_conservatively() {
 }
 
 #[test]
-fn parses_and_normalizes_cloudreve_tags_for_ad() {
+fn parses_and_normalizes_cloudreve_tags_for_aster_drive() {
     assert_eq!(tag_name("tag:Important"), Some("Important"));
     assert_eq!(tag_name("tag:  Project A  "), Some("Project A"));
     assert_eq!(tag_name("author"), None);

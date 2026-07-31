@@ -14,7 +14,7 @@ async fn reuses_and_verifies_local_storage_per_policy_root() -> Result<()> {
     let source = Database::connect(&source_url).await?;
     create_source_schema(&source).await?;
     seed_source(&source).await?;
-    let source_policy_id = cr::storage_policies::Entity::find()
+    let source_policy_id = cloudreve_schema::storage_policies::Entity::find()
         .one(&source)
         .await?
         .expect("seeded storage policy")
@@ -55,7 +55,7 @@ async fn reuses_and_verifies_local_storage_per_policy_root() -> Result<()> {
     assert!(report.validation.passed);
 
     let target = Database::connect(&target_url).await?;
-    let policy = ad::storage_policy::Entity::find()
+    let policy = aster_drive_schema::entities::storage_policy::Entity::find()
         .one(&target)
         .await?
         .expect("migrated storage policy");
@@ -81,7 +81,7 @@ async fn rejects_local_storage_size_mismatch() -> Result<()> {
     let source = Database::connect(&source_url).await?;
     create_source_schema(&source).await?;
     seed_source(&source).await?;
-    let source_policy_id = cr::storage_policies::Entity::find()
+    let source_policy_id = cloudreve_schema::storage_policies::Entity::find()
         .one(&source)
         .await?
         .expect("seeded storage policy")
@@ -123,7 +123,12 @@ async fn rejects_local_storage_size_mismatch() -> Result<()> {
     assert!(format!("{error:?}").contains("size mismatch"));
 
     let target = Database::connect(&target_url).await?;
-    assert_eq!(ad::storage_policy::Entity::find().count(&target).await?, 0);
+    assert_eq!(
+        aster_drive_schema::entities::storage_policy::Entity::find()
+            .count(&target)
+            .await?,
+        0
+    );
     target.close().await?;
 
     let _ = std::fs::remove_file(source_path);
@@ -226,7 +231,7 @@ async fn copies_local_objects_to_target_root_and_uses_content_hashes() -> Result
     let source = Database::connect(&source_url).await?;
     create_source_schema(&source).await?;
     seed_source(&source).await?;
-    let source_policy_id = cr::storage_policies::Entity::find()
+    let source_policy_id = cloudreve_schema::storage_policies::Entity::find()
         .one(&source)
         .await?
         .expect("seeded storage policy")
@@ -276,12 +281,12 @@ async fn copies_local_objects_to_target_root_and_uses_content_hashes() -> Result
     );
 
     let target = Database::connect(&target_url).await?;
-    let policy = ad::storage_policy::Entity::find()
+    let policy = aster_drive_schema::entities::storage_policy::Entity::find()
         .one(&target)
         .await?
         .expect("copied local policy");
     assert_eq!(policy.base_path, target_root.to_string_lossy());
-    let blob = ad::file_blob::Entity::find()
+    let blob = aster_drive_schema::entities::file_blob::Entity::find()
         .one(&target)
         .await?
         .expect("copied blob");
@@ -319,7 +324,7 @@ async fn compensates_copied_local_objects_when_blob_database_write_fails() -> Re
     let source = Database::connect(&source_url).await?;
     create_source_schema(&source).await?;
     seed_source(&source).await?;
-    let source_policy_id = cr::storage_policies::Entity::find()
+    let source_policy_id = cloudreve_schema::storage_policies::Entity::find()
         .one(&source)
         .await?
         .expect("seeded storage policy")

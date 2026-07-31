@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use aster_drive_model::entities as ad;
+use aster_drive_model as aster_drive_schema;
 use aster_drive_model::types::{
     AvatarSource, BackgroundTaskKind, BackgroundTaskStatus, DriverType, EntityType,
     StoredStoragePolicyAllowedTypes, StoredStoragePolicyOptions, StoredTaskPayload,
@@ -25,7 +25,6 @@ use aster_drive_model::types::{
     UserStatus,
 };
 use aster_drive_schema_migration::{MigrationTrack, inspect_migration_history};
-use cloudreve_entities as cr;
 
 fn target_time(value: chrono::DateTime<chrono::FixedOffset>) -> chrono::DateTime<chrono::Utc> {
     value.with_timezone(&chrono::Utc)
@@ -978,13 +977,13 @@ async fn migrate_blobs_batched(
     let started_at = Instant::now();
 
     loop {
-        let mut query = cr::entities::Entity::find()
-            .filter(cr::entities::Column::Type.eq(0))
-            .filter(cr::entities::Column::Id.gt(cursor_value))
-            .order_by_asc(cr::entities::Column::Id)
+        let mut query = cloudreve_schema::entities::Entity::find()
+            .filter(cloudreve_schema::entities::Column::Type.eq(0))
+            .filter(cloudreve_schema::entities::Column::Id.gt(cursor_value))
+            .order_by_asc(cloudreve_schema::entities::Column::Id)
             .limit(inputs.options.blob_batch_size as u64);
         if !inputs.source_data.include_deleted {
-            query = query.filter(cr::entities::Column::DeletedAt.is_null());
+            query = query.filter(cloudreve_schema::entities::Column::DeletedAt.is_null());
         }
         let entities = query.all(inputs.source).await?;
         if entities.is_empty() {
@@ -1125,10 +1124,10 @@ async fn migrate_files_batched(
     let started_at = Instant::now();
 
     loop {
-        let files = cr::files::Entity::find()
-            .filter(cr::files::Column::Type.eq(0))
-            .filter(cr::files::Column::Id.gt(cursor_value))
-            .order_by_asc(cr::files::Column::Id)
+        let files = cloudreve_schema::files::Entity::find()
+            .filter(cloudreve_schema::files::Column::Type.eq(0))
+            .filter(cloudreve_schema::files::Column::Id.gt(cursor_value))
+            .order_by_asc(cloudreve_schema::files::Column::Id)
             .limit(inputs.options.file_batch_size as u64)
             .all(inputs.source)
             .await?;
@@ -1208,16 +1207,21 @@ async fn migrate_files_batched(
 async fn load_file_batch_data(
     source: &DatabaseConnection,
     include_deleted: bool,
-    files: &[cr::files::Model],
-) -> Result<(HashMap<i64, Vec<i64>>, HashMap<i64, cr::entities::Model>)> {
+    files: &[cloudreve_schema::files::Model],
+) -> Result<(
+    HashMap<i64, Vec<i64>>,
+    HashMap<i64, cloudreve_schema::entities::Model>,
+)> {
     const QUERY_ID_BATCH_SIZE: usize = 500;
 
     let file_ids = files.iter().map(|file| file.id).collect::<Vec<_>>();
     let mut file_entities = Vec::new();
     for file_ids in file_ids.chunks(QUERY_ID_BATCH_SIZE) {
         file_entities.extend(
-            cr::file_entities::Entity::find()
-                .filter(cr::file_entities::Column::FileId.is_in(file_ids.iter().copied()))
+            cloudreve_schema::file_entities::Entity::find()
+                .filter(
+                    cloudreve_schema::file_entities::Column::FileId.is_in(file_ids.iter().copied()),
+                )
                 .all(source)
                 .await?,
         );
@@ -1230,11 +1234,11 @@ async fn load_file_batch_data(
     let entity_ids = entity_ids.into_iter().collect::<Vec<_>>();
     let mut entities = HashMap::with_capacity(entity_ids.len());
     for entity_ids in entity_ids.chunks(QUERY_ID_BATCH_SIZE) {
-        let mut query = cr::entities::Entity::find()
-            .filter(cr::entities::Column::Id.is_in(entity_ids.iter().copied()))
-            .filter(cr::entities::Column::Type.eq(0));
+        let mut query = cloudreve_schema::entities::Entity::find()
+            .filter(cloudreve_schema::entities::Column::Id.is_in(entity_ids.iter().copied()))
+            .filter(cloudreve_schema::entities::Column::Type.eq(0));
         if !include_deleted {
-            query = query.filter(cr::entities::Column::DeletedAt.is_null());
+            query = query.filter(cloudreve_schema::entities::Column::DeletedAt.is_null());
         }
         for entity in query.all(source).await? {
             entities.insert(entity.id, entity);
@@ -1258,12 +1262,12 @@ async fn load_blob_association_info(
             thumbnail_paths: HashMap::new(),
         });
     }
-    let relations = cr::file_entities::Entity::find()
-        .filter(cr::file_entities::Column::EntityId.is_in(blob_ids.iter().copied()))
+    let relations = cloudreve_schema::file_entities::Entity::find()
+        .filter(cloudreve_schema::file_entities::Column::EntityId.is_in(blob_ids.iter().copied()))
         .all(source)
         .await?;
-    let primary_files = cr::files::Entity::find()
-        .filter(cr::files::Column::PrimaryEntity.is_in(blob_ids.iter().copied()))
+    let primary_files = cloudreve_schema::files::Entity::find()
+        .filter(cloudreve_schema::files::Column::PrimaryEntity.is_in(blob_ids.iter().copied()))
         .all(source)
         .await?;
     let file_ids = relations
@@ -1277,17 +1281,17 @@ async fn load_blob_association_info(
             thumbnail_paths: HashMap::new(),
         });
     }
-    let all_relations = cr::file_entities::Entity::find()
-        .filter(cr::file_entities::Column::FileId.is_in(file_ids.iter().copied()))
+    let all_relations = cloudreve_schema::file_entities::Entity::find()
+        .filter(cloudreve_schema::file_entities::Column::FileId.is_in(file_ids.iter().copied()))
         .all(source)
         .await?;
     let thumbnail_ids = all_relations
         .iter()
         .map(|relation| relation.entity_id)
         .collect::<HashSet<_>>();
-    let thumbnails = cr::entities::Entity::find()
-        .filter(cr::entities::Column::Id.is_in(thumbnail_ids.iter().copied()))
-        .filter(cr::entities::Column::Type.eq(1))
+    let thumbnails = cloudreve_schema::entities::Entity::find()
+        .filter(cloudreve_schema::entities::Column::Id.is_in(thumbnail_ids.iter().copied()))
+        .filter(cloudreve_schema::entities::Column::Type.eq(1))
         .all(source)
         .await?
         .into_iter()
@@ -1550,7 +1554,7 @@ impl CopiedLocalBatch {
 }
 
 fn copy_local_blob_batch(
-    entities: &[cr::entities::Model],
+    entities: &[cloudreve_schema::entities::Model],
     source: &SourceData,
     options: &MigrationOptions,
     context: &MigrationContext,
@@ -1868,13 +1872,13 @@ async fn verify_all_local_source_objects(
         .collect::<HashMap<_, _>>();
     let mut cursor_value = 0;
     loop {
-        let mut query = cr::entities::Entity::find()
-            .filter(cr::entities::Column::Type.eq(0))
-            .filter(cr::entities::Column::Id.gt(cursor_value))
-            .order_by_asc(cr::entities::Column::Id)
+        let mut query = cloudreve_schema::entities::Entity::find()
+            .filter(cloudreve_schema::entities::Column::Type.eq(0))
+            .filter(cloudreve_schema::entities::Column::Id.gt(cursor_value))
+            .order_by_asc(cloudreve_schema::entities::Column::Id)
             .limit(VERIFY_BATCH_SIZE);
         if !source.include_deleted {
-            query = query.filter(cr::entities::Column::DeletedAt.is_null());
+            query = query.filter(cloudreve_schema::entities::Column::DeletedAt.is_null());
         }
         let entities = query.all(source_db).await?;
         let Some(last_entity) = entities.last() else {
@@ -1899,7 +1903,7 @@ async fn verify_all_local_source_objects(
 }
 
 fn verify_local_blob_batch(
-    entities: &[cr::entities::Model],
+    entities: &[cloudreve_schema::entities::Model],
     source: &SourceData,
     options: &MigrationOptions,
     context: &MigrationContext,
@@ -1941,13 +1945,13 @@ async fn verify_all_remote_source_objects(
         .collect::<HashMap<_, _>>();
     let mut cursor_value = 0;
     loop {
-        let mut query = cr::entities::Entity::find()
-            .filter(cr::entities::Column::Type.eq(0))
-            .filter(cr::entities::Column::Id.gt(cursor_value))
-            .order_by_asc(cr::entities::Column::Id)
+        let mut query = cloudreve_schema::entities::Entity::find()
+            .filter(cloudreve_schema::entities::Column::Type.eq(0))
+            .filter(cloudreve_schema::entities::Column::Id.gt(cursor_value))
+            .order_by_asc(cloudreve_schema::entities::Column::Id)
             .limit(VERIFY_BATCH_SIZE);
         if !source.include_deleted {
-            query = query.filter(cr::entities::Column::DeletedAt.is_null());
+            query = query.filter(cloudreve_schema::entities::Column::DeletedAt.is_null());
         }
         let entities = query.all(source_db).await?;
         let Some(last_entity) = entities.last() else {
@@ -1966,7 +1970,7 @@ async fn verify_all_remote_source_objects(
 }
 
 async fn verify_remote_blob_batch(
-    entities: &[cr::entities::Model],
+    entities: &[cloudreve_schema::entities::Model],
     source: &SourceData,
     _options: &MigrationOptions,
     context: &MigrationContext,
@@ -1994,8 +1998,8 @@ async fn verify_remote_blob_batch(
 }
 
 fn verify_local_entity(
-    entity: &cr::entities::Model,
-    policy: &cr::storage_policies::Model,
+    entity: &cloudreve_schema::entities::Model,
+    policy: &cloudreve_schema::storage_policies::Model,
     options: &MigrationOptions,
 ) -> Result<()> {
     let root = local_policy_root(options, policy.id);
@@ -2061,27 +2065,27 @@ async fn validate_target_schema(db: &DatabaseConnection) -> Result<()> {
             "AsterDrive target database {status}; apply the migrations from the matching aster_drive_migration dependency before importing data"
         );
     }
-    ad::user::Entity::find()
+    aster_drive_schema::entities::user::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive schema is unavailable; run AD database migrations first")?;
-    ad::storage_policy::Entity::find()
+    aster_drive_schema::entities::storage_policy::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive storage_policies table is unavailable")?;
-    ad::file::Entity::find()
+    aster_drive_schema::entities::file::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive files table is unavailable")?;
-    ad::entity_property::Entity::find()
+    aster_drive_schema::entities::entity_property::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive entity_properties table is unavailable")?;
-    ad::tag::Entity::find()
+    aster_drive_schema::entities::tag::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive tags table is unavailable")?;
-    ad::background_task::Entity::find()
+    aster_drive_schema::entities::background_task::Entity::find()
         .count(db)
         .await
         .wrap_err("AsterDrive background_tasks table is unavailable")?;
@@ -2095,33 +2099,75 @@ async fn ensure_target_safe(db: &DatabaseConnection, allow_non_empty: bool) -> R
     let counts = [
         (
             "storage_policies",
-            ad::storage_policy::Entity::find().count(db).await?,
+            aster_drive_schema::entities::storage_policy::Entity::find()
+                .count(db)
+                .await?,
         ),
         (
             "storage_policy_groups",
-            ad::storage_policy_group::Entity::find().count(db).await?,
+            aster_drive_schema::entities::storage_policy_group::Entity::find()
+                .count(db)
+                .await?,
         ),
-        ("users", ad::user::Entity::find().count(db).await?),
+        (
+            "users",
+            aster_drive_schema::entities::user::Entity::find()
+                .count(db)
+                .await?,
+        ),
         (
             "user_profiles",
-            ad::user_profile::Entity::find().count(db).await?,
+            aster_drive_schema::entities::user_profile::Entity::find()
+                .count(db)
+                .await?,
         ),
-        ("folders", ad::folder::Entity::find().count(db).await?),
-        ("files", ad::file::Entity::find().count(db).await?),
-        ("file_blobs", ad::file_blob::Entity::find().count(db).await?),
+        (
+            "folders",
+            aster_drive_schema::entities::folder::Entity::find()
+                .count(db)
+                .await?,
+        ),
+        (
+            "files",
+            aster_drive_schema::entities::file::Entity::find()
+                .count(db)
+                .await?,
+        ),
+        (
+            "file_blobs",
+            aster_drive_schema::entities::file_blob::Entity::find()
+                .count(db)
+                .await?,
+        ),
         (
             "file_versions",
-            ad::file_version::Entity::find().count(db).await?,
+            aster_drive_schema::entities::file_version::Entity::find()
+                .count(db)
+                .await?,
         ),
-        ("shares", ad::share::Entity::find().count(db).await?),
+        (
+            "shares",
+            aster_drive_schema::entities::share::Entity::find()
+                .count(db)
+                .await?,
+        ),
         (
             "entity_properties",
-            ad::entity_property::Entity::find().count(db).await?,
+            aster_drive_schema::entities::entity_property::Entity::find()
+                .count(db)
+                .await?,
         ),
-        ("tags", ad::tag::Entity::find().count(db).await?),
+        (
+            "tags",
+            aster_drive_schema::entities::tag::Entity::find()
+                .count(db)
+                .await?,
+        ),
         (
             "background_tasks",
-            ad::background_task::Entity::find().count(db).await?,
+            aster_drive_schema::entities::background_task::Entity::find()
+                .count(db)
+                .await?,
         ),
     ];
     let occupied: Vec<String> = counts
@@ -2157,18 +2203,42 @@ struct TargetCounts {
 impl TargetCounts {
     async fn load(db: &DatabaseConnection) -> Result<Self> {
         Ok(Self {
-            policies: ad::storage_policy::Entity::find().count(db).await?,
-            policy_groups: ad::storage_policy_group::Entity::find().count(db).await?,
-            users: ad::user::Entity::find().count(db).await?,
-            user_profiles: ad::user_profile::Entity::find().count(db).await?,
-            folders: ad::folder::Entity::find().count(db).await?,
-            blobs: ad::file_blob::Entity::find().count(db).await?,
-            files: ad::file::Entity::find().count(db).await?,
-            versions: ad::file_version::Entity::find().count(db).await?,
-            shares: ad::share::Entity::find().count(db).await?,
-            properties: ad::entity_property::Entity::find().count(db).await?,
-            tags: ad::tag::Entity::find().count(db).await?,
-            tasks: ad::background_task::Entity::find().count(db).await?,
+            policies: aster_drive_schema::entities::storage_policy::Entity::find()
+                .count(db)
+                .await?,
+            policy_groups: aster_drive_schema::entities::storage_policy_group::Entity::find()
+                .count(db)
+                .await?,
+            users: aster_drive_schema::entities::user::Entity::find()
+                .count(db)
+                .await?,
+            user_profiles: aster_drive_schema::entities::user_profile::Entity::find()
+                .count(db)
+                .await?,
+            folders: aster_drive_schema::entities::folder::Entity::find()
+                .count(db)
+                .await?,
+            blobs: aster_drive_schema::entities::file_blob::Entity::find()
+                .count(db)
+                .await?,
+            files: aster_drive_schema::entities::file::Entity::find()
+                .count(db)
+                .await?,
+            versions: aster_drive_schema::entities::file_version::Entity::find()
+                .count(db)
+                .await?,
+            shares: aster_drive_schema::entities::share::Entity::find()
+                .count(db)
+                .await?,
+            properties: aster_drive_schema::entities::entity_property::Entity::find()
+                .count(db)
+                .await?,
+            tags: aster_drive_schema::entities::tag::Entity::find()
+                .count(db)
+                .await?,
+            tasks: aster_drive_schema::entities::background_task::Entity::find()
+                .count(db)
+                .await?,
         })
     }
 }
@@ -2193,7 +2263,7 @@ fn add_storage_usage(
     Ok(())
 }
 
-fn file_storage_owner(file: &ad::file::Model) -> Option<StorageOwner> {
+fn file_storage_owner(file: &aster_drive_schema::entities::file::Model) -> Option<StorageOwner> {
     file.team_id
         .map(StorageOwner::Team)
         .or_else(|| file.owner_user_id.map(StorageOwner::User))
@@ -2205,9 +2275,9 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
     let mut usage = HashMap::<StorageOwner, i64>::new();
     let mut last_file_id = 0;
     loop {
-        let files = ad::file::Entity::find()
-            .filter(ad::file::Column::Id.gt(last_file_id))
-            .order_by_asc(ad::file::Column::Id)
+        let files = aster_drive_schema::entities::file::Entity::find()
+            .filter(aster_drive_schema::entities::file::Column::Id.gt(last_file_id))
+            .order_by_asc(aster_drive_schema::entities::file::Column::Id)
             .limit(INTEGRITY_BATCH_SIZE)
             .all(transaction)
             .await?;
@@ -2227,9 +2297,9 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
 
     let mut last_version_id = 0;
     loop {
-        let versions = ad::file_version::Entity::find()
-            .filter(ad::file_version::Column::Id.gt(last_version_id))
-            .order_by_asc(ad::file_version::Column::Id)
+        let versions = aster_drive_schema::entities::file_version::Entity::find()
+            .filter(aster_drive_schema::entities::file_version::Column::Id.gt(last_version_id))
+            .order_by_asc(aster_drive_schema::entities::file_version::Column::Id)
             .limit(INTEGRITY_BATCH_SIZE)
             .all(transaction)
             .await?;
@@ -2251,9 +2321,9 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
     let now = chrono::Utc::now();
     let mut last_blob_id = 0;
     loop {
-        let blobs = ad::file_blob::Entity::find()
-            .filter(ad::file_blob::Column::Id.gt(last_blob_id))
-            .order_by_asc(ad::file_blob::Column::Id)
+        let blobs = aster_drive_schema::entities::file_blob::Entity::find()
+            .filter(aster_drive_schema::entities::file_blob::Column::Id.gt(last_blob_id))
+            .order_by_asc(aster_drive_schema::entities::file_blob::Column::Id)
             .limit(INTEGRITY_BATCH_SIZE)
             .all(transaction)
             .await?;
@@ -2269,7 +2339,10 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
             }
         }
     }
-    for user in ad::user::Entity::find().all(transaction).await? {
+    for user in aster_drive_schema::entities::user::Entity::find()
+        .all(transaction)
+        .await?
+    {
         let actual = usage
             .get(&StorageOwner::User(user.id))
             .copied()
@@ -2281,7 +2354,10 @@ async fn recalculate_statistics(transaction: &DatabaseTransaction) -> Result<()>
             active.update(transaction).await?;
         }
     }
-    for team in ad::team::Entity::find().all(transaction).await? {
+    for team in aster_drive_schema::entities::team::Entity::find()
+        .all(transaction)
+        .await?
+    {
         let actual = usage
             .get(&StorageOwner::Team(team.id))
             .copied()
@@ -2320,9 +2396,11 @@ fn invariant_check(name: &str, expected: usize, actual: usize, message: &str) ->
 }
 
 async fn run_preflight(db: &DatabaseConnection, source: &SourceData) -> Result<MigrationPreflight> {
-    let files = cr::files::Entity::find().all(db).await?;
-    let entities = cr::entities::Entity::find().all(db).await?;
-    let file_entities = cr::file_entities::Entity::find().all(db).await?;
+    let files = cloudreve_schema::files::Entity::find().all(db).await?;
+    let entities = cloudreve_schema::entities::Entity::find().all(db).await?;
+    let file_entities = cloudreve_schema::file_entities::Entity::find()
+        .all(db)
+        .await?;
     let user_ids = source
         .users
         .iter()
@@ -2499,7 +2577,10 @@ async fn run_preflight(db: &DatabaseConnection, source: &SourceData) -> Result<M
     })
 }
 
-fn source_folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &cr::files::Model>) -> bool {
+fn source_folder_has_cycle(
+    folder_id: i64,
+    folders: &HashMap<i64, &cloudreve_schema::files::Model>,
+) -> bool {
     let mut visited = HashSet::new();
     let mut current = Some(folder_id);
     while let Some(id) = current {
@@ -2645,8 +2726,11 @@ async fn validate_migration_result(
     let mut imported_tasks = Vec::new();
     for chunk in task_ids.chunks(500) {
         imported_tasks.extend(
-            ad::background_task::Entity::find()
-                .filter(ad::background_task::Column::Id.is_in(chunk.iter().copied()))
+            aster_drive_schema::entities::background_task::Entity::find()
+                .filter(
+                    aster_drive_schema::entities::background_task::Column::Id
+                        .is_in(chunk.iter().copied()),
+                )
                 .all(db)
                 .await?,
         );
@@ -2671,8 +2755,8 @@ async fn validate_migration_result(
         "imported tasks must be terminal and have no active lease",
     ));
 
-    let tag_properties = ad::entity_property::Entity::find()
-        .filter(ad::entity_property::Column::Namespace.eq("system.tags"))
+    let tag_properties = aster_drive_schema::entities::entity_property::Entity::find()
+        .filter(aster_drive_schema::entities::entity_property::Column::Namespace.eq("system.tags"))
         .all(db)
         .await?;
     let tag_binding_keys = tag_properties
@@ -2699,8 +2783,11 @@ async fn validate_migration_result(
         "one or more system.tags bindings are missing",
     ));
 
-    let direct_link_properties = ad::entity_property::Entity::find()
-        .filter(ad::entity_property::Column::Namespace.eq("cloudreve.direct_links"))
+    let direct_link_properties = aster_drive_schema::entities::entity_property::Entity::find()
+        .filter(
+            aster_drive_schema::entities::entity_property::Column::Namespace
+                .eq("cloudreve.direct_links"),
+        )
         .all(db)
         .await?;
     let direct_link_values = direct_link_properties
@@ -2738,25 +2825,37 @@ async fn validate_target_integrity(
     db: &DatabaseConnection,
     options: &MigrationOptions,
 ) -> Result<Vec<ValidationCheck>> {
-    let users = ad::user::Entity::find().all(db).await?;
+    let users = aster_drive_schema::entities::user::Entity::find()
+        .all(db)
+        .await?;
     let user_ids = users.iter().map(|user| user.id).collect::<HashSet<_>>();
-    let teams = ad::team::Entity::find().all(db).await?;
+    let teams = aster_drive_schema::entities::team::Entity::find()
+        .all(db)
+        .await?;
     let team_ids = teams.iter().map(|team| team.id).collect::<HashSet<_>>();
-    let policies = ad::storage_policy::Entity::find().all(db).await?;
+    let policies = aster_drive_schema::entities::storage_policy::Entity::find()
+        .all(db)
+        .await?;
     let policies_by_id = policies
         .iter()
         .map(|policy| (policy.id, policy))
         .collect::<HashMap<_, _>>();
     let policy_ids = policies_by_id.keys().copied().collect::<HashSet<_>>();
-    let blobs = ad::file_blob::Entity::find().all(db).await?;
+    let blobs = aster_drive_schema::entities::file_blob::Entity::find()
+        .all(db)
+        .await?;
     let blob_ids = blobs.iter().map(|blob| blob.id).collect::<HashSet<_>>();
-    let folders = ad::folder::Entity::find().all(db).await?;
+    let folders = aster_drive_schema::entities::folder::Entity::find()
+        .all(db)
+        .await?;
     let folders_by_id = folders
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
     let folder_ids = folders_by_id.keys().copied().collect::<HashSet<_>>();
-    let files = ad::file::Entity::find().all(db).await?;
+    let files = aster_drive_schema::entities::file::Entity::find()
+        .all(db)
+        .await?;
     let file_ids = files.iter().map(|file| file.id).collect::<HashSet<_>>();
 
     let invalid_folders = folders
@@ -2822,7 +2921,9 @@ async fn validate_target_integrity(
         "files contain an orphan relation or invalid personal/team scope",
     ));
 
-    let versions = ad::file_version::Entity::find().all(db).await?;
+    let versions = aster_drive_schema::entities::file_version::Entity::find()
+        .all(db)
+        .await?;
     let invalid_versions = versions
         .iter()
         .filter(|version| {
@@ -2836,7 +2937,9 @@ async fn validate_target_integrity(
         "file_versions contain an orphan file or blob",
     ));
 
-    let shares = ad::share::Entity::find().all(db).await?;
+    let shares = aster_drive_schema::entities::share::Entity::find()
+        .all(db)
+        .await?;
     let invalid_shares = shares
         .iter()
         .filter(|share| {
@@ -2902,8 +3005,8 @@ async fn validate_target_integrity(
 }
 
 fn expected_statistics(
-    files: &[ad::file::Model],
-    versions: &[ad::file_version::Model],
+    files: &[aster_drive_schema::entities::file::Model],
+    versions: &[aster_drive_schema::entities::file_version::Model],
 ) -> Result<(HashMap<i64, i32>, HashMap<StorageOwner, i64>)> {
     let mut refs = HashMap::<i64, i32>::new();
     let mut usage = HashMap::new();
@@ -2930,7 +3033,10 @@ fn expected_statistics(
     Ok((refs, usage))
 }
 
-fn folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &ad::folder::Model>) -> bool {
+fn folder_has_cycle(
+    folder_id: i64,
+    folders: &HashMap<i64, &aster_drive_schema::entities::folder::Model>,
+) -> bool {
     let mut visited = HashSet::new();
     let mut current = Some(folder_id);
     while let Some(id) = current {
@@ -2943,8 +3049,8 @@ fn folder_has_cycle(folder_id: i64, folders: &HashMap<i64, &ad::folder::Model>) 
 }
 
 fn verify_local_runtime_readability(
-    blobs: &[ad::file_blob::Model],
-    policies: &HashMap<i64, &ad::storage_policy::Model>,
+    blobs: &[aster_drive_schema::entities::file_blob::Model],
+    policies: &HashMap<i64, &aster_drive_schema::entities::storage_policy::Model>,
     options: &MigrationOptions,
 ) -> ValidationCheck {
     let mut checked = 0usize;
@@ -3031,10 +3137,10 @@ fn sorted_id_mappings(values: &HashMap<i64, i64>) -> Vec<IdMapping> {
 }
 
 struct SourceData {
-    groups: Vec<cr::groups::Model>,
-    users: Vec<cr::users::Model>,
-    policies: Vec<cr::storage_policies::Model>,
-    folders: Vec<cr::files::Model>,
+    groups: Vec<cloudreve_schema::groups::Model>,
+    users: Vec<cloudreve_schema::users::Model>,
+    policies: Vec<cloudreve_schema::storage_policies::Model>,
+    folders: Vec<cloudreve_schema::files::Model>,
     source_file_records: u64,
     source_files: u64,
     symbolic_files: u64,
@@ -3042,51 +3148,59 @@ struct SourceData {
     source_blobs: u64,
     source_file_entities: u64,
     include_deleted: bool,
-    shares: Vec<cr::shares::Model>,
-    metadata: Vec<cr::metadata::Model>,
-    direct_links: Vec<cr::direct_links::Model>,
-    tasks: Vec<cr::tasks::Model>,
+    shares: Vec<cloudreve_schema::shares::Model>,
+    metadata: Vec<cloudreve_schema::metadata::Model>,
+    direct_links: Vec<cloudreve_schema::direct_links::Model>,
+    tasks: Vec<cloudreve_schema::tasks::Model>,
 }
 
 impl SourceData {
     async fn load(db: &DatabaseConnection, include_deleted: bool) -> Result<Self> {
-        let groups = cr::groups::Entity::find().all(db).await?;
-        let users = cr::users::Entity::find().all(db).await?;
-        let policies = cr::storage_policies::Entity::find().all(db).await?;
-        let folders = cr::files::Entity::find()
-            .filter(cr::files::Column::Type.eq(1))
+        let groups = cloudreve_schema::groups::Entity::find().all(db).await?;
+        let users = cloudreve_schema::users::Entity::find().all(db).await?;
+        let policies = cloudreve_schema::storage_policies::Entity::find()
             .all(db)
             .await?;
-        let source_file_records = cr::files::Entity::find().count(db).await?;
-        let source_files = cr::files::Entity::find()
-            .filter(cr::files::Column::Type.eq(0))
+        let folders = cloudreve_schema::files::Entity::find()
+            .filter(cloudreve_schema::files::Column::Type.eq(1))
+            .all(db)
+            .await?;
+        let source_file_records = cloudreve_schema::files::Entity::find().count(db).await?;
+        let source_files = cloudreve_schema::files::Entity::find()
+            .filter(cloudreve_schema::files::Column::Type.eq(0))
             .count(db)
             .await?;
-        let symbolic_files = cr::files::Entity::find()
-            .filter(cr::files::Column::Type.eq(0))
-            .filter(cr::files::Column::IsSymbolic.eq(true))
+        let symbolic_files = cloudreve_schema::files::Entity::find()
+            .filter(cloudreve_schema::files::Column::Type.eq(0))
+            .filter(cloudreve_schema::files::Column::IsSymbolic.eq(true))
             .count(db)
             .await?;
         let entity_query = if include_deleted {
-            cr::entities::Entity::find()
+            cloudreve_schema::entities::Entity::find()
         } else {
-            cr::entities::Entity::find().filter(cr::entities::Column::DeletedAt.is_null())
+            cloudreve_schema::entities::Entity::find()
+                .filter(cloudreve_schema::entities::Column::DeletedAt.is_null())
         };
         let source_entities = entity_query.count(db).await?;
         let blob_query = if include_deleted {
-            cr::entities::Entity::find()
+            cloudreve_schema::entities::Entity::find()
         } else {
-            cr::entities::Entity::find().filter(cr::entities::Column::DeletedAt.is_null())
+            cloudreve_schema::entities::Entity::find()
+                .filter(cloudreve_schema::entities::Column::DeletedAt.is_null())
         };
         let source_blobs = blob_query
-            .filter(cr::entities::Column::Type.eq(0))
+            .filter(cloudreve_schema::entities::Column::Type.eq(0))
             .count(db)
             .await?;
-        let source_file_entities = cr::file_entities::Entity::find().count(db).await?;
-        let shares = cr::shares::Entity::find().all(db).await?;
-        let metadata = cr::metadata::Entity::find().all(db).await?;
-        let direct_links = cr::direct_links::Entity::find().all(db).await?;
-        let tasks = cr::tasks::Entity::find().all(db).await?;
+        let source_file_entities = cloudreve_schema::file_entities::Entity::find()
+            .count(db)
+            .await?;
+        let shares = cloudreve_schema::shares::Entity::find().all(db).await?;
+        let metadata = cloudreve_schema::metadata::Entity::find().all(db).await?;
+        let direct_links = cloudreve_schema::direct_links::Entity::find()
+            .all(db)
+            .await?;
+        let tasks = cloudreve_schema::tasks::Entity::find().all(db).await?;
 
         Ok(Self {
             groups: filter_deleted(groups, include_deleted, |model| model.deleted_at.is_some()),
@@ -3192,7 +3306,7 @@ fn map_driver_type(source: &str) -> Option<DriverType> {
     }
 }
 
-fn unsupported_policy_reason(policy: &cr::storage_policies::Model) -> Option<String> {
+fn unsupported_policy_reason(policy: &cloudreve_schema::storage_policies::Model) -> Option<String> {
     if map_driver_type(&policy.r#type).is_none() {
         return Some(policy.r#type.clone());
     }
@@ -3210,7 +3324,9 @@ fn source_settings(value: &Option<Value>) -> Value {
     value.clone().unwrap_or_else(|| json!({}))
 }
 
-fn policy_options(policy: &cr::storage_policies::Model) -> StoredStoragePolicyOptions {
+fn policy_options(
+    policy: &cloudreve_schema::storage_policies::Model,
+) -> StoredStoragePolicyOptions {
     let settings = source_settings(&policy.settings);
     let path_style = settings
         .get("s3_path_style")
@@ -3227,7 +3343,9 @@ fn policy_options(policy: &cr::storage_policies::Model) -> StoredStoragePolicyOp
     .into()
 }
 
-fn allowed_types(policy: &cr::storage_policies::Model) -> StoredStoragePolicyAllowedTypes {
+fn allowed_types(
+    policy: &cloudreve_schema::storage_policies::Model,
+) -> StoredStoragePolicyAllowedTypes {
     source_settings(&policy.settings)
         .get("file_type")
         .cloned()
@@ -3236,14 +3354,14 @@ fn allowed_types(policy: &cr::storage_policies::Model) -> StoredStoragePolicyAll
         .into()
 }
 
-fn chunk_size(policy: &cr::storage_policies::Model) -> i64 {
+fn chunk_size(policy: &cloudreve_schema::storage_policies::Model) -> i64 {
     source_settings(&policy.settings)
         .get("chunk_size")
         .and_then(Value::as_i64)
         .unwrap_or(0)
 }
 
-fn group_is_admin(group: &cr::groups::Model) -> bool {
+fn group_is_admin(group: &cloudreve_schema::groups::Model) -> bool {
     group
         .permissions
         .first()
