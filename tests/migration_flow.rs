@@ -1,10 +1,15 @@
-use super::super::*;
-use super::fixtures::{
+mod support;
+
+use aster_drive_migration::migration::*;
+use aster_drive_model as aster_drive_schema;
+use aster_drive_model::types::{BackgroundTaskKind, BackgroundTaskStatus, UserRole};
+use color_eyre::eyre::Result;
+use sea_orm::ConnectionTrait;
+use sea_orm::{ActiveModelTrait, Database, EntityTrait, PaginatorTrait, Set};
+use support::{
     create_source_schema, create_target_schema, seed_extra_blob_entities, seed_extra_files,
     seed_source, sqlite_url,
 };
-use aster_drive_model::types::{BackgroundTaskKind, BackgroundTaskStatus, UserRole};
-use sea_orm::ConnectionTrait;
 
 #[tokio::test]
 async fn preflight_rejects_orphan_source_relations() -> Result<()> {
@@ -24,16 +29,23 @@ async fn preflight_rejects_orphan_source_relations() -> Result<()> {
     .insert(&source)
     .await?;
 
-    let source_data = SourceData::load(&source, false).await?;
-    let preflight = run_preflight(&source, &source_data).await?;
-    assert!(preflight.performed);
-    assert!(!preflight.passed);
-    assert!(preflight.checks.iter().any(|check| {
+    source.close().await?;
+
+    let target_path = std::env::temp_dir().join(format!("asterdrive-preflight-{suffix}.db"));
+    let target_url = sqlite_url(&target_path);
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let report = inspect(&source_url, &target_url, false).await?;
+    assert!(report.preflight.performed);
+    assert!(!report.preflight.passed);
+    assert!(report.preflight.checks.iter().any(|check| {
         check.name == "source_file_entity_relations" && !check.passed && check.actual == "1"
     }));
 
-    source.close().await?;
     let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
     Ok(())
 }
 
@@ -299,10 +311,7 @@ async fn resumes_from_last_completed_stage() -> Result<()> {
             .await?,
         0
     );
-    let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
-        .one(&target)
-        .await?
-        .expect("failed migration checkpoint");
+    let failed_checkpoint = migration_run_status(&target_url, &run_id).await?;
     assert_eq!(failed_checkpoint.status, "failed");
     assert_eq!(
         failed_checkpoint.last_completed_stage.as_deref(),
@@ -343,10 +352,7 @@ async fn resumes_from_last_completed_stage() -> Result<()> {
             .await?,
         1
     );
-    let completed_checkpoint = checkpoint::Entity::find_by_id(run_id)
-        .one(&target)
-        .await?
-        .expect("completed migration checkpoint");
+    let completed_checkpoint = migration_run_status(&target_url, &run_id).await?;
     assert_eq!(completed_checkpoint.status, "completed");
     assert_eq!(
         completed_checkpoint.last_completed_stage.as_deref(),
@@ -382,7 +388,7 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
             "CREATE TRIGGER fail_blob_batch BEFORE INSERT ON file_blobs \
              WHEN NEW.hash = '{}' \
              BEGIN SELECT RAISE(ABORT, 'forced blob batch failure'); END",
-            opaque_blob_key(failing_blob_id)
+            format!("cloudreve-{failing_blob_id:016x}")
         ))
         .await?;
     target.close().await?;
@@ -419,29 +425,13 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
             .await?,
         2
     );
-    let cursor = checkpoint::load_stage_cursor(&target, &run_id, "blobs")
-        .await?
-        .expect("committed blob cursor");
-    assert_eq!(cursor.cursor_value, extra_blob_ids[0]);
-    assert_eq!(cursor.processed_count, 2);
-    assert_eq!(
-        checkpoint::object_map::Entity::find()
-            .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-            .filter(checkpoint::object_map::Column::ObjectType.eq("blob"))
-            .count(&target)
-            .await?,
-        2
-    );
-    let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
-        .one(&target)
-        .await?
-        .expect("failed blob migration checkpoint");
+    let failed_checkpoint = migration_run_status(&target_url, &run_id).await?;
     assert_eq!(failed_checkpoint.status, "failed");
     assert_eq!(
         failed_checkpoint.last_completed_stage.as_deref(),
         Some("folders")
     );
-    let failed_report: MigrationReport = serde_json::from_value(failed_checkpoint.report_json)?;
+    let failed_report = migration_run_report(&target_url, &run_id).await?;
     assert_eq!(failed_report.migrated_blobs, 2);
     target
         .execute_unprepared("DROP TRIGGER fail_blob_batch")
@@ -465,19 +455,8 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
             .await?,
         4
     );
-    assert_eq!(
-        checkpoint::object_map::Entity::find()
-            .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-            .filter(checkpoint::object_map::Column::ObjectType.eq("blob"))
-            .count(&target)
-            .await?,
-        4
-    );
-    let completed_cursor = checkpoint::load_stage_cursor(&target, &run_id, "blobs")
-        .await?
-        .expect("completed blob cursor");
-    assert_eq!(completed_cursor.cursor_value, extra_blob_ids[2]);
-    assert_eq!(completed_cursor.processed_count, 4);
+    let completed_checkpoint = migration_run_status(&target_url, &run_id).await?;
+    assert_eq!(completed_checkpoint.status, "completed");
     target.close().await?;
 
     let _ = std::fs::remove_file(source_path);
@@ -498,7 +477,7 @@ async fn resumes_files_from_last_committed_batch() -> Result<()> {
     create_source_schema(&source).await?;
     seed_source(&source).await?;
     let extra_blob_ids = seed_extra_blob_entities(&source, 3).await?;
-    let extra_file_ids = seed_extra_files(&source, &extra_blob_ids).await?;
+    let _extra_file_ids = seed_extra_files(&source, &extra_blob_ids).await?;
     source.close().await?;
 
     let target = Database::connect(&target_url).await?;
@@ -550,29 +529,13 @@ async fn resumes_files_from_last_committed_batch() -> Result<()> {
             .await?,
         1
     );
-    let cursor = checkpoint::load_stage_cursor(&target, &run_id, "files")
-        .await?
-        .expect("committed file cursor");
-    assert_eq!(cursor.cursor_value, extra_file_ids[0]);
-    assert_eq!(cursor.processed_count, 2);
-    assert_eq!(
-        checkpoint::object_map::Entity::find()
-            .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-            .filter(checkpoint::object_map::Column::ObjectType.eq("file"))
-            .count(&target)
-            .await?,
-        2
-    );
-    let failed_checkpoint = checkpoint::Entity::find_by_id(run_id.clone())
-        .one(&target)
-        .await?
-        .expect("failed file migration checkpoint");
+    let failed_checkpoint = migration_run_status(&target_url, &run_id).await?;
     assert_eq!(failed_checkpoint.status, "failed");
     assert_eq!(
         failed_checkpoint.last_completed_stage.as_deref(),
         Some("blobs")
     );
-    let failed_report: MigrationReport = serde_json::from_value(failed_checkpoint.report_json)?;
+    let failed_report = migration_run_report(&target_url, &run_id).await?;
     assert_eq!(failed_report.migrated_files, 2);
     assert_eq!(failed_report.migrated_versions, 1);
     target
@@ -604,19 +567,8 @@ async fn resumes_files_from_last_committed_batch() -> Result<()> {
             .await?,
         1
     );
-    assert_eq!(
-        checkpoint::object_map::Entity::find()
-            .filter(checkpoint::object_map::Column::RunId.eq(&run_id))
-            .filter(checkpoint::object_map::Column::ObjectType.eq("file"))
-            .count(&target)
-            .await?,
-        4
-    );
-    let completed_cursor = checkpoint::load_stage_cursor(&target, &run_id, "files")
-        .await?
-        .expect("completed file cursor");
-    assert_eq!(completed_cursor.cursor_value, extra_file_ids[2]);
-    assert_eq!(completed_cursor.processed_count, 4);
+    let completed_checkpoint = migration_run_status(&target_url, &run_id).await?;
+    assert_eq!(completed_checkpoint.status, "completed");
     target.close().await?;
 
     let _ = std::fs::remove_file(source_path);

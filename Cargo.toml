@@ -32,12 +32,6 @@ members = [
     "crates/cloudreve_schema",
 ]
 
-[features]
-default = ["cli", "tui"]
-cli = []
-tui = ["cli", "dep:ratatui"]
-full = ["cli", "tui"]
-
 [dependencies]
 aster_drive_model = { git = "https://github.com/AsterCommunity/AsterDrive", package = "aster_drive_model" }
 # Alias the upstream schema-migration crate so it does not collide with this
@@ -50,10 +44,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4", features = ["derive", "env"] }
 cloudreve_schema = { path = "crates/cloudreve_schema" }
 color-eyre = "0.6.5"
-crossterm = "0.29.0"
 hmac = "0.12"
 mime_guess = "2"
-ratatui = { version = "0.30.2", optional = true, features = ["serde"] }
 sea-orm = { version = "2.0.0", features = ["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite", "macros", "runtime-tokio-rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"

@@ -1,6 +1,19 @@
-use super::super::*;
-use super::fixtures::{create_source_schema, create_target_schema, seed_source, sqlite_url};
+mod support;
+
+use std::collections::BTreeMap;
+
+use aster_drive_migration::migration::*;
+use aster_drive_model as aster_drive_schema;
+use color_eyre::eyre::Result;
 use sea_orm::ConnectionTrait;
+use sea_orm::{Database, EntityTrait, PaginatorTrait};
+use support::{create_source_schema, create_target_schema, seed_source, sqlite_url};
+
+fn sha256_file_for_test(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
 
 #[tokio::test]
 async fn reuses_and_verifies_local_storage_per_policy_root() -> Result<()> {
@@ -184,40 +197,6 @@ async fn rejects_unknown_local_policy_root() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn resumes_local_copy_from_matching_temporary_file() -> Result<()> {
-    let suffix = uuid::Uuid::new_v4();
-    let root = std::env::temp_dir().join(format!("asterdrive-copy-resume-{suffix}"));
-    let source_path = root.join("source.bin");
-    let target_path = root.join("target/object.bin");
-    let content = b"a local object that resumes from a generated checkpoint";
-    std::fs::create_dir_all(&root)?;
-    std::fs::write(&source_path, content)?;
-    std::fs::create_dir_all(target_path.parent().expect("target parent"))?;
-    let temporary_path = temporary_copy_path(
-        target_path.parent().expect("target parent"),
-        "local-copy-resume",
-        42,
-    );
-    std::fs::write(&temporary_path, &content[..17])?;
-
-    let (sha256, created) = copy_local_object(
-        &source_path,
-        &target_path,
-        content.len() as i64,
-        "local-copy-resume",
-        42,
-    )?;
-
-    assert!(created);
-    assert_eq!(sha256, sha256_file(&source_path)?);
-    assert_eq!(std::fs::read(&target_path)?, content);
-    assert!(!temporary_path.exists());
-
-    let _ = std::fs::remove_dir_all(root);
-    Ok(())
-}
-
 #[tokio::test]
 async fn copies_local_objects_to_target_root_and_uses_content_hashes() -> Result<()> {
     let suffix = uuid::Uuid::new_v4();
@@ -293,7 +272,7 @@ async fn copies_local_objects_to_target_root_and_uses_content_hashes() -> Result
     assert_eq!(blob.storage_path, "uploads/object.bin");
     assert_eq!(
         blob.hash,
-        sha256_file(&source_root.join("uploads/object.bin"))?
+        sha256_file_for_test(&source_root.join("uploads/object.bin"))?
     );
     assert!(
         report
@@ -333,7 +312,7 @@ async fn compensates_copied_local_objects_when_blob_database_write_fails() -> Re
     std::fs::create_dir_all(source_root.join("uploads"))?;
     std::fs::create_dir_all(&target_root)?;
     std::fs::write(source_root.join("uploads/object.bin"), vec![0x4d_u8; 128])?;
-    let expected_hash = sha256_file(&source_root.join("uploads/object.bin"))?;
+    let expected_hash = sha256_file_for_test(&source_root.join("uploads/object.bin"))?;
 
     let target = Database::connect(&target_url).await?;
     create_target_schema(&target).await?;

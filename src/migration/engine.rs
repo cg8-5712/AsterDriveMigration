@@ -1,0 +1,998 @@
+use super::*;
+
+pub async fn list_migration_runs(target_url: &str) -> Result<Vec<MigrationRunSummary>> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    checkpoint::list(&target)
+        .await?
+        .into_iter()
+        .map(run_summary)
+        .collect()
+}
+
+pub async fn migration_run_report(target_url: &str, run_id: &str) -> Result<MigrationReport> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    let run = checkpoint::load_any(&target, run_id).await?;
+    serde_json::from_value(run.report_json).wrap_err("decode stored migration report")
+}
+
+pub async fn migration_run_status(target_url: &str, run_id: &str) -> Result<MigrationRunSummary> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    run_summary(checkpoint::load_any(&target, run_id).await?)
+}
+
+pub async fn abort_migration_run(target_url: &str, run_id: &str) -> Result<()> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    checkpoint::abort(&target, run_id).await
+}
+
+pub async fn cleanup_completed_migration_run(target_url: &str, run_id: &str) -> Result<()> {
+    let target = connect(target_url, "AsterDrive").await?;
+    checkpoint::ensure_table(&target).await?;
+    checkpoint::delete_completed(&target, run_id).await
+}
+
+pub(super) fn run_summary(run: checkpoint::Model) -> Result<MigrationRunSummary> {
+    Ok(MigrationRunSummary {
+        run_id: run.id,
+        status: run.status,
+        last_completed_stage: run.last_completed_stage,
+        created_at: run.created_at,
+        updated_at: run.updated_at,
+        last_error: run.last_error,
+    })
+}
+
+pub async fn inspect(
+    source_url: &str,
+    target_url: &str,
+    include_deleted: bool,
+) -> Result<MigrationReport> {
+    let source = connect(source_url, "Cloudreve").await?;
+    let target = connect(target_url, "AsterDrive").await?;
+    let source_data = SourceData::load(&source, include_deleted).await?;
+    validate_target_schema(&target).await?;
+    let mut report = source_data.report();
+    report.dry_run = true;
+    report.warnings.extend(source_data.compatibility_warnings());
+    report.preflight = run_preflight(&source, &source_data).await?;
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MigrationStage {
+    Policies,
+    PolicyGroups,
+    Users,
+    Folders,
+    Blobs,
+    Files,
+    Metadata,
+    Shares,
+    DirectLinks,
+    Tasks,
+}
+
+impl MigrationStage {
+    const ALL: [Self; 10] = [
+        Self::Policies,
+        Self::PolicyGroups,
+        Self::Users,
+        Self::Folders,
+        Self::Blobs,
+        Self::Files,
+        Self::Metadata,
+        Self::Shares,
+        Self::DirectLinks,
+        Self::Tasks,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Policies => "policies",
+            Self::PolicyGroups => "policy_groups",
+            Self::Users => "users",
+            Self::Folders => "folders",
+            Self::Blobs => "blobs",
+            Self::Files => "files",
+            Self::Metadata => "metadata",
+            Self::Shares => "shares",
+            Self::DirectLinks => "direct_links",
+            Self::Tasks => "tasks",
+        }
+    }
+
+    fn should_run_after(self, last_completed_stage: Option<&str>) -> Result<bool> {
+        let Some(last_completed_stage) = last_completed_stage else {
+            return Ok(true);
+        };
+        let last_index = Self::ALL
+            .iter()
+            .position(|stage| stage.as_str() == last_completed_stage)
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("checkpoint contains unknown stage {last_completed_stage}")
+            })?;
+        let current_index = Self::ALL
+            .iter()
+            .position(|stage| *stage == self)
+            .expect("migration stage must exist in ALL");
+        Ok(current_index > last_index)
+    }
+}
+
+pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
+    if options.default_password.chars().count() < 8 {
+        bail!("--default-password must contain at least 8 characters");
+    }
+    if options
+        .direct_link_secret
+        .as_deref()
+        .is_some_and(|secret| secret.chars().count() < 16)
+    {
+        bail!("--direct-link-secret must contain at least 16 characters");
+    }
+    if options.resume && options.run_id.is_none() {
+        bail!("--resume requires --run-id");
+    }
+    if options.resume && options.dry_run {
+        bail!("--resume cannot be combined with --dry-run");
+    }
+    if let Some(run_id) = options.run_id.as_deref() {
+        validate_run_id(run_id)?;
+    }
+    if !(1..=10_000).contains(&options.blob_batch_size) {
+        bail!("--blob-batch-size must be between 1 and 10000");
+    }
+    if !(1..=10_000).contains(&options.file_batch_size) {
+        bail!("--file-batch-size must be between 1 and 10000");
+    }
+
+    let source = connect(&options.source_url, "Cloudreve").await?;
+    let target = connect(&options.target_url, "AsterDrive").await?;
+    let source_data = SourceData::load(&source, options.include_deleted).await?;
+    validate_target_schema(&target).await?;
+    let preflight = run_preflight(&source, &source_data).await?;
+    if !preflight.passed {
+        bail!(
+            "Cloudreve preflight failed ({} checks); run `check --report-path` for details and repair source data before migration",
+            preflight
+                .checks
+                .iter()
+                .filter(|check| !check.passed)
+                .count()
+        );
+    }
+
+    let unsupported = source_data.unsupported_policy_types();
+    if !unsupported.is_empty() && !options.skip_unsupported_policies {
+        bail!(
+            "unsupported Cloudreve storage policy types: {}; rerun with --skip-unsupported-policies to omit their files",
+            unsupported.join(", ")
+        );
+    }
+    validate_local_policy_roots(&source_data, &options)?;
+    if options.verify_local_storage || options.storage_mode == StorageMode::CopyLocal {
+        verify_local_storage_roots(&source_data, &options)?;
+    }
+    if options.storage_mode == StorageMode::CopyLocal {
+        verify_target_local_storage_roots(&source_data, &options)?;
+    }
+    if options.dry_run
+        && (options.verify_local_storage || options.storage_mode == StorageMode::CopyLocal)
+    {
+        verify_all_local_source_objects(&source, &source_data, &options).await?;
+    }
+    if options.dry_run && options.verify_remote_storage {
+        verify_all_remote_source_objects(&source, &source_data, &options).await?;
+    }
+
+    let mut report = source_data.report();
+    report.dry_run = options.dry_run;
+    report.warnings.extend(source_data.compatibility_warnings());
+    report.preflight = preflight;
+    if options.dry_run {
+        report.run_id = options.run_id.clone();
+        return Ok(report);
+    }
+
+    checkpoint::ensure_table(&target).await?;
+    let run_id = options
+        .run_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let source_fingerprint = source_fingerprint(&options.source_url, &source_data);
+    let target_fingerprint = hash_fingerprint(&options.target_url);
+    let plan_fingerprint = plan_fingerprint(&options);
+
+    let (mut context, target_before, mut last_completed_stage) = if options.resume {
+        let loaded = checkpoint::load(
+            &target,
+            &run_id,
+            &source_fingerprint,
+            &target_fingerprint,
+            &plan_fingerprint,
+        )
+        .await?;
+        if !matches!(
+            loaded.status.as_str(),
+            "running" | "failed" | "validation_failed" | "completed"
+        ) {
+            bail!(
+                "migration run {run_id} has unsupported status {}",
+                loaded.status
+            );
+        }
+        report = loaded.report;
+        report.resumed = true;
+        report.run_id = Some(run_id.clone());
+        (loaded.context, loaded.baseline, loaded.last_completed_stage)
+    } else {
+        ensure_target_safe(&target, options.allow_non_empty_target).await?;
+        let baseline = TargetCounts::load(&target).await?;
+        report.run_id = Some(run_id.clone());
+        let context = MigrationContext::default();
+        checkpoint::create(
+            &target,
+            checkpoint::NewCheckpoint {
+                run_id: &run_id,
+                source_fingerprint: &source_fingerprint,
+                target_fingerprint: &target_fingerprint,
+                plan_fingerprint: &plan_fingerprint,
+                context: &context,
+                report: &report,
+                baseline: &baseline,
+            },
+        )
+        .await?;
+        (context, baseline, None)
+    };
+    let mut blob_mappings = checkpoint::load_object_mappings(&target, &run_id, "blob").await?;
+    if blob_mappings.is_empty() && !context.blobs.is_empty() {
+        let legacy_mappings = context
+            .blobs
+            .iter()
+            .map(|(source_id, target_id)| (*source_id, *target_id))
+            .collect::<Vec<_>>();
+        checkpoint::save_object_mappings(&target, &run_id, "blob", &legacy_mappings).await?;
+        blob_mappings.extend(legacy_mappings);
+        context.blobs.clear();
+    }
+    if report.migrated_blobs != blob_mappings.len() {
+        bail!(
+            "migration run {run_id} blob mapping count {} does not match migrated blob count {}; restore the checkpoint tables before resuming",
+            blob_mappings.len(),
+            report.migrated_blobs
+        );
+    }
+    let mut file_mappings = checkpoint::load_object_mappings(&target, &run_id, "file").await?;
+    if file_mappings.is_empty() && !context.files.is_empty() {
+        let legacy_mappings = context
+            .files
+            .iter()
+            .map(|(source_id, target_id)| (*source_id, *target_id))
+            .collect::<Vec<_>>();
+        checkpoint::save_object_mappings(&target, &run_id, "file", &legacy_mappings).await?;
+        file_mappings.extend(legacy_mappings);
+        context.files.clear();
+    }
+    if report.migrated_files != file_mappings.len() {
+        bail!(
+            "migration run {run_id} file mapping count {} does not match migrated file count {}; restore the checkpoint tables before resuming",
+            file_mappings.len(),
+            report.migrated_files
+        );
+    }
+
+    let password_hash = hash_password(&options.default_password)?;
+
+    for (stage_index, stage) in MigrationStage::ALL.into_iter().enumerate() {
+        if !stage.should_run_after(last_completed_stage.as_deref())? {
+            continue;
+        }
+        eprintln!(
+            "[progress] stage {}/{} {} started",
+            stage_index + 1,
+            MigrationStage::ALL.len(),
+            stage.as_str()
+        );
+        if stage == MigrationStage::Blobs {
+            let inputs = BlobBatchInputs {
+                source: &source,
+                target: &target,
+                run_id: &run_id,
+                source_data: &source_data,
+                options: &options,
+                context: &context,
+                file_mappings: &file_mappings,
+            };
+            if let Err(error) =
+                migrate_blobs_batched(&inputs, &mut blob_mappings, &mut report).await
+            {
+                let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+                return Err(error).wrap_err_with(|| {
+                    format!(
+                        "migration run {run_id} failed at stage {}; rerun with --resume --run-id {run_id}",
+                        stage.as_str()
+                    )
+                });
+            }
+            last_completed_stage = Some(stage.as_str().to_string());
+            eprintln!("[progress] stage {} completed", stage.as_str());
+            continue;
+        }
+        if stage == MigrationStage::Files {
+            let inputs = FileBatchInputs {
+                source: &source,
+                target: &target,
+                run_id: &run_id,
+                source_data: &source_data,
+                options: &options,
+                context: &context,
+                blob_mappings: &blob_mappings,
+            };
+            if let Err(error) =
+                migrate_files_batched(&inputs, &mut file_mappings, &mut report).await
+            {
+                let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+                return Err(error).wrap_err_with(|| {
+                    format!(
+                        "migration run {run_id} failed at stage {}; rerun with --resume --run-id {run_id}",
+                        stage.as_str()
+                    )
+                });
+            }
+            last_completed_stage = Some(stage.as_str().to_string());
+            eprintln!("[progress] stage {} completed", stage.as_str());
+            continue;
+        }
+        let transaction = target
+            .begin()
+            .await
+            .wrap_err_with(|| format!("begin migration stage {}", stage.as_str()))?;
+        let stage_result: Result<()> = async {
+            let inputs = StageInputs {
+                source_db: &source,
+                source_data: &source_data,
+                options: &options,
+                password_hash: &password_hash,
+                file_mappings: &file_mappings,
+            };
+            execute_stage(stage, &transaction, &inputs, &mut context, &mut report).await?;
+            report.set_mappings(&context, &blob_mappings, &file_mappings);
+            if !report
+                .completed_stages
+                .iter()
+                .any(|completed| completed == stage.as_str())
+            {
+                report.completed_stages.push(stage.as_str().to_string());
+            }
+            checkpoint::save_stage(&transaction, &run_id, stage.as_str(), &context, &report).await
+        }
+        .await;
+        if let Err(error) = stage_result {
+            drop(transaction);
+            let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "migration run {run_id} failed at stage {}; rerun with --resume --run-id {run_id}",
+                    stage.as_str()
+                )
+            });
+        }
+        if let Err(error) = transaction.commit().await {
+            let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "commit migration run {run_id} stage {}; resume with the same run ID",
+                    stage.as_str()
+                )
+            });
+        }
+        last_completed_stage = Some(stage.as_str().to_string());
+        eprintln!("[progress] stage {} completed", stage.as_str());
+    }
+
+    report.set_mappings(&context, &blob_mappings, &file_mappings);
+    let recalculation = target
+        .begin()
+        .await
+        .wrap_err("begin final statistics recalculation")?;
+    if let Err(error) = recalculate_statistics(&recalculation).await {
+        let _ = recalculation.rollback().await;
+        let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+        return Err(error)
+            .wrap_err_with(|| format!("recalculate completed migration run {run_id}"));
+    }
+    recalculation
+        .commit()
+        .await
+        .wrap_err("commit final statistics recalculation")?;
+    report.validation =
+        match validate_migration_result(&target, &target_before, &report, &options).await {
+            Ok(validation) => validation,
+            Err(error) => {
+                let _ = checkpoint::mark_failed(&target, &run_id, &error.to_string()).await;
+                return Err(error)
+                    .wrap_err_with(|| format!("validate completed migration run {run_id}"));
+            }
+        };
+    report.generated_at = chrono::Utc::now();
+    checkpoint::finish(
+        &target,
+        &run_id,
+        if report.validation.passed {
+            "completed"
+        } else {
+            "validation_failed"
+        },
+        &context,
+        &report,
+    )
+    .await?;
+    Ok(report)
+}
+
+pub(super) struct StageInputs<'a> {
+    source_db: &'a DatabaseConnection,
+    source_data: &'a SourceData,
+    options: &'a MigrationOptions,
+    password_hash: &'a str,
+    file_mappings: &'a HashMap<i64, i64>,
+}
+
+pub(super) async fn execute_stage(
+    stage: MigrationStage,
+    transaction: &sea_orm::DatabaseTransaction,
+    inputs: &StageInputs<'_>,
+    context: &mut MigrationContext,
+    report: &mut MigrationReport,
+) -> Result<()> {
+    match stage {
+        MigrationStage::Policies => {
+            migrate_policies(
+                transaction,
+                inputs.source_data,
+                inputs.options,
+                context,
+                report,
+            )
+            .await
+        }
+        MigrationStage::PolicyGroups => {
+            migrate_policy_groups(transaction, inputs.source_data, context, report).await
+        }
+        MigrationStage::Users => {
+            migrate_users(
+                transaction,
+                inputs.source_data,
+                inputs.password_hash,
+                context,
+                report,
+            )
+            .await
+        }
+        MigrationStage::Folders => {
+            migrate_folders(transaction, inputs.source_data, context, report).await
+        }
+        MigrationStage::Blobs => bail!("blobs stage must use the batched runner"),
+        MigrationStage::Files => bail!("files stage must use the batched runner"),
+        MigrationStage::Metadata => {
+            migrate_metadata(
+                transaction,
+                inputs.source_db,
+                inputs.source_data,
+                inputs.file_mappings,
+                context,
+                report,
+            )
+            .await
+        }
+        MigrationStage::Shares => {
+            migrate_shares(
+                transaction,
+                inputs.source_db,
+                inputs.source_data,
+                inputs.file_mappings,
+                context,
+                report,
+            )
+            .await
+        }
+        MigrationStage::DirectLinks => {
+            migrate_direct_links(
+                transaction,
+                inputs.source_db,
+                inputs.source_data,
+                inputs.file_mappings,
+                context,
+                inputs.options.direct_link_secret.as_deref(),
+                report,
+            )
+            .await
+        }
+        MigrationStage::Tasks => {
+            migrate_tasks(transaction, inputs.source_data, context, report).await
+        }
+    }
+}
+
+pub(super) struct BlobBatchInputs<'a> {
+    source: &'a DatabaseConnection,
+    target: &'a DatabaseConnection,
+    run_id: &'a str,
+    source_data: &'a SourceData,
+    options: &'a MigrationOptions,
+    context: &'a MigrationContext,
+    file_mappings: &'a HashMap<i64, i64>,
+}
+
+pub(super) async fn migrate_blobs_batched(
+    inputs: &BlobBatchInputs<'_>,
+    blob_mappings: &mut HashMap<i64, i64>,
+    report: &mut MigrationReport,
+) -> Result<()> {
+    let cursor =
+        checkpoint::load_stage_cursor(inputs.target, inputs.run_id, MigrationStage::Blobs.as_str())
+            .await?;
+    let mut cursor_value = cursor.as_ref().map_or(0, |cursor| cursor.cursor_value);
+    let mut processed_count = cursor.as_ref().map_or(0, |cursor| cursor.processed_count);
+    let started_at = Instant::now();
+
+    loop {
+        let mut query = cloudreve_schema::entities::Entity::find()
+            .filter(cloudreve_schema::entities::Column::Type.eq(0))
+            .filter(cloudreve_schema::entities::Column::Id.gt(cursor_value))
+            .order_by_asc(cloudreve_schema::entities::Column::Id)
+            .limit(inputs.options.blob_batch_size as u64);
+        if !inputs.source_data.include_deleted {
+            query = query.filter(cloudreve_schema::entities::Column::DeletedAt.is_null());
+        }
+        let entities = query.all(inputs.source).await?;
+        if entities.is_empty() {
+            let transaction = inputs
+                .target
+                .begin()
+                .await
+                .wrap_err("begin blobs completion")?;
+            report.set_mappings(inputs.context, blob_mappings, inputs.file_mappings);
+            if !report
+                .completed_stages
+                .iter()
+                .any(|completed| completed == MigrationStage::Blobs.as_str())
+            {
+                report
+                    .completed_stages
+                    .push(MigrationStage::Blobs.as_str().to_string());
+            }
+            checkpoint::save_stage(
+                &transaction,
+                inputs.run_id,
+                MigrationStage::Blobs.as_str(),
+                inputs.context,
+                report,
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .wrap_err("commit blobs completion")?;
+            return Ok(());
+        }
+
+        if inputs.options.verify_local_storage {
+            verify_local_blob_batch(
+                &entities,
+                inputs.source_data,
+                inputs.options,
+                inputs.context,
+            )?;
+        }
+        if inputs.options.verify_remote_storage {
+            verify_remote_blob_batch(
+                &entities,
+                inputs.source_data,
+                inputs.options,
+                inputs.context,
+            )
+            .await?;
+        }
+
+        let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
+        let association_info = load_blob_association_info(inputs.source, &entity_ids).await?;
+        let last_entity_id = entities.last().expect("non-empty blob batch").id;
+        let copied_objects = copy_local_blob_batch(
+            &entities,
+            inputs.source_data,
+            inputs.options,
+            inputs.context,
+            inputs.run_id,
+        )?;
+        let transaction = inputs.target.begin().await.wrap_err("begin blobs batch")?;
+        let report_before_batch = report.clone();
+        let batch_result: Result<Vec<(i64, i64)>> = async {
+            let mappings = migrate_blob_batch(
+                &transaction,
+                &entities,
+                &association_info.reference_counts,
+                &association_info.thumbnail_paths,
+                &copied_objects.objects,
+                inputs.context,
+                report,
+            )
+            .await?;
+            checkpoint::save_object_mappings(&transaction, inputs.run_id, "blob", &mappings)
+                .await?;
+            processed_count += entities.len() as i64;
+            checkpoint::save_stage_cursor(
+                &transaction,
+                inputs.run_id,
+                MigrationStage::Blobs.as_str(),
+                last_entity_id,
+                processed_count,
+            )
+            .await?;
+            checkpoint::save_progress(&transaction, inputs.run_id, inputs.context, report).await?;
+            Ok(mappings)
+        }
+        .await;
+        let mappings = match batch_result {
+            Ok(mappings) => mappings,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                *report = report_before_batch;
+                copied_objects.compensate()?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = transaction.commit().await {
+            return Err(error).wrap_err("commit blobs batch");
+        }
+        let batch_bytes = entities.iter().try_fold(0_i64, |total, entity| {
+            total
+                .checked_add(entity.size)
+                .ok_or_else(|| color_eyre::eyre::eyre!("blob batch byte count overflow"))
+        })?;
+        eprintln!(
+            "[progress] blobs: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}, {}",
+            inputs.source_data.source_blobs,
+            entities.len(),
+            progress_timing(processed_count, inputs.source_data.source_blobs, started_at)
+        );
+        blob_mappings.extend(mappings);
+        cursor_value = last_entity_id;
+    }
+}
+
+pub(super) struct FileBatchInputs<'a> {
+    source: &'a DatabaseConnection,
+    target: &'a DatabaseConnection,
+    run_id: &'a str,
+    source_data: &'a SourceData,
+    options: &'a MigrationOptions,
+    context: &'a MigrationContext,
+    blob_mappings: &'a HashMap<i64, i64>,
+}
+
+pub(super) async fn migrate_files_batched(
+    inputs: &FileBatchInputs<'_>,
+    file_mappings: &mut HashMap<i64, i64>,
+    report: &mut MigrationReport,
+) -> Result<()> {
+    let cursor =
+        checkpoint::load_stage_cursor(inputs.target, inputs.run_id, MigrationStage::Files.as_str())
+            .await?;
+    let mut cursor_value = cursor.as_ref().map_or(0, |cursor| cursor.cursor_value);
+    let mut processed_count = cursor.as_ref().map_or(0, |cursor| cursor.processed_count);
+    let started_at = Instant::now();
+
+    loop {
+        let files = cloudreve_schema::files::Entity::find()
+            .filter(cloudreve_schema::files::Column::Type.eq(0))
+            .filter(cloudreve_schema::files::Column::Id.gt(cursor_value))
+            .order_by_asc(cloudreve_schema::files::Column::Id)
+            .limit(inputs.options.file_batch_size as u64)
+            .all(inputs.source)
+            .await?;
+        if files.is_empty() {
+            let transaction = inputs
+                .target
+                .begin()
+                .await
+                .wrap_err("begin files completion")?;
+            report.set_mappings(inputs.context, inputs.blob_mappings, file_mappings);
+            if !report
+                .completed_stages
+                .iter()
+                .any(|completed| completed == MigrationStage::Files.as_str())
+            {
+                report
+                    .completed_stages
+                    .push(MigrationStage::Files.as_str().to_string());
+            }
+            checkpoint::save_stage(
+                &transaction,
+                inputs.run_id,
+                MigrationStage::Files.as_str(),
+                inputs.context,
+                report,
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .wrap_err("commit files completion")?;
+            return Ok(());
+        }
+
+        let (associations, entities) =
+            load_file_batch_data(inputs.source, inputs.source_data.include_deleted, &files).await?;
+        let last_file_id = files.last().expect("non-empty file batch").id;
+        let transaction = inputs.target.begin().await.wrap_err("begin files batch")?;
+        let mappings = migrate_file_batch(
+            &transaction,
+            &files,
+            &associations,
+            &entities,
+            inputs.blob_mappings,
+            inputs.context,
+            report,
+        )
+        .await?;
+        checkpoint::save_object_mappings(&transaction, inputs.run_id, "file", &mappings).await?;
+        processed_count += files.len() as i64;
+        checkpoint::save_stage_cursor(
+            &transaction,
+            inputs.run_id,
+            MigrationStage::Files.as_str(),
+            last_file_id,
+            processed_count,
+        )
+        .await?;
+        checkpoint::save_progress(&transaction, inputs.run_id, inputs.context, report).await?;
+        transaction.commit().await.wrap_err("commit files batch")?;
+        let batch_bytes = files.iter().try_fold(0_i64, |total, file| {
+            total
+                .checked_add(file.size)
+                .ok_or_else(|| color_eyre::eyre::eyre!("file batch byte count overflow"))
+        })?;
+        eprintln!(
+            "[progress] files: source_rows={processed_count}/{}, batch_rows={}, batch_bytes={batch_bytes}, {}",
+            inputs.source_data.source_files,
+            files.len(),
+            progress_timing(processed_count, inputs.source_data.source_files, started_at)
+        );
+        file_mappings.extend(mappings);
+        cursor_value = last_file_id;
+    }
+}
+
+pub(super) async fn load_file_batch_data(
+    source: &DatabaseConnection,
+    include_deleted: bool,
+    files: &[cloudreve_schema::files::Model],
+) -> Result<(
+    HashMap<i64, Vec<i64>>,
+    HashMap<i64, cloudreve_schema::entities::Model>,
+)> {
+    const QUERY_ID_BATCH_SIZE: usize = 500;
+
+    let file_ids = files.iter().map(|file| file.id).collect::<Vec<_>>();
+    let mut file_entities = Vec::new();
+    for file_ids in file_ids.chunks(QUERY_ID_BATCH_SIZE) {
+        file_entities.extend(
+            cloudreve_schema::file_entities::Entity::find()
+                .filter(
+                    cloudreve_schema::file_entities::Column::FileId.is_in(file_ids.iter().copied()),
+                )
+                .all(source)
+                .await?,
+        );
+    }
+    let mut entity_ids = file_entities
+        .iter()
+        .map(|relation| relation.entity_id)
+        .collect::<HashSet<_>>();
+    entity_ids.extend(files.iter().filter_map(|file| file.primary_entity));
+    let entity_ids = entity_ids.into_iter().collect::<Vec<_>>();
+    let mut entities = HashMap::with_capacity(entity_ids.len());
+    for entity_ids in entity_ids.chunks(QUERY_ID_BATCH_SIZE) {
+        let mut query = cloudreve_schema::entities::Entity::find()
+            .filter(cloudreve_schema::entities::Column::Id.is_in(entity_ids.iter().copied()))
+            .filter(cloudreve_schema::entities::Column::Type.eq(0));
+        if !include_deleted {
+            query = query.filter(cloudreve_schema::entities::Column::DeletedAt.is_null());
+        }
+        for entity in query.all(source).await? {
+            entities.insert(entity.id, entity);
+        }
+    }
+    Ok((associations(files, &file_entities), entities))
+}
+
+pub(super) struct BlobAssociationInfo {
+    reference_counts: HashMap<i64, i64>,
+    thumbnail_paths: HashMap<i64, String>,
+}
+
+pub(super) async fn load_blob_association_info(
+    source: &DatabaseConnection,
+    blob_ids: &[i64],
+) -> Result<BlobAssociationInfo> {
+    if blob_ids.is_empty() {
+        return Ok(BlobAssociationInfo {
+            reference_counts: HashMap::new(),
+            thumbnail_paths: HashMap::new(),
+        });
+    }
+    let relations = cloudreve_schema::file_entities::Entity::find()
+        .filter(cloudreve_schema::file_entities::Column::EntityId.is_in(blob_ids.iter().copied()))
+        .all(source)
+        .await?;
+    let primary_files = cloudreve_schema::files::Entity::find()
+        .filter(cloudreve_schema::files::Column::PrimaryEntity.is_in(blob_ids.iter().copied()))
+        .all(source)
+        .await?;
+    let file_ids = relations
+        .iter()
+        .map(|relation| relation.file_id)
+        .chain(primary_files.iter().map(|file| file.id))
+        .collect::<HashSet<_>>();
+    if file_ids.is_empty() {
+        return Ok(BlobAssociationInfo {
+            reference_counts: HashMap::new(),
+            thumbnail_paths: HashMap::new(),
+        });
+    }
+    let all_relations = cloudreve_schema::file_entities::Entity::find()
+        .filter(cloudreve_schema::file_entities::Column::FileId.is_in(file_ids.iter().copied()))
+        .all(source)
+        .await?;
+    let thumbnail_ids = all_relations
+        .iter()
+        .map(|relation| relation.entity_id)
+        .collect::<HashSet<_>>();
+    let thumbnails = cloudreve_schema::entities::Entity::find()
+        .filter(cloudreve_schema::entities::Column::Id.is_in(thumbnail_ids.iter().copied()))
+        .filter(cloudreve_schema::entities::Column::Type.eq(1))
+        .all(source)
+        .await?
+        .into_iter()
+        .map(|entity| (entity.id, entity.source))
+        .collect::<HashMap<_, _>>();
+    let relations_by_file =
+        all_relations
+            .into_iter()
+            .fold(HashMap::<i64, Vec<i64>>::new(), |mut values, relation| {
+                values
+                    .entry(relation.file_id)
+                    .or_default()
+                    .push(relation.entity_id);
+                values
+            });
+    let blob_id_set = blob_ids.iter().copied().collect::<HashSet<_>>();
+    let mut file_blob_pairs = HashSet::new();
+    let mut thumbnail_paths = HashMap::new();
+    for (blob_id, file_id) in relations
+        .into_iter()
+        .map(|relation| (relation.entity_id, relation.file_id))
+        .chain(
+            primary_files
+                .into_iter()
+                .filter_map(|file| file.primary_entity.map(|entity_id| (entity_id, file.id))),
+        )
+    {
+        if blob_id_set.contains(&blob_id) {
+            file_blob_pairs.insert((file_id, blob_id));
+        }
+        if let Some(path) = relations_by_file
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+            .find_map(|entity_id| thumbnails.get(entity_id))
+        {
+            thumbnail_paths
+                .entry(blob_id)
+                .or_insert_with(|| path.clone());
+        }
+    }
+    let mut reference_counts = HashMap::new();
+    for (_, blob_id) in file_blob_pairs {
+        *reference_counts.entry(blob_id).or_insert(0) += 1;
+    }
+    Ok(BlobAssociationInfo {
+        reference_counts,
+        thumbnail_paths,
+    })
+}
+
+pub(super) fn validate_run_id(run_id: &str) -> Result<()> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() || run_id.chars().count() > 128 || run_id.chars().any(char::is_control) {
+        bail!("--run-id must contain 1-128 non-control characters");
+    }
+    Ok(())
+}
+
+pub(super) fn hash_fingerprint(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+pub(super) fn source_fingerprint(source_url: &str, source: &SourceData) -> String {
+    hash_fingerprint(&format!(
+        "{source_url}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        source.users.len(),
+        source.groups.len(),
+        source.policies.len(),
+        source.source_file_records,
+        source.source_entities,
+        source.source_file_entities,
+        source.shares.len(),
+        source.metadata.len(),
+        source.direct_links.len(),
+        source.tasks.len(),
+    ))
+}
+
+pub(super) fn progress_timing(processed: i64, total: u64, started_at: Instant) -> String {
+    let elapsed_seconds = started_at.elapsed().as_secs_f64().max(0.001);
+    let rows_per_second = processed as f64 / elapsed_seconds;
+    let remaining_rows = total.saturating_sub(processed.max(0) as u64);
+    let eta_seconds = if rows_per_second > 0.0 {
+        remaining_rows as f64 / rows_per_second
+    } else {
+        0.0
+    };
+    format!(
+        "elapsed_secs={elapsed_seconds:.1}, rows_per_sec={rows_per_second:.2}, eta_secs={eta_seconds:.1}"
+    )
+}
+
+pub(super) fn plan_fingerprint(options: &MigrationOptions) -> String {
+    hash_fingerprint(&format!(
+        "{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}",
+        options.local_base_path,
+        options
+            .local_policy_roots
+            .iter()
+            .map(|(policy_id, path)| format!("{policy_id}={path}"))
+            .collect::<Vec<_>>()
+            .join("|"),
+        options.storage_mode,
+        options
+            .target_local_base_path
+            .as_deref()
+            .unwrap_or_default(),
+        options
+            .target_local_policy_roots
+            .iter()
+            .map(|(policy_id, path)| format!("{policy_id}={path}"))
+            .collect::<Vec<_>>()
+            .join("|"),
+        options.verify_local_storage,
+        options.include_deleted,
+        options.allow_non_empty_target,
+        options.skip_unsupported_policies,
+        hash_fingerprint(&options.default_password),
+        options
+            .direct_link_secret
+            .as_deref()
+            .map(hash_fingerprint)
+            .unwrap_or_default(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn progress_timing_includes_rate_and_eta() {
+        let timing = progress_timing(50, 100, Instant::now());
+        assert!(timing.contains("rows_per_sec="));
+        assert!(timing.contains("eta_secs="));
+    }
+}
