@@ -1,5 +1,5 @@
 [package]
-name = "cloudreve_schema"
+name = "aster_drive_migration_core"
 version = "0.1.0"
 authors.workspace = true
 repository.workspace = true
@@ -12,4 +12,5 @@ publish = false
 workspace = true
 
 [dependencies]
-sea-orm = { workspace = true, features = ["macros", "with-chrono", "with-json", "with-uuid"] }
+chrono = { workspace = true, features = ["serde"] }
+serde_json.workspace = true

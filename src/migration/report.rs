@@ -1,13 +1,5 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum StorageMode {
-    #[value(name = "reuse-source-storage")]
-    ReuseSourceStorage,
-    #[value(name = "copy-local")]
-    CopyLocal,
-}
-
 #[derive(Debug, Clone)]
 pub struct MigrationOptions {
     pub source_url: String,
@@ -15,9 +7,6 @@ pub struct MigrationOptions {
     pub default_password: String,
     pub local_base_path: String,
     pub local_policy_roots: BTreeMap<i64, String>,
-    pub storage_mode: StorageMode,
-    pub target_local_base_path: Option<String>,
-    pub target_local_policy_roots: BTreeMap<i64, String>,
     pub verify_local_storage: bool,
     pub verify_remote_storage: bool,
     pub direct_link_secret: Option<String>,

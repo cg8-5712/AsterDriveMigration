@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "the shared fixture module is compiled separately by each integration test binary"
+)]
 
 use color_eyre::eyre::{Result, WrapErr};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};

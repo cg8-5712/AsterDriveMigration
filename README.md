@@ -83,25 +83,9 @@ cargo run -- migrate `
 
 `--verify-remote-storage` enables provider-level verification for Cloudreve `s3`, `oss`, `ks3` and `obs` policies before each migrated blob is committed. It performs an authenticated `HeadObject` and validates the reported size, then performs an authenticated `bytes=0-0` range read for non-empty objects. With `--dry-run`, the full eligible remote-object set is verified before target writes begin. This verifies the source provider credentials, endpoint, bucket, object key and read path; it does not copy remote bytes or validate a running AD HTTP service. Cloudreve Tencent COS uses a distinct signing protocol and is deliberately rejected by this verification mode until native COS support is implemented.
 
-## Copy local storage
+## Object storage boundary
 
-Use `--storage-mode copy-local` only when AD must use a **different local root**. It copies compatible local blobs while retaining their relative `entities.source` paths, configures AD's local policy to the target root, and stores a real SHA-256 in each copied `file_blobs.hash`. Source paths must be relative and must not escape the configured root.
-
-```powershell
-cargo run -- migrate `
-  --source-url "sqlite://C:/cloudreve/cloudreve.db?mode=ro" `
-  --target-url "sqlite://C:/asterdrive/asterdrive.db" `
-  --default-password "change-this-password" `
-  --local-policy-root "1=D:/cloudreve-data" `
-  --storage-mode copy-local `
-  --target-local-policy-root "1=E:/asterdrive-data" `
-  --verify-local-storage `
-  --run-id "cloudreve-local-copy-2026-07-22"
-```
-
-`--target-local-base-path` is the fallback destination root; `--target-local-policy-root SOURCE_POLICY_ID=PATH` overrides it for one local policy. The source and target roots must be existing, different directories. If a target object already exists, migration never overwrites it: size and SHA-256 must both match the source before it is reused.
-
-Each copied object first streams to a generated `.aster-migration-<run-hash>-<entity-id>.part` file in the destination directory. The next run with the same `--run-id --resume` verifies the partial prefix and appends the remaining bytes. It calls `sync_all` and atomically renames the temporary file only after the complete byte count has been written. If the database transaction for that blob page rolls back, files newly finalized by that page are deleted as compensation. A commit error is intentionally not compensated because commit outcome may be unknown; resume verifies and reuses a matching finalized object. Thumbnail objects and remote object-storage policies are not copied by this mode.
+The migration writes database metadata and preserves each compatible Cloudreve object key. It does not move local or remote object bytes. When AsterDrive must use a different filesystem root, bucket or endpoint, transfer the objects separately with an infrastructure tool such as `rsync`, `rclone`, a filesystem snapshot or a provider-side copy job, while preserving the relative `storage_path` layout. Complete that transfer and its byte-level verification before cutover.
 
 ## Limited resume
 
@@ -127,7 +111,7 @@ Resume verifies the source URL/count fingerprint, target URL fingerprint and mig
 
 During migration the CLI writes progress to stderr: each stage emits start/completed markers, while committed blob/file pages include processed source rows, the exact stage total, batch row count and batch bytes. Progress is printed only after the corresponding target transaction commits, so it never claims an uncommitted page as complete.
 
-Folders, metadata, shares, direct links and tasks are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. `copy-local` provides physical byte copying only for compatible local policies; remote object-storage copy/upload is not implemented.
+Folders, metadata, shares, direct links and tasks are still stage-level only: a failure restarts that entire stage. A file page loads only its related entity/version rows into memory. Object-byte transfer remains outside the migration process.
 
 ## JSON migration report
 
@@ -140,7 +124,7 @@ Folders, metadata, shares, direct links and tasks are still stage-level only: a 
 - every regenerated direct-link URL and its Cloudreve/AD file IDs
 - post-commit database count checks, imported-task terminal-state checks, tag-binding checks and direct-link property checks
 - final relation checks for folders, blobs, files, versions and shares; automatic `ref_count` and `storage_used` recalculation using AD's current-file-plus-history accounting rule
-- when `--verify-local-storage` or `--storage-mode copy-local` is used, local AD object open/read checks (and copied-object SHA-256 checks)
+- when `--verify-local-storage` is used, local AD object open/read and size checks
 - run ID, whether the execution resumed, and the list of completed stages
 
 The CLI writes the JSON report before returning a validation error. A failed post-migration check therefore produces a usable report and exits with a non-zero status. Direct-link URLs are bearer-style public capabilities, so the report file must be stored with restricted access.

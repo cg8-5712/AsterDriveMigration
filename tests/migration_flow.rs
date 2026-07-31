@@ -2,7 +2,9 @@ mod support;
 
 use aster_drive_migration::migration::*;
 use aster_drive_model as aster_drive_schema;
-use aster_drive_model::types::{BackgroundTaskKind, BackgroundTaskStatus, UserRole};
+use aster_drive_model::types::{
+    AvatarSource, BackgroundTaskKind, BackgroundTaskStatus, DriverType, UserRole, UserStatus,
+};
 use color_eyre::eyre::Result;
 use sea_orm::ConnectionTrait;
 use sea_orm::{ActiveModelTrait, Database, EntityTrait, PaginatorTrait, Set};
@@ -72,9 +74,6 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
         default_password: "temporary-password".to_string(),
         local_base_path: "C:/cloudreve".to_string(),
         local_policy_roots: std::collections::BTreeMap::new(),
-        storage_mode: StorageMode::ReuseSourceStorage,
-        target_local_base_path: None,
-        target_local_policy_roots: std::collections::BTreeMap::new(),
         verify_local_storage: false,
         verify_remote_storage: false,
         direct_link_secret: Some("test-direct-link-secret".to_string()),
@@ -114,6 +113,35 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
     assert_eq!(report.tag_assignments[0].target_entity_type, "file");
 
     let target = Database::connect(&target_url).await?;
+    let policy = aster_drive_schema::entities::storage_policy::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated policy");
+    assert_eq!(policy.name, "Local");
+    assert_eq!(policy.driver_type, DriverType::Local);
+    assert_eq!(policy.base_path, "C:/cloudreve");
+    assert!(policy.is_default);
+    assert_eq!(policy.chunk_size, 0);
+    let policy_options: serde_json::Value = serde_json::from_str(policy.options.as_ref())?;
+    assert_eq!(
+        policy_options["object_storage_upload_strategy"],
+        "relay_stream"
+    );
+
+    let policy_group = aster_drive_schema::entities::storage_policy_group::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated policy group");
+    assert_eq!(policy_group.name, "Administrators");
+    assert!(policy_group.is_enabled);
+    assert!(!policy_group.is_default);
+    let policy_group_item = aster_drive_schema::entities::storage_policy_group_item::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated policy group item");
+    assert_eq!(policy_group_item.group_id, policy_group.id);
+    assert_eq!(policy_group_item.policy_id, policy.id);
+
     assert_eq!(
         aster_drive_schema::entities::user::Entity::find()
             .count(&target)
@@ -219,6 +247,26 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
         .unwrap();
     assert!(user.must_change_password);
     assert_eq!(user.role, UserRole::Admin);
+    assert_eq!(user.status, UserStatus::Active);
+    assert_eq!(user.policy_group_id, Some(policy_group.id));
+    assert!(user.email_verified_at.is_some());
+    let profile = aster_drive_schema::entities::user_profile::Entity::find_by_id(user.id)
+        .one(&target)
+        .await?
+        .expect("migrated user profile");
+    assert_eq!(profile.display_name.as_deref(), Some("admin"));
+    assert_eq!(profile.avatar_source, AvatarSource::None);
+
+    let folder = aster_drive_schema::entities::folder::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated folder");
+    assert_eq!(folder.name, "Documents");
+    assert_eq!(folder.parent_id, None);
+    assert_eq!(folder.owner_user_id, Some(user.id));
+    assert_eq!(folder.created_by_user_id, Some(user.id));
+    assert_eq!(folder.created_by_username, "admin");
+    assert_eq!(folder.policy_id, Some(policy.id));
     let expected_storage_used = files.iter().map(|file| file.size).sum::<i64>()
         + versions.iter().map(|version| version.size).sum::<i64>();
     assert_eq!(user.storage_used, expected_storage_used);
@@ -273,9 +321,6 @@ async fn resumes_from_last_completed_stage() -> Result<()> {
         default_password: "temporary-password".to_string(),
         local_base_path: "C:/cloudreve".to_string(),
         local_policy_roots: std::collections::BTreeMap::new(),
-        storage_mode: StorageMode::ReuseSourceStorage,
-        target_local_base_path: None,
-        target_local_policy_roots: std::collections::BTreeMap::new(),
         verify_local_storage: false,
         verify_remote_storage: false,
         direct_link_secret: Some("test-direct-link-secret".to_string()),
@@ -366,6 +411,72 @@ async fn resumes_from_last_completed_stage() -> Result<()> {
 }
 
 #[tokio::test]
+async fn completed_run_is_terminal_and_cleanup_removes_its_metadata() -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let run_id = format!("terminal-run-{suffix}");
+    let source_path = std::env::temp_dir().join(format!("cloudreve-terminal-{suffix}.db"));
+    let target_path = std::env::temp_dir().join(format!("asterdrive-terminal-{suffix}.db"));
+    let source_url = sqlite_url(&source_path);
+    let target_url = sqlite_url(&target_path);
+
+    let source = Database::connect(&source_url).await?;
+    create_source_schema(&source).await?;
+    seed_source(&source).await?;
+    source.close().await?;
+
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let options = MigrationOptions {
+        source_url: source_url.clone(),
+        target_url: target_url.clone(),
+        default_password: "temporary-password".to_string(),
+        local_base_path: "C:/cloudreve".to_string(),
+        local_policy_roots: std::collections::BTreeMap::new(),
+        verify_local_storage: false,
+        verify_remote_storage: false,
+        direct_link_secret: Some("test-direct-link-secret".to_string()),
+        include_deleted: false,
+        allow_non_empty_target: false,
+        skip_unsupported_policies: false,
+        dry_run: false,
+        run_id: Some(run_id.clone()),
+        resume: false,
+        blob_batch_size: 500,
+        file_batch_size: 500,
+    };
+
+    let report = migrate(options.clone()).await?;
+    assert!(report.validation.passed);
+    assert_eq!(
+        migration_run_status(&target_url, &run_id).await?.status,
+        "completed"
+    );
+
+    let resume_error = migrate(MigrationOptions {
+        resume: true,
+        ..options
+    })
+    .await
+    .unwrap_err();
+    assert!(resume_error.to_string().contains("terminal"));
+
+    let abort_error = abort_migration_run(&target_url, &run_id).await.unwrap_err();
+    assert!(abort_error.to_string().contains("completed"));
+
+    cleanup_completed_migration_run(&target_url, &run_id).await?;
+    let missing_error = migration_run_status(&target_url, &run_id)
+        .await
+        .unwrap_err();
+    assert!(missing_error.to_string().contains("does not exist"));
+
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
     let suffix = uuid::Uuid::new_v4();
     let run_id = format!("blob-resume-test-{suffix}");
@@ -386,9 +497,8 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
     target
         .execute_unprepared(&format!(
             "CREATE TRIGGER fail_blob_batch BEFORE INSERT ON file_blobs \
-             WHEN NEW.hash = '{}' \
-             BEGIN SELECT RAISE(ABORT, 'forced blob batch failure'); END",
-            format!("cloudreve-{failing_blob_id:016x}")
+             WHEN NEW.hash = 'cloudreve-{failing_blob_id:016x}' \
+             BEGIN SELECT RAISE(ABORT, 'forced blob batch failure'); END"
         ))
         .await?;
     target.close().await?;
@@ -399,9 +509,6 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
         default_password: "temporary-password".to_string(),
         local_base_path: "C:/cloudreve".to_string(),
         local_policy_roots: std::collections::BTreeMap::new(),
-        storage_mode: StorageMode::ReuseSourceStorage,
-        target_local_base_path: None,
-        target_local_policy_roots: std::collections::BTreeMap::new(),
         verify_local_storage: false,
         verify_remote_storage: false,
         direct_link_secret: Some("test-direct-link-secret".to_string()),
@@ -497,9 +604,6 @@ async fn resumes_files_from_last_committed_batch() -> Result<()> {
         default_password: "temporary-password".to_string(),
         local_base_path: "C:/cloudreve".to_string(),
         local_policy_roots: std::collections::BTreeMap::new(),
-        storage_mode: StorageMode::ReuseSourceStorage,
-        target_local_base_path: None,
-        target_local_policy_roots: std::collections::BTreeMap::new(),
         verify_local_storage: false,
         verify_remote_storage: false,
         direct_link_secret: Some("test-direct-link-secret".to_string()),

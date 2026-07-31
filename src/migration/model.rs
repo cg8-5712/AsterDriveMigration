@@ -225,50 +225,6 @@ pub(super) fn source_settings(value: &Option<Value>) -> Value {
     value.clone().unwrap_or_else(|| json!({}))
 }
 
-pub(super) fn policy_options(
-    policy: &cloudreve_schema::storage_policies::Model,
-) -> StoredStoragePolicyOptions {
-    let settings = source_settings(&policy.settings);
-    let path_style = settings
-        .get("s3_path_style")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    json!({
-        "s3_path_style": path_style,
-        "object_storage_upload_strategy": "relay_stream",
-        "object_storage_download_strategy": "relay_stream",
-        "cloudreve_source": settings,
-        "cloudreve_policy_type": policy.r#type,
-    })
-    .to_string()
-    .into()
-}
-
-pub(super) fn allowed_types(
-    policy: &cloudreve_schema::storage_policies::Model,
-) -> StoredStoragePolicyAllowedTypes {
-    source_settings(&policy.settings)
-        .get("file_type")
-        .cloned()
-        .unwrap_or_else(|| json!([]))
-        .to_string()
-        .into()
-}
-
-pub(super) fn chunk_size(policy: &cloudreve_schema::storage_policies::Model) -> i64 {
-    source_settings(&policy.settings)
-        .get("chunk_size")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-}
-
-pub(super) fn group_is_admin(group: &cloudreve_schema::groups::Model) -> bool {
-    group
-        .permissions
-        .first()
-        .is_some_and(|permissions| permissions & 1 == 1)
-}
-
 pub(super) fn opaque_blob_key(entity_id: i64) -> String {
     format!("cloudreve-{entity_id:016x}")
 }

@@ -1,6 +1,13 @@
 use super::*;
 use sea_orm::DatabaseTransaction;
 
+use aster_drive_migration_core::{Conversion, ConversionContext, SourceConverter};
+use aster_drive_writer::{AsterDriveWriter, ResolvedFolder, ResolvedPolicyGroup, ResolvedUser};
+use cloudreve_adapter::{
+    CloudreveConverter, CloudreveFolderRecord, CloudrevePolicyGroupRecord,
+    CloudreveStoragePolicyRecord, CloudreveUserRecord,
+};
+
 pub(super) async fn migrate_policies(
     transaction: &DatabaseTransaction,
     source: &SourceData,
@@ -8,52 +15,34 @@ pub(super) async fn migrate_policies(
     context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
     let mut default_assigned = false;
     for policy in &source.policies {
-        let Some(driver_type) = map_driver_type(&policy.r#type).filter(|_| {
-            !source_settings(&policy.settings)
-                .get("encryption")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        }) else {
-            report.record_skip(
-                "storage_policy",
-                Some(policy.id),
-                unsupported_policy_reason(policy)
-                    .unwrap_or_else(|| "storage policy is not compatible with AD".to_string()),
-            );
-            continue;
-        };
-        let base_path = if policy.r#type == "local" {
-            target_local_policy_root(options, policy.id)?.to_string()
+        let local_root = if policy.r#type == "local" {
+            Some(local_policy_root(options, policy.id).to_string())
         } else {
-            String::new()
+            None
         };
-        let model = aster_drive_schema::entities::storage_policy::ActiveModel {
-            name: Set(policy.name.clone()),
-            driver_type: Set(driver_type),
-            endpoint: Set(policy.server.clone().unwrap_or_default()),
-            bucket: Set(policy.bucket_name.clone().unwrap_or_default()),
-            access_key: Set(policy.access_key.clone().unwrap_or_default()),
-            secret_key: Set(policy.secret_key.clone().unwrap_or_default()),
-            base_path: Set(base_path),
-            remote_node_id: Set(None),
-            max_file_size: Set(policy.max_size.unwrap_or(0)),
-            allowed_types: Set(allowed_types(policy)),
-            options: Set(policy_options(policy)),
-            is_default: Set(!default_assigned),
-            chunk_size: Set(chunk_size(policy)),
-            created_at: Set(target_time(policy.created_at)),
-            updated_at: Set(target_time(policy.updated_at)),
-            remote_storage_target_key: Set(None),
-            ..Default::default()
+        match converter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: policy.clone(),
+                local_root,
+            },
+            &conversion_context,
+        )? {
+            Conversion::Ready(converted) => {
+                let source_id = converted.source_id;
+                let target_id = writer.write_policy(converted, !default_assigned).await?;
+                default_assigned = true;
+                context.policies.insert(source_id, target_id);
+                report.migrated_policies += 1;
+            }
+            Conversion::Skipped(reason) => {
+                report.record_skip("storage_policy", Some(policy.id), reason.message);
+            }
         }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("migrate storage policy {}", policy.id))?;
-        default_assigned = true;
-        context.policies.insert(policy.id, model.id);
-        report.migrated_policies += 1;
     }
     Ok(())
 }
@@ -64,38 +53,31 @@ pub(super) async fn migrate_policy_groups(
     context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
     for group in &source.groups {
-        let target_group = aster_drive_schema::entities::storage_policy_group::ActiveModel {
-            name: Set(group.name.clone()),
-            description: Set(format!("Migrated from Cloudreve group {}", group.id)),
-            is_enabled: Set(true),
-            is_default: Set(false),
-            created_at: Set(target_time(group.created_at)),
-            updated_at: Set(target_time(group.updated_at)),
-            ..Default::default()
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("migrate Cloudreve group {}", group.id))?;
-        context.policy_groups.insert(group.id, target_group.id);
+        let converted = converter
+            .convert(
+                CloudrevePolicyGroupRecord {
+                    group: group.clone(),
+                },
+                &conversion_context,
+            )?
+            .into_ready()
+            .expect("Cloudreve policy-group conversion never skips");
+        let source_id = converted.source_id;
+        let policy_id = converted
+            .policy_source_id
+            .and_then(|source_id| context.policies.get(&source_id).copied());
+        let target_id = writer
+            .write_policy_group(ResolvedPolicyGroup {
+                group: converted,
+                policy_id,
+            })
+            .await?;
+        context.policy_groups.insert(source_id, target_id);
         report.migrated_policy_groups += 1;
-
-        if let Some(source_policy_id) = group.storage_policy_id
-            && let Some(target_policy_id) = context.policies.get(&source_policy_id)
-        {
-            aster_drive_schema::entities::storage_policy_group_item::ActiveModel {
-                group_id: Set(target_group.id),
-                policy_id: Set(*target_policy_id),
-                priority: Set(0),
-                min_file_size: Set(0),
-                max_file_size: Set(0),
-                created_at: Set(target_time(group.created_at)),
-                ..Default::default()
-            }
-            .insert(transaction)
-            .await
-            .wrap_err_with(|| format!("link Cloudreve group {} storage policy", group.id))?;
-        }
     }
     Ok(())
 }
@@ -112,81 +94,39 @@ pub(super) async fn migrate_users(
         .iter()
         .map(|group| (group.id, group))
         .collect();
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
     let mut used_usernames = HashSet::new();
     for user in &source.users {
         let username = unique_username(&user.nick, user.id, &mut used_usernames);
-        let group = groups.get(&user.group_users).copied();
-        let role = if group.is_some_and(group_is_admin) {
-            "admin"
-        } else {
-            "user"
-        };
-        let status = if user.status == "active" && user.deleted_at.is_none() {
-            "active"
-        } else {
-            "disabled"
-        };
-        let target = aster_drive_schema::entities::user::ActiveModel {
-            username: Set(username.clone()),
-            email: Set(user.email.clone()),
-            password_hash: Set(password_hash.to_string()),
-            role: Set(if role == "admin" {
-                UserRole::Admin
-            } else {
-                UserRole::User
-            }),
-            status: Set(if status == "active" {
-                UserStatus::Active
-            } else {
-                UserStatus::Disabled
-            }),
-            session_version: Set(1),
-            email_verified_at: Set((status == "active").then(|| target_time(user.created_at))),
-            pending_email: Set(None),
-            storage_used: Set(user.storage),
-            storage_quota: Set(group.and_then(|group| group.max_storage).unwrap_or(0)),
-            policy_group_id: Set(context.policy_groups.get(&user.group_users).copied()),
-            created_at: Set(target_time(user.created_at)),
-            updated_at: Set(target_time(user.updated_at)),
-            config: Set(user
-                .settings
-                .as_ref()
-                .map(|settings| StoredUserConfig::from(settings.to_string()))),
-            must_change_password: Set(true),
-            ..Default::default()
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("migrate Cloudreve user {}", user.id))?;
-
-        let avatar = user.avatar.clone().unwrap_or_default();
-        let avatar_source = if avatar.is_empty() {
-            "none"
-        } else if avatar.to_ascii_lowercase().contains("gravatar") {
-            "gravatar"
-        } else {
-            "upload"
-        };
-        aster_drive_schema::entities::user_profile::ActiveModel {
-            user_id: Set(target.id),
-            display_name: Set(Some(user.nick.clone())),
-            wopi_user_info: Set(None),
-            avatar_source: Set(match avatar_source {
-                "none" => AvatarSource::None,
-                "gravatar" => AvatarSource::Gravatar,
-                _ => AvatarSource::Upload,
-            }),
-            avatar_key: Set((!avatar.is_empty()).then_some(avatar)),
-            avatar_version: Set(0),
-            created_at: Set(target_time(user.created_at)),
-            updated_at: Set(target_time(user.updated_at)),
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("create profile for Cloudreve user {}", user.id))?;
-
-        context.users.insert(user.id, target.id);
-        context.usernames.insert(user.id, username);
+        let converted = converter
+            .convert(
+                CloudreveUserRecord {
+                    user: user.clone(),
+                    group: groups.get(&user.group_users).map(|group| (*group).clone()),
+                    username: username.clone(),
+                },
+                &conversion_context,
+            )?
+            .into_ready()
+            .expect("Cloudreve user conversion never skips");
+        let source_id = converted.source_id;
+        let policy_group_id = context
+            .policy_groups
+            .get(&converted.policy_group_source_id)
+            .copied();
+        let target_id = writer
+            .write_user(
+                ResolvedUser {
+                    user: converted,
+                    policy_group_id,
+                },
+                password_hash,
+            )
+            .await?;
+        context.users.insert(source_id, target_id);
+        context.usernames.insert(source_id, username);
         report.migrated_users += 1;
     }
     Ok(())
@@ -198,60 +138,71 @@ pub(super) async fn migrate_folders(
     context: &mut MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<()> {
-    let mut pending: Vec<&cloudreve_schema::files::Model> = source
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
+    let mut pending = source
         .folders
         .iter()
-        .filter(|file| file.r#type == 1)
-        .collect();
-    pending.sort_by_key(|folder| folder.id);
+        .map(|folder| {
+            converter
+                .convert(
+                    CloudreveFolderRecord {
+                        folder: folder.clone(),
+                    },
+                    &conversion_context,
+                )
+                .and_then(|conversion| {
+                    conversion.into_ready().ok_or_else(|| {
+                        color_eyre::eyre::eyre!("source folder query returned a non-folder row")
+                    })
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pending.sort_by_key(|folder| folder.source_id);
 
     while !pending.is_empty() {
         let mut progress = false;
         let mut next = Vec::new();
         for folder in pending {
-            let parent = folder.file_children;
-            if parent.is_some_and(|parent_id| {
+            if folder.parent_source_id.is_some_and(|parent_id| {
                 source
                     .folders
                     .iter()
-                    .any(|file| file.id == parent_id && file.r#type == 1)
+                    .any(|candidate| candidate.id == parent_id && candidate.r#type == 1)
                     && !context.folders.contains_key(&parent_id)
             }) {
                 next.push(folder);
                 continue;
             }
-            let Some(owner_id) = context.users.get(&folder.owner_id).copied() else {
+            let source_id = folder.source_id;
+            let owner_source_id = folder.owner_source_id;
+            if !context.users.contains_key(&owner_source_id) {
                 report.record_skip(
                     "folder",
-                    Some(folder.id),
-                    format!("owner user {} was not migrated", folder.owner_id),
+                    Some(source_id),
+                    format!("owner user {owner_source_id} was not migrated"),
                 );
                 continue;
-            };
-            let target = aster_drive_schema::entities::folder::ActiveModel {
-                name: Set(folder.name.clone()),
-                parent_id: Set(parent.and_then(|id| context.folders.get(&id).copied())),
-                team_id: Set(None),
-                owner_user_id: Set(Some(owner_id)),
-                created_by_user_id: Set(Some(owner_id)),
-                created_by_username: Set(context
-                    .usernames
-                    .get(&folder.owner_id)
-                    .cloned()
-                    .unwrap_or_default()),
-                policy_id: Set(folder
-                    .storage_policy_files
-                    .and_then(|id| context.policies.get(&id).copied())),
-                created_at: Set(target_time(folder.created_at)),
-                updated_at: Set(target_time(folder.updated_at)),
-                deleted_at: Set(None),
-                is_locked: Set(false),
-                ..Default::default()
             }
-            .insert(transaction)
-            .await
-            .wrap_err_with(|| format!("migrate Cloudreve folder {}", folder.id))?;
-            context.folders.insert(folder.id, target.id);
+            let owner_id = context.users[&owner_source_id];
+            let resolved = ResolvedFolder {
+                parent_id: folder
+                    .parent_source_id
+                    .and_then(|id| context.folders.get(&id).copied()),
+                owner_id,
+                owner_username: context
+                    .usernames
+                    .get(&owner_source_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                policy_id: folder
+                    .policy_source_id
+                    .and_then(|id| context.policies.get(&id).copied()),
+                folder,
+            };
+            let target_id = writer.write_folder(resolved).await?;
+            context.folders.insert(source_id, target_id);
             report.migrated_folders += 1;
             progress = true;
         }
@@ -268,7 +219,6 @@ pub(super) async fn migrate_blob_batch(
     entities: &[cloudreve_schema::entities::Model],
     reference_counts: &HashMap<i64, i64>,
     thumbnail_paths: &HashMap<i64, String>,
-    copied_local_objects: &HashMap<i64, CopiedLocalObject>,
     context: &MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<Vec<(i64, i64)>> {
@@ -291,22 +241,12 @@ pub(super) async fn migrate_blob_batch(
         };
         let reference_count = i32::try_from(reference_counts.get(&entity.id).copied().unwrap_or(1))
             .wrap_err("blob reference count exceeds i32")?;
-        let copied_local_object = copied_local_objects.get(&entity.id);
-        let thumbnail_path = if copied_local_object.is_some() {
-            None
-        } else {
-            thumbnail_paths.get(&entity.id).cloned()
-        };
         let target = aster_drive_schema::entities::file_blob::ActiveModel {
-            hash: Set(copied_local_object
-                .map(|object| object.sha256.clone())
-                .unwrap_or_else(|| opaque_blob_key(entity.id))),
+            hash: Set(opaque_blob_key(entity.id)),
             size: Set(entity.size),
             policy_id: Set(policy_id),
-            storage_path: Set(copied_local_object
-                .map(|object| object.storage_path.clone())
-                .unwrap_or_else(|| entity.source.clone())),
-            thumbnail_path: Set(thumbnail_path),
+            storage_path: Set(entity.source.clone()),
+            thumbnail_path: Set(thumbnail_paths.get(&entity.id).cloned()),
             thumbnail_processor: Set(None),
             thumbnail_version: Set(None),
             ref_count: Set(reference_count),

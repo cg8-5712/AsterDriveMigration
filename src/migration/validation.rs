@@ -968,12 +968,8 @@ pub(super) async fn validate_target_integrity(
         user_usage_drifts + team_usage_drifts,
         "users.storage_used or teams.storage_used differs from current files plus historical versions",
     ));
-    if options.verify_local_storage || options.storage_mode == StorageMode::CopyLocal {
-        checks.push(verify_local_runtime_readability(
-            &blobs,
-            &policies_by_id,
-            options,
-        ));
+    if options.verify_local_storage {
+        checks.push(verify_local_runtime_readability(&blobs, &policies_by_id));
     }
     Ok(checks)
 }
@@ -1025,7 +1021,6 @@ pub(super) fn folder_has_cycle(
 pub(super) fn verify_local_runtime_readability(
     blobs: &[aster_drive_schema::entities::file_blob::Model],
     policies: &HashMap<i64, &aster_drive_schema::entities::storage_policy::Model>,
-    options: &MigrationOptions,
 ) -> ValidationCheck {
     let mut checked = 0usize;
     let mut failed = 0usize;
@@ -1050,12 +1045,6 @@ pub(super) fn verify_local_runtime_readability(
                 file.read_exact(&mut byte)?;
                 file.seek(SeekFrom::End(-1))?;
                 file.read_exact(&mut byte)?;
-            }
-            if options.storage_mode == StorageMode::CopyLocal
-                && blob.hash.len() == 64
-                && sha256_file(&path)? != blob.hash
-            {
-                bail!("SHA-256 differs from the copied blob hash");
             }
             Ok(())
         })();

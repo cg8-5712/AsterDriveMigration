@@ -24,9 +24,9 @@ policies → policy_groups → users → folders → blobs → files → metadat
 | 分享与新直链 | 已支持 | 新建 AD share token/direct-link；旧 Cloudreve URL 不会自动保持可用。 |
 | 归档任务 | 有限支持 | 只迁移为终态历史记录；活动上传任务和运行中会话不迁移。 |
 | 本地存储零拷贝复用 | 已支持 | AD 读取原 Cloudreve 本地根目录，无需复制字节。 |
-| 本地存储复制 | 已支持 | 支持断点续传、原子改名、哈希校验和批次失败补偿。 |
+| 跨根目录对象搬运 | 外部前置步骤 | 使用 rsync、rclone、快照或云厂商复制能力，并保持相对 `storage_path`。 |
 | 远端对象存储零拷贝复用 | 有限支持 | `--verify-remote-storage` 可校验 S3/OSS/KS3/OBS 的 `HeadObject` 与 range read；COS 原生校验尚未实现。 |
-| 远端对象存储物理复制 | 未支持 | 不支持跨 bucket/endpoint 的流式复制或 multipart 上传恢复。 |
+| 远端对象存储搬运 | 外部前置步骤 | 由对象存储或基础设施工具完成跨 bucket/endpoint 搬运与校验。 |
 
 ### 1.2 明确不迁移的内容
 
@@ -58,7 +58,7 @@ policies → policy_groups → users → folders → blobs → files → metadat
 |---|---|---|
 | AD 目标库已由对应版本的 AD migration 初始化 | 空库检查、schema 版本记录、备份点 | AD DBA |
 | Cloudreve 源库和所有对象存储已完成可恢复备份 | 数据库备份校验、对象版本/快照或恢复演练记录 | Cloudreve DBA / 存储管理员 |
-| 存储方案已评审 | 选择“零拷贝复用”或“本地复制”，并完成挂载/权限演练 | 存储管理员 |
+| 存储方案已评审 | 选择零拷贝复用或迁移前外部搬运，并完成挂载、路径和权限演练 | 存储管理员 |
 | 预检通过 | `check` 的 JSON report 中 preflight 无失败项 | 迁移负责人 |
 | 演练通过 | 脱敏全量或代表性样本完成 `migrate`、恢复、验证和回滚演练 | 迁移负责人 / QA |
 | 最终窗口源端已冻结 | 公告、反向代理/应用只读策略、审计日志 | 业务负责人 / 运维 |
@@ -74,8 +74,8 @@ policies → policy_groups → users → folders → blobs → files → metadat
 |---|---|---|
 | AD 能安全挂载 Cloudreve 同一份本地数据目录，并能保持相同相对对象路径 | 本地零拷贝复用（推荐） | 不产生第二份文件；必须确认容器/服务进程实际可读。 |
 | AD 与 Cloudreve 使用同一兼容对象存储 endpoint、bucket、凭据和 key 规则 | 远端零拷贝复用（有限支持） | 不产生第二份文件；上线前必须手工完成 provider `HeadObject` 与 range read 验收。 |
-| AD 必须使用不同的本地磁盘/根目录 | `copy-local` | 需要目的端近似一份完整数据空间，外加迁移期间部分 `.part` 临时文件空间。 |
-| AD 必须使用不同 endpoint/bucket 的远端对象存储 | **当前 No-Go** | 迁移器尚未实现远端流式 copy、multipart checkpoint 与失败清理。 |
+| AD 必须使用不同的本地磁盘/根目录 | 迁移前外部搬运 | 使用 rsync、rclone 或快照复制，并保持相对对象路径；迁移器不搬运字节。 |
+| AD 必须使用不同 endpoint/bucket 的远端对象存储 | 迁移前外部搬运 | 使用 provider copy/rclone 等工具；切换前完成清单与内容校验。 |
 | Cloudreve 策略为 Qiniu、Upyun、remote-node、OneDrive 或加密存储 | **当前 No-Go 或显式跳过** | 不可安全复用；可用 `--skip-unsupported-policies` 仅在业务批准丢弃其依赖文件时跳过。 |
 
 ### 3.2 本地零拷贝复用
@@ -97,34 +97,11 @@ cargo run -- migrate `
 
 `--verify-local-storage` 会检查每一个兼容本地 policy，以及每个迁移 blob 的解析路径、普通文件属性、打开权限、文件大小和首尾读取。它不能证明 Docker/Kubernetes 挂载正确，也不能替代启动 AD 后的 HTTP 下载验证。
 
-### 3.3 本地复制模式（`copy-local`）
+### 3.3 外部对象搬运
 
-当必须迁往不同本地根目录时，使用 `--storage-mode copy-local`。迁移器保持 `entities.source` 相对路径，并写入新的 AD 本地 policy 根目录；源路径含绝对路径或目录逃逸时会被拒绝。
+迁移器只迁移数据库关系、对象引用和相对 `storage_path`，不负责搬运对象字节。目标本地根目录、bucket 或 endpoint 与源端不同时，应在正式迁移前使用 rsync、rclone、文件系统快照或云厂商复制任务完成搬运。外部流程必须保持相对对象路径，并独立校验对象数量、总字节数和抽样内容哈希。
 
-```powershell
-cargo run -- migrate `
-  --source-url "<CLOUDREVE_DATABASE_URL>" `
-  --target-url "<AD_DATABASE_URL>" `
-  --temporary-password "<临时密码>" `
-  --local-policy-root "1=D:/cloudreve-data" `
-  --storage-mode copy-local `
-  --target-local-policy-root "1=E:/asterdrive-data" `
-  --verify-local-storage `
-  --run-id "cloudreve-local-copy-2026-07-23" `
-  --report-path "C:/migration/cloudreve-local-copy.json"
-```
-
-目的根目录必须已存在，且不得与源根目录相同。若最终对象已经存在，迁移器只在其大小和 SHA-256 都等于源对象时复用，绝不覆盖不匹配对象。
-
-#### 复制恢复和补偿语义
-
-1. 数据先流式写入目标目录中的 `.aster-migration-<run-hash>-<entity-id>.part`。
-2. 同一 `--run-id --resume` 会校验已有临时文件前缀后续写；不匹配时立即失败，不会盲目追加。
-3. 写满后执行 `sync_all`，再通过同目录原子 `rename` 发布最终对象。
-4. 同一 blob 批次的 AD 数据库事务回滚时，迁移器删除本批新发布的最终对象作为补偿。
-5. 数据库 commit 结果不确定时，不删除已发布对象；恢复运行会校验并复用大小/哈希一致的最终对象。
-
-这只覆盖兼容 **local** policy 的原文件；不复制缩略图，也不支持远端对象存储复制。
+数据库迁移时仍通过 `--local-base-path` / `--local-policy-root` 配置 AsterDrive 最终可读取的根目录；`--verify-local-storage` 只检查该最终目录中的对象可读性与大小。
 
 ## 4. 生产执行 SOP
 
@@ -201,7 +178,7 @@ cargo run -- migrate `
 | 引用计数 | `file_blobs.ref_count = files + file_versions` 的实际引用数。 |
 | 用量统计 | `users.storage_used` 和 `teams.storage_used` 依 AD 当前文件加历史版本的真实 scope 重算。 |
 | 关系完整性 | folder owner/creator/team/policy/parent 与环；blob policy；file 的 blob/folder/owner/creator/team/scope；file version 的 file/blob；share owner/team/target 且恰好一个 target。 |
-| 本地对象可读性 | 使用 `--verify-local-storage` 或 `copy-local` 时，检查 AD policy `base_path` 下文件类型、大小、打开和首尾读取；`copy-local` 另重算 SHA-256。 |
+| 本地对象可读性 | 使用 `--verify-local-storage` 时，检查 AD policy `base_path` 下文件类型、大小、打开和首尾读取。 |
 
 任何 post-validation failure 都会使命令以非零状态退出，但 JSON report 会在退出前写出，供事故处理使用。
 
@@ -236,9 +213,7 @@ cargo run -- migrate `
 |---|---|---|
 | `check` 或 preflight 失败 | 不执行正式迁移 | 修复源数据、记录豁免，重新预检。 |
 | blob/file 批次失败 | 不更换 run ID；收集日志 | 修复外部原因后 `--resume`；最后未提交批次会重试。 |
-| `copy-local` 中断 | 保留 `.part` 文件 | 使用相同 run ID 恢复；系统校验前缀并继续复制。 |
-| 本地目标已有同名对象但 hash/大小不同 | 立即停止 | 不允许覆盖；隔离冲突对象并调查路径或数据污染。 |
-| 数据库 commit 结果不确定 | 不手工删除新最终对象 | 恢复时由迁移器核验并复用匹配对象。 |
+| 外部对象搬运中断 | 按所用工具的 checkpoint/快照语义处理 | 搬运完成并独立校验后再执行数据库迁移。 |
 | 迁移后关系/统计校验失败 | 不开放 AD | 审阅 report、保留目标库快照；修复代码/数据后在新目标库重跑。 |
 | 远端对象读失败 | 不开放使用该 policy 的 AD 服务 | 检查 AD 部署网络、凭据、endpoint/bucket/key，完成 provider 手工验证。 |
 
@@ -249,7 +224,7 @@ cargo run -- migrate `
 | 风险 | 当前状态 | 上线要求 / 验收条件 | 建议责任人 |
 |---|---|---|---|
 | 远端对象存储在线验证 | S3/OSS/KS3/OBS 已支持 source `HeadObject`/range read；COS 与 AD 运行时读验证仍缺失 | 对 COS 及每个目标 AD policy 完成真实 AD 凭据的手工验证；后续实现原生 COS 与 AD HTTP 自动化。 | 存储管理员 / QA |
-| 跨远端 bucket/endpoint 物理复制 | 未实现 | 需要该模式时为 No-Go；实现流式 copy、真实 hash 去重、multipart upload checkpoint（upload ID、part、ETag、字节数）与 abort/cleanup 后方可上线。 | 迁移研发 |
+| 跨根目录或 bucket 搬运 | 迁移器职责外 | 由基础设施工具完成，并在切换前验证路径兼容、数量、总字节和抽样 hash。 | 存储管理员 / QA |
 | AD HTTP 端到端验证 | 未自动化 | 每次切换必须完成第 5.2 节人工验收；后续建设集成测试环境。 | QA / AD 运维 |
 | 生产规模与真实数据库验证 | 缺 MySQL、PostgreSQL、真实 AD 启动和大样本 E2E | 在目标 DB 引擎、脱敏生产样本和预计容量上演练，覆盖中断恢复和性能基线。 | DBA / QA |
 | 源端变更识别 | fingerprint 无法覆盖内容不变计数的修改 | 最终窗口强制冻结写入，完成冻结后的最终迁移与校验。 | 发布负责人 |
@@ -290,10 +265,7 @@ cargo run -- migrate `
 | `--dry-run` | 执行预检而不写目标；用于演练和切换前检查。 |
 | `--local-base-path` | 本地源 policy 的默认根目录。 |
 | `--local-policy-root ID=PATH` | 覆盖某个 Cloudreve local policy 的源根目录；可重复使用。 |
-| `--storage-mode copy-local` | 复制兼容 local policy 的对象到新根目录；不支持远端 copy。 |
-| `--target-local-base-path` | copy-local 的默认目标根目录。 |
-| `--target-local-policy-root ID=PATH` | copy-local 时覆盖指定源 policy 的目标根目录；可重复使用。 |
-| `--verify-local-storage` | 在本地复用/复制时验证路径、大小、可读性；复制时额外验证 SHA-256。 |
+| `--verify-local-storage` | 验证最终本地根目录中的路径、大小和可读性。 |
 | `--verify-remote-storage` | 对 S3/OSS/KS3/OBS 的源对象执行认证 `HeadObject`、大小比对和 range read；COS 当前会拒绝，避免错误地标记为已验证。 |
 | `--blob-batch-size` | blob 每批大小，默认 `500`，范围 `1..=10000`。 |
 | `--file-batch-size` | file 每批大小，默认 `500`，范围 `1..=10000`。 |
@@ -311,4 +283,4 @@ cargo run -- migrate `
 5. 回滚窗口、源备份、源对象保留期限和切回负责人已明确；
 6. 回滚窗口结束后，才可按数据保留制度处理 Cloudreve 源库与源对象。
 
-在远端物理复制、完整 HTTP 自动化验证、真实生产规模 E2E 和源端冻结控制尚未完善前，不应宣称迁移器已经覆盖“任意 Cloudreve 部署的一键无损迁移”。
+在完整 HTTP 自动化验证、真实生产规模 E2E 和源端冻结控制尚未完善前，不应宣称迁移器已经覆盖“任意 Cloudreve 部署的一键无损迁移”。

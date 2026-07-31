@@ -6,6 +6,7 @@ use sea_orm::{
 };
 
 use super::{MigrationContext, MigrationReport, TargetCounts};
+use aster_drive_migration_core::RunStatus;
 
 pub(super) mod stage_cursor {
     use sea_orm::entity::prelude::*;
@@ -106,15 +107,16 @@ pub(super) async fn load_any<C: ConnectionTrait>(db: &C, run_id: &str) -> Result
 
 pub(super) async fn abort<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<()> {
     let model = load_any(db, run_id).await?;
-    if model.status != "running" && model.status != "failed" {
+    let status = RunStatus::parse(&model.status)?;
+    if !status.can_abort() {
         bail!(
-            "migration run {run_id} has status {}; only running or failed runs may be aborted",
+            "migration run {run_id} has status {}; only running, failed or validation_failed runs may be aborted",
             model.status
         );
     }
     ActiveModel {
         id: Unchanged(run_id.to_string()),
-        status: Set("aborted".to_string()),
+        status: Set(RunStatus::Aborted.as_str().to_string()),
         last_error: Set(Some("aborted by operator".to_string())),
         updated_at: Set(chrono::Utc::now().fixed_offset()),
         ..Default::default()
@@ -127,7 +129,8 @@ pub(super) async fn abort<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<()
 
 pub(super) async fn delete_completed<C: ConnectionTrait>(db: &C, run_id: &str) -> Result<()> {
     let model = load_any(db, run_id).await?;
-    if model.status != "completed" {
+    let status = RunStatus::parse(&model.status)?;
+    if !status.can_cleanup() {
         bail!(
             "migration run {run_id} has status {}; only completed run metadata may be cleaned up",
             model.status
@@ -279,7 +282,7 @@ pub(super) async fn create<C: ConnectionTrait>(
         source_fingerprint: Set(source_fingerprint.to_string()),
         target_fingerprint: Set(target_fingerprint.to_string()),
         plan_fingerprint: Set(plan_fingerprint.to_string()),
-        status: Set("running".to_string()),
+        status: Set(RunStatus::Running.as_str().to_string()),
         last_completed_stage: Set(None),
         context_json: Set(serde_json::to_value(context).wrap_err("serialize migration context")?),
         report_json: Set(serde_json::to_value(report).wrap_err("serialize migration report")?),
@@ -335,7 +338,7 @@ pub(super) async fn save_stage<C: ConnectionTrait>(
 ) -> Result<()> {
     ActiveModel {
         id: Unchanged(run_id.to_string()),
-        status: Set("running".to_string()),
+        status: Set(RunStatus::Running.as_str().to_string()),
         last_completed_stage: Set(Some(stage.to_string())),
         context_json: Set(serde_json::to_value(context).wrap_err("serialize migration context")?),
         report_json: Set(serde_json::to_value(report).wrap_err("serialize migration report")?),
@@ -357,7 +360,7 @@ pub(super) async fn save_progress<C: ConnectionTrait>(
 ) -> Result<()> {
     ActiveModel {
         id: Unchanged(run_id.to_string()),
-        status: Set("running".to_string()),
+        status: Set(RunStatus::Running.as_str().to_string()),
         context_json: Set(serde_json::to_value(context).wrap_err("serialize migration context")?),
         report_json: Set(serde_json::to_value(report).wrap_err("serialize migration report")?),
         last_error: Set(None),
@@ -400,7 +403,7 @@ pub(super) async fn mark_failed<C: ConnectionTrait>(
     let error = error.chars().take(2048).collect::<String>();
     ActiveModel {
         id: Unchanged(run_id.to_string()),
-        status: Set("failed".to_string()),
+        status: Set(RunStatus::Failed.as_str().to_string()),
         last_error: Set(Some(error)),
         updated_at: Set(chrono::Utc::now().fixed_offset()),
         ..Default::default()

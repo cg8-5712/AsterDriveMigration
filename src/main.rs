@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use aster_drive_migration::migration::{
-    MigrationOptions, MigrationReport, StorageMode, abort_migration_run,
-    cleanup_completed_migration_run, inspect, list_migration_runs, migrate, migration_run_report,
-    migration_run_status, write_csv_mapping_report, write_json_report,
+    MigrationOptions, MigrationReport, abort_migration_run, cleanup_completed_migration_run,
+    inspect, list_migration_runs, migrate, migration_run_report, migration_run_status,
+    write_csv_mapping_report, write_json_report,
 };
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, bail};
@@ -81,15 +81,6 @@ struct MigrateArgs {
     local_base_path: String,
     #[arg(long = "local-policy-root", value_name = "SOURCE_POLICY_ID=PATH")]
     local_policy_roots: Vec<String>,
-    #[arg(long, value_enum, default_value_t = StorageMode::ReuseSourceStorage)]
-    storage_mode: StorageMode,
-    #[arg(long, value_name = "PATH")]
-    target_local_base_path: Option<String>,
-    #[arg(
-        long = "target-local-policy-root",
-        value_name = "SOURCE_POLICY_ID=PATH"
-    )]
-    target_local_policy_roots: Vec<String>,
     #[arg(long)]
     verify_local_storage: bool,
     #[arg(long)]
@@ -189,9 +180,6 @@ async fn run_migration(args: MigrateArgs, force_resume: bool) -> Result<()> {
         default_password: args.default_password,
         local_base_path: args.local_base_path,
         local_policy_roots: parse_local_policy_roots(args.local_policy_roots)?,
-        storage_mode: args.storage_mode,
-        target_local_base_path: args.target_local_base_path,
-        target_local_policy_roots: parse_local_policy_roots(args.target_local_policy_roots)?,
         verify_local_storage: args.verify_local_storage,
         verify_remote_storage: args.verify_remote_storage,
         direct_link_secret: args.direct_link_secret,

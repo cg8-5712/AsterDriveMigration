@@ -314,11 +314,14 @@ version = "0.0.0-alpha.0"
 dependencies = [
  "argon2",
  "aster_drive_migration 0.4.0",
+ "aster_drive_migration_core",
  "aster_drive_model",
+ "aster_drive_writer",
  "aws-sdk-s3",
  "base64 0.22.1",
  "chrono",
  "clap",
+ "cloudreve_adapter",
  "cloudreve_schema",
  "color-eyre",
  "hmac 0.12.1",
@@ -347,6 +350,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster_drive_migration_core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+]
+
+[[package]]
 name = "aster_drive_model"
 version = "0.4.0"
 source = "git+https://github.com/AsterCommunity/AsterDrive#c9efba0361962cc4d504f66763a1fda4fcbbdd78"
@@ -360,6 +371,17 @@ dependencies = [
  "serde_json",
  "tracing",
  "validator",
+]
+
+[[package]]
+name = "aster_drive_writer"
+version = "0.1.0"
+dependencies = [
+ "aster_drive_migration_core",
+ "aster_drive_model",
+ "color-eyre",
+ "sea-orm",
+ "serde_json",
 ]
 
 [[package]]
@@ -1266,6 +1288,17 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cloudreve_adapter"
+version = "0.1.0"
+dependencies = [
+ "aster_drive_migration_core",
+ "chrono",
+ "cloudreve_schema",
+ "color-eyre",
+ "serde_json",
+]
 
 [[package]]
 name = "cloudreve_schema"

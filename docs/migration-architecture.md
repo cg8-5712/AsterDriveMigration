@@ -175,7 +175,7 @@ planned -> running -> verifying -> completed
 | 4 | `policy_groups` | AD policy group、group item 及 mapping |
 | 5 | `users` | AD user/profile 及 mapping |
 | 6 | `folders` | 目录树及 parent mapping |
-| 7 | `blobs` | 对象复制/复用、哈希和 blob mapping |
+| 7 | `blobs` | 对象引用、opaque key 和 blob mapping |
 | 8 | `files` | 当前文件和历史版本 |
 | 9 | `shares` | 分享和新 token |
 | 10 | `metadata_tags` | properties、Cloudreve `tag:*` 到 AD 原生标签及关联 |
@@ -426,7 +426,7 @@ Cloudreve group 默认不自动转换成 WorkspaceScope::Team。只有管理员�
 - storage policy decisions
 - conflict policy
 - include_deleted
-- copy/reuse storage mode
+- object-reference and external-transfer decisions
 - concurrency/retry 参数
 - verification level
 - inventory estimate
@@ -629,32 +629,18 @@ checkpoint 表保存在 AD 数据库中，以便迁移进程重启后恢复。�
 | ref_count 可重算 | ref_count 必须能从 files + file_versions 反向计算 |
 | storage_used 可重算 | 用户/workspace 使用量必须能从目标文件关系反向校验 |
 
-## 5. 物理对象复制流程
+## 5. 对象存储边界
 
-目标流程不是只复用 Cloudreve `entity.source`，而是支持将对象实际复制到 AD 管理的存储空间。
+迁移核心负责数据库转换、对象引用和映射，不负责搬运 blob 字节。兼容存储直接复用 Cloudreve 的相对 object key；目标根目录、bucket 或 endpoint 不同时，由 rsync、rclone、文件系统快照或 provider-side copy 在迁移前完成数据搬运。
 
-| 步骤 | 动作 | 关键要求 |
-|---:|---|---|
-| 1 | Read source physical object | SourceAdapter 根据 policy 和 object key 打开流 |
-| 2 | Stream bytes | 固定大小 buffer，支持 backpressure，不整文件载入内存 |
-| 3 | Calculate SHA-256 | 在流式传输过程中计算真实内容哈希 |
-| 4 | Write to AD storage | 使用 AD storage writer 上传到目标策略 |
-| 5 | Generate storage path | 使用 AD 规范，例如 `ab/cd/<sha256>` |
-| 6 | Insert or reuse blob | 按可信 hash + target policy 查找或插入 `file_blobs` |
-| 7 | Insert file | 创建 `files` 并设置 `blob_id` |
-| 8 | Increment/recalculate ref_count | 避免并发下计数漂移，最终统一重算 |
-| 9 | Update storage_used | 按 AD 配额语义更新或最终统一重算 |
+外部搬运必须满足以下契约：
 
-### 对象复制模式
+1. 保持与 Cloudreve `entity.source` 一致的相对 `storage_path`；
+2. 在切换前校验对象数量、总字节和抽样内容哈希；
+3. 目标 AsterDrive 进程能使用最终 policy 实际读取对象；
+4. 搬运 checkpoint、重试、孤儿清理和带宽控制由所选基础设施工具负责。
 
-建议支持两种模式：
-
-| 模式 | 行为 | 适用场景 |
-|---|---|---|
-| `reuse_source_storage` | AD policy 指向原 bucket/path，不复制字节 | 快速切换、源存储长期保留、驱动完全兼容 |
-| `copy_to_target_storage` | 流式读取源对象并写入 AD 新存储 | 真正脱离 Cloudreve、统一对象布局、计算真实 SHA-256 |
-
-当前实现属于 `reuse_source_storage`：保留 Cloudreve object key，并使用 opaque blob key，避免把非内容摘要伪装成 SHA-256。
+当前 blob 写入保留 Cloudreve object key，并使用 opaque blob key，避免把非内容摘要伪装成 SHA-256。
 
 ## 6. 冲突处理
 
@@ -734,7 +720,7 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 - metadata size 与 DB size 一致
 - 随机抽样完整读取
 - 支持 range read 的策略执行范围读取
-- copy 模式校验 SHA-256
+- 外部搬运场景抽样校验 SHA-256
 
 ### 可重算校验
 
@@ -755,7 +741,7 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | 能力 | 当前状态 | 目标状态 |
 |---|---|---|
 | Cloudreve/AD schema 预检 | 已实现 | 扩展版本、权限、capability 和存储连通性检查 |
-| 用户、策略组、目录、文件、blob、版本、分享、metadata | 已实现基础迁移 | 改为 adapter/domain/writer 分层和分页 stage |
+| 用户、策略组、目录、文件、blob、版本、分享、metadata | policy/group/user/folder 已通过独立 adapter/domain/writer crates；其余已实现基础迁移 | 继续迁移其余对象转换并分页 stage |
 | Cloudreve v4 标签 | 已从 `tag:*` metadata 生成 AD `tags` 和 `system.tags` 文件/目录关联 | 增加跨批次持久化去重和冲突报告 |
 | Direct links | 提供 AD `direct_link_secret` 时生成 v2 URL，并以 `cloudreve.direct_links` property 保存源 ID 映射 | 增加独立 JSON/CSV 报告和可选旧 URL 重定向层 |
 | Cloudreve 任务 | 已全部写成 AD `system_runtime` 终态历史；活动任务归档为 canceled | 后续可增加独立 legacy task archive 表，避免占用运维任务列表 |
@@ -764,11 +750,10 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 | 断点续传 | blobs/files 已支持 source ID cursor；其他 stage 为阶段级恢复 | folders 等 cursor、对象存储上传恢复和并行 worker checkpoint |
 | 幂等重复运行 | 同一 run 会跳过已完成 stage；失败 stage 因事务回滚可安全重跑 | 不依赖 run checkpoint 的对象级 upsert/reuse 和完整重复运行 |
 | 冲突策略 | 仅 username 自动后缀，其他冲突依赖 DB 报错 | fail/rename/skip/reuse/update 可配置 |
-| 本地物理对象复制 | 已支持 `copy-local`：流式复制到新 local root，保留相对 storage path，并写入真实 SHA-256 | 远端对象存储 copy/upload、缩略图复制与 hash + policy 去重 |
-| 本地复制恢复/补偿 | 同目录 `.part` 前缀校验、追加、`sync_all` 和原子 rename；DB blob batch 回滚后删除本批新最终文件 | multipart upload checkpoint、跨进程提交结果确认与远端孤儿对象清理 |
+| 对象字节搬运 | 迁移器不搬运；复用兼容引用，跨根目录/bucket 由外部工具完成 | 补充外部搬运清单、校验记录与运行手册 |
 | ref_count 重算 | 最终事务按 `files + file_versions` 统一重算并回写，再复核无漂移 | 大型库的数据库端聚合优化 |
 | storage_used 重算 | 最终事务按 AD 当前文件 + 历史版本、个人/团队 scope 统一重算并回写，再复核无漂移 | 大型库的数据库端聚合优化 |
-| 验证编排 | 提交后重查核心表数量、导入任务终态、标签绑定、直链 property、folder/blob/file/version/share 关系和目录环；`--verify-local-storage`/`copy-local` 打开并读取本地 AD 对象，复制模式复核 SHA-256；有 SQLite 端到端测试 | AD HTTP 下载/分享/直链验证与远端对象存储可读性验证 |
+| 验证编排 | 提交后重查核心表数量、导入任务终态、标签绑定、直链 property、folder/blob/file/version/share 关系和目录环；`--verify-local-storage` 打开并读取本地 AD 对象；有 SQLite 端到端测试 | AD HTTP 下载/分享/直链验证与远端对象存储可读性验证 |
 | 报告 | 已支持终端摘要和 `--report-path` JSON，包含分类跳过原因、核心 ID 映射、标签/直链记录和校验结果 | 增加失败中间态、stage 进度、吞吐量、字节数和独立 CSV 导出 |
 | TUI | 未接入新迁移核心 | 可选进度视图 |
 | 多源系统插件 | 未实现 | SourceAdapter 插件化 |
@@ -784,10 +769,10 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 
 ### Phase 2：领域模型和 Adapter/Writer 重构
 
-- 定义 SourceAdapter、TargetWriter
-- 引入 ExternalUser/Folder/File/Blob/Share
-- 将 Cloudreve ORM 查询移动到 Cloudreve Adapter
-- 将 AD ActiveModel 写入移动到 AsterDrive Writer
+- 已建立 `aster_drive_migration_core`、`cloudreve_adapter`、`aster_drive_writer` 独立 crates
+- 继续引入 File/Blob/Share 等 source-neutral domain values
+- 将剩余 Cloudreve ORM 转换移动到 Cloudreve Adapter
+- 将剩余 AD ActiveModel 写入移动到 AsterDrive Writer
 
 ### Phase 3：持久化运行状态
 
@@ -796,13 +781,11 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 - resume 和幂等 upsert
 - `migrate list/resume/report`
 
-### Phase 4：物理对象复制
+### Phase 4：对象存储交接
 
-- StorageResolver 和 BlobReader
-- AsterDrive Storage Writer
-- 流式 SHA-256
-- copy/reuse 两种模式
-- 孤儿对象清理
+- 输出需要外部搬运的 policy 和相对路径清单
+- 记录 rsync/rclone/快照/provider copy 的完成证据
+- 在 AsterDrive 运行环境执行读取抽检
 
 ### Phase 5：验证和运维体验
 
@@ -818,7 +801,7 @@ Cloudreve entity ID、object key、路径或 `policy+path+size` 摘要都不能�
 1. 所有必需 stages 完成并持久化 cursor。
 2. 所有迁移对象都有 created/reused/skipped/renamed 等明确 mapping 状态。
 3. 目标关系完整，没有孤儿 owner、parent、blob、version 或 share。
-4. copy 模式下对象大小和 SHA-256 校验通过。
+4. 外部对象搬运完成，且目标运行环境的大小与抽样 SHA-256 校验通过。
 5. ref_count 和 storage_used 重算通过。
 6. 源在最终校验窗口内没有发生未处理变化。
 7. 所有 skipped 和 warning 都出现在最终报告中。

@@ -105,21 +105,13 @@ impl MigrationStage {
         }
     }
 
-    fn should_run_after(self, last_completed_stage: Option<&str>) -> Result<bool> {
-        let Some(last_completed_stage) = last_completed_stage else {
-            return Ok(true);
-        };
-        let last_index = Self::ALL
-            .iter()
-            .position(|stage| stage.as_str() == last_completed_stage)
-            .ok_or_else(|| {
-                color_eyre::eyre::eyre!("checkpoint contains unknown stage {last_completed_stage}")
-            })?;
-        let current_index = Self::ALL
-            .iter()
-            .position(|stage| *stage == self)
-            .expect("migration stage must exist in ALL");
-        Ok(current_index > last_index)
+    fn plan() -> aster_drive_migration_core::StagePlan {
+        aster_drive_migration_core::StagePlan::new(
+            Self::ALL
+                .into_iter()
+                .map(|stage| aster_drive_migration_core::StageId::borrowed(stage.as_str())),
+        )
+        .expect("static migration stages form a valid plan")
     }
 }
 
@@ -174,15 +166,10 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
         );
     }
     validate_local_policy_roots(&source_data, &options)?;
-    if options.verify_local_storage || options.storage_mode == StorageMode::CopyLocal {
+    if options.verify_local_storage {
         verify_local_storage_roots(&source_data, &options)?;
     }
-    if options.storage_mode == StorageMode::CopyLocal {
-        verify_target_local_storage_roots(&source_data, &options)?;
-    }
-    if options.dry_run
-        && (options.verify_local_storage || options.storage_mode == StorageMode::CopyLocal)
-    {
+    if options.dry_run && options.verify_local_storage {
         verify_all_local_source_objects(&source, &source_data, &options).await?;
     }
     if options.dry_run && options.verify_remote_storage {
@@ -216,12 +203,10 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
             &plan_fingerprint,
         )
         .await?;
-        if !matches!(
-            loaded.status.as_str(),
-            "running" | "failed" | "validation_failed" | "completed"
-        ) {
+        let status = aster_drive_migration_core::RunStatus::parse(&loaded.status)?;
+        if !status.can_resume() {
             bail!(
-                "migration run {run_id} has unsupported status {}",
+                "migration run {run_id} has status {}; this run is terminal and cannot be resumed",
                 loaded.status
             );
         }
@@ -288,8 +273,12 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
 
     let password_hash = hash_password(&options.default_password)?;
 
+    let stage_plan = MigrationStage::plan();
     for (stage_index, stage) in MigrationStage::ALL.into_iter().enumerate() {
-        if !stage.should_run_after(last_completed_stage.as_deref())? {
+        if !stage_plan.should_run_after(
+            &aster_drive_migration_core::StageId::borrowed(stage.as_str()),
+            last_completed_stage.as_deref(),
+        )? {
             continue;
         }
         eprintln!(
@@ -603,13 +592,6 @@ pub(super) async fn migrate_blobs_batched(
         let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
         let association_info = load_blob_association_info(inputs.source, &entity_ids).await?;
         let last_entity_id = entities.last().expect("non-empty blob batch").id;
-        let copied_objects = copy_local_blob_batch(
-            &entities,
-            inputs.source_data,
-            inputs.options,
-            inputs.context,
-            inputs.run_id,
-        )?;
         let transaction = inputs.target.begin().await.wrap_err("begin blobs batch")?;
         let report_before_batch = report.clone();
         let batch_result: Result<Vec<(i64, i64)>> = async {
@@ -618,7 +600,6 @@ pub(super) async fn migrate_blobs_batched(
                 &entities,
                 &association_info.reference_counts,
                 &association_info.thumbnail_paths,
-                &copied_objects.objects,
                 inputs.context,
                 report,
             )
@@ -643,7 +624,6 @@ pub(super) async fn migrate_blobs_batched(
             Err(error) => {
                 let _ = transaction.rollback().await;
                 *report = report_before_batch;
-                copied_objects.compensate()?;
                 return Err(error);
             }
         };
@@ -939,7 +919,7 @@ pub(super) fn source_fingerprint(source_url: &str, source: &SourceData) -> Strin
 pub(super) fn progress_timing(processed: i64, total: u64, started_at: Instant) -> String {
     let elapsed_seconds = started_at.elapsed().as_secs_f64().max(0.001);
     let rows_per_second = processed as f64 / elapsed_seconds;
-    let remaining_rows = total.saturating_sub(processed.max(0) as u64);
+    let remaining_rows = total.saturating_sub(processed.max(0).cast_unsigned());
     let eta_seconds = if rows_per_second > 0.0 {
         remaining_rows as f64 / rows_per_second
     } else {
@@ -952,21 +932,10 @@ pub(super) fn progress_timing(processed: i64, total: u64, started_at: Instant) -
 
 pub(super) fn plan_fingerprint(options: &MigrationOptions) -> String {
     hash_fingerprint(&format!(
-        "{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         options.local_base_path,
         options
             .local_policy_roots
-            .iter()
-            .map(|(policy_id, path)| format!("{policy_id}={path}"))
-            .collect::<Vec<_>>()
-            .join("|"),
-        options.storage_mode,
-        options
-            .target_local_base_path
-            .as_deref()
-            .unwrap_or_default(),
-        options
-            .target_local_policy_roots
             .iter()
             .map(|(policy_id, path)| format!("{policy_id}={path}"))
             .collect::<Vec<_>>()
