@@ -1,14 +1,17 @@
 use super::*;
 use sea_orm::DatabaseTransaction;
 
-use aster_drive_migration_core::{Conversion, ConversionContext, SourceConverter};
+use aster_drive_migration_core::{
+    Conversion, ConversionContext, MigrationShareTarget, SourceConverter,
+};
 use aster_drive_writer::{
     AsterDriveWriter, ResolvedBlob, ResolvedFile, ResolvedFileVersion, ResolvedFolder,
-    ResolvedPolicyGroup, ResolvedUser,
+    ResolvedPolicyGroup, ResolvedShare, ResolvedShareTarget, ResolvedUser,
 };
 use cloudreve_adapter::{
     CloudreveBlobRecord, CloudreveConverter, CloudreveFileRecord, CloudreveFolderRecord,
-    CloudrevePolicyGroupRecord, CloudreveStoragePolicyRecord, CloudreveUserRecord,
+    CloudrevePolicyGroupRecord, CloudreveShareRecord, CloudreveStoragePolicyRecord,
+    CloudreveUserRecord,
 };
 
 pub(super) async fn migrate_policies(
@@ -734,65 +737,80 @@ pub(super) async fn migrate_shares(
         .filter_map(|share| share.file_shares)
         .collect::<Vec<_>>();
     let source_files = load_source_files(source_db, &source_file_ids).await?;
+    let converter = CloudreveConverter;
+    let conversion_context = ConversionContext;
+    let writer = AsterDriveWriter::new(transaction);
     for share in &source.shares {
-        let Some(source_user_id) = share.user_shares else {
-            report.record_skip("share", Some(share.id), "share has no owner user");
-            continue;
+        let conversion = converter.convert(
+            CloudreveShareRecord {
+                share: share.clone(),
+                target: share
+                    .file_shares
+                    .and_then(|source_id| source_files.get(&source_id).cloned()),
+            },
+            &conversion_context,
+        )?;
+        let migrated_share = match conversion {
+            Conversion::Ready(share) => share,
+            Conversion::Skipped(reason) => {
+                report.record_skip("share", Some(share.id), reason.message);
+                continue;
+            }
         };
-        let Some(user_id) = context.users.get(&source_user_id).copied() else {
+        let Some(user_id) = context.users.get(&migrated_share.owner_source_id).copied() else {
             report.record_skip(
                 "share",
                 Some(share.id),
-                format!("owner user {source_user_id} was not migrated"),
+                format!(
+                    "owner user {} was not migrated",
+                    migrated_share.owner_source_id
+                ),
             );
             continue;
         };
-        let Some(source_file_id) = share.file_shares else {
-            report.record_skip("share", Some(share.id), "share has no file/folder target");
-            continue;
+        let resolved_target = match migrated_share.target {
+            MigrationShareTarget::File { source_id } => file_mappings
+                .get(&source_id)
+                .copied()
+                .map(|target_id| ResolvedShareTarget::File { target_id }),
+            MigrationShareTarget::Folder { source_id } => context
+                .folders
+                .get(&source_id)
+                .copied()
+                .map(|target_id| ResolvedShareTarget::Folder { target_id }),
         };
-        let source_file = source_files.get(&source_file_id);
-        let file_id = source_file
-            .filter(|file| file.r#type == 0)
-            .and_then(|_| file_mappings.get(&source_file_id).copied());
-        let folder_id = source_file
-            .filter(|file| file.r#type == 1)
-            .and_then(|_| context.folders.get(&source_file_id).copied());
-        if file_id.is_none() && folder_id.is_none() {
+        let Some(resolved_target) = resolved_target else {
+            let source_target_id = match migrated_share.target {
+                MigrationShareTarget::File { source_id }
+                | MigrationShareTarget::Folder { source_id } => source_id,
+            };
             report.record_skip(
                 "share",
                 Some(share.id),
-                format!("source target {source_file_id} was not migrated"),
+                format!("source target {source_target_id} was not migrated"),
             );
             continue;
-        }
-        let password = match share.password.as_deref().filter(|value| !value.is_empty()) {
-            Some(password) => Some(hash_password(password)?),
+        };
+        let password_hash = match migrated_share.plain_password.as_deref() {
+            Some(password) => Some(hash_argon2_password(password)?),
             None => None,
         };
-        let max_downloads = share
-            .remain_downloads
-            .map(|remaining| share.downloads.saturating_add(remaining))
-            .unwrap_or(0);
-        let target = aster_drive_schema::entities::share::ActiveModel {
-            token: Set(share_token(share.id)),
-            user_id: Set(user_id),
-            team_id: Set(None),
-            file_id: Set(file_id),
-            folder_id: Set(folder_id),
-            password: Set(password),
-            expires_at: Set(target_optional_time(share.expires)),
-            max_downloads: Set(max_downloads),
-            download_count: Set(share.downloads),
-            view_count: Set(share.views),
-            created_at: Set(target_time(share.created_at)),
-            updated_at: Set(target_time(share.updated_at)),
-            ..Default::default()
-        }
-        .insert(transaction)
-        .await
-        .wrap_err_with(|| format!("migrate share {}", share.id))?;
-        context.shares.insert(share.id, target.id);
+        let source_id = migrated_share.source_id;
+        let target_id = writer
+            .write_share(ResolvedShare {
+                source_id,
+                owner_id: user_id,
+                target: resolved_target,
+                password_hash,
+                expires_at: migrated_share.expires_at,
+                max_downloads: migrated_share.max_downloads,
+                download_count: migrated_share.download_count,
+                view_count: migrated_share.view_count,
+                created_at: migrated_share.created_at,
+                updated_at: migrated_share.updated_at,
+            })
+            .await?;
+        context.shares.insert(source_id, target_id);
         report.migrated_shares += 1;
     }
     Ok(())

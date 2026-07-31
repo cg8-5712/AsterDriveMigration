@@ -32,3 +32,9 @@ pub struct CloudreveFileRecord {
     pub file: cloudreve_schema::files::Model,
     pub entities: Vec<cloudreve_schema::entities::Model>,
 }
+
+#[derive(Debug, Clone)]
+pub struct CloudreveShareRecord {
+    pub share: cloudreve_schema::shares::Model,
+    pub target: Option<cloudreve_schema::files::Model>,
+}

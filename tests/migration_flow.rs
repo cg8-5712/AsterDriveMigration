@@ -1,5 +1,6 @@
 mod support;
 
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use aster_drive_migration::migration::*;
 use aster_drive_model as aster_drive_schema;
 use aster_drive_model::types::{
@@ -173,6 +174,37 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
             .count(&target)
             .await?,
         1
+    );
+    let migrated_share = aster_drive_schema::entities::share::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated share");
+    assert_eq!(migrated_share.token.len(), 32);
+    assert!(
+        migrated_share
+            .token
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
+    assert_eq!(migrated_share.team_id, None);
+    assert_eq!(migrated_share.folder_id, None);
+    assert!(migrated_share.file_id.is_some());
+    assert_eq!(migrated_share.max_downloads, 5);
+    assert_eq!(migrated_share.download_count, 2);
+    assert_eq!(migrated_share.view_count, 4);
+    let password_hash = migrated_share
+        .password
+        .as_deref()
+        .expect("migrated share password hash");
+    assert_ne!(password_hash, "share-password");
+    assert!(
+        Argon2::default()
+            .verify_password(
+                b"share-password",
+                &PasswordHash::new(password_hash)
+                    .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?,
+            )
+            .is_ok()
     );
     assert_eq!(
         aster_drive_schema::entities::tag::Entity::find()

@@ -28,12 +28,6 @@ fn target_time(value: chrono::DateTime<chrono::FixedOffset>) -> chrono::DateTime
     value.with_timezone(&chrono::Utc)
 }
 
-fn target_optional_time(
-    value: Option<chrono::DateTime<chrono::FixedOffset>>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    value.map(target_time)
-}
-
 mod checkpoint;
 mod engine;
 mod local_storage;

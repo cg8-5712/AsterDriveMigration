@@ -19,6 +19,7 @@ color-eyre.workspace = true
 mime_guess.workspace = true
 sea-orm = { workspace = true, features = ["macros"] }
 serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 aster_drive_schema_migration.workspace = true

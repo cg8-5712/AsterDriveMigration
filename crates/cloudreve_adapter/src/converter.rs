@@ -5,13 +5,13 @@ use serde_json::{Value, json};
 
 use super::{
     CloudreveBlobRecord, CloudreveFileRecord, CloudreveFolderRecord, CloudrevePolicyGroupRecord,
-    CloudreveStoragePolicyRecord, CloudreveUserRecord,
+    CloudreveShareRecord, CloudreveStoragePolicyRecord, CloudreveUserRecord,
 };
 use aster_drive_migration_core::{
     Conversion, ConversionContext, MigrationAvatarSource, MigrationBlob, MigrationFile,
-    MigrationFileVersion, MigrationFolder, MigrationPolicyGroup, MigrationStorageDriver,
-    MigrationStoragePolicy, MigrationUser, MigrationUserRole, MigrationUserStatus, SkipReason,
-    SourceConverter,
+    MigrationFileVersion, MigrationFolder, MigrationPolicyGroup, MigrationShare,
+    MigrationShareTarget, MigrationStorageDriver, MigrationStoragePolicy, MigrationUser,
+    MigrationUserRole, MigrationUserStatus, SkipReason, SourceConverter,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -345,6 +345,103 @@ impl SourceConverter<CloudreveFileRecord> for CloudreveConverter {
     }
 }
 
+impl SourceConverter<CloudreveShareRecord> for CloudreveConverter {
+    type Output = MigrationShare;
+    type Error = color_eyre::Report;
+
+    fn convert(
+        &self,
+        source: CloudreveShareRecord,
+        _: &ConversionContext,
+    ) -> Result<Conversion<Self::Output>> {
+        let share = source.share;
+        if share.deleted_at.is_some() {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "deleted_share",
+                message: format!("Cloudreve share {} is deleted", share.id),
+            }));
+        }
+        let Some(owner_source_id) = share.user_shares else {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "missing_share_owner",
+                message: format!("Cloudreve share {} has no owner user", share.id),
+            }));
+        };
+        let Some(target_source_id) = share.file_shares else {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "missing_share_target",
+                message: format!("Cloudreve share {} has no file/folder target", share.id),
+            }));
+        };
+        let Some(target) = source.target else {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "missing_share_target",
+                message: format!(
+                    "Cloudreve share {} target {} does not exist",
+                    share.id, target_source_id
+                ),
+            }));
+        };
+        if target.id != target_source_id {
+            bail!(
+                "Cloudreve share {} target record {} does not match target {}",
+                share.id,
+                target.id,
+                target_source_id
+            );
+        }
+        let target = match target.r#type {
+            0 => MigrationShareTarget::File {
+                source_id: target_source_id,
+            },
+            1 => MigrationShareTarget::Folder {
+                source_id: target_source_id,
+            },
+            target_type => {
+                return Ok(Conversion::Skipped(SkipReason {
+                    code: "unsupported_share_target",
+                    message: format!(
+                        "Cloudreve share {} target {} has unsupported type {}",
+                        share.id, target_source_id, target_type
+                    ),
+                }));
+            }
+        };
+        if share.downloads < 0 || share.views < 0 {
+            bail!(
+                "Cloudreve share {} has negative view or download counters",
+                share.id
+            );
+        }
+        let max_downloads = match share.remain_downloads {
+            None => 0,
+            Some(remaining) if remaining < 0 => {
+                bail!(
+                    "Cloudreve share {} has negative remaining downloads {}",
+                    share.id,
+                    remaining
+                );
+            }
+            Some(remaining) => share.downloads.checked_add(remaining).ok_or_else(|| {
+                color_eyre::eyre::eyre!("Cloudreve share {} download limit exceeds i64", share.id)
+            })?,
+        };
+        let plain_password = share.password.filter(|password| !password.is_empty());
+        Ok(Conversion::Ready(MigrationShare {
+            source_id: share.id,
+            owner_source_id,
+            target,
+            plain_password,
+            expires_at: share.expires.map(target_time),
+            max_downloads,
+            download_count: share.downloads,
+            view_count: share.views,
+            created_at: target_time(share.created_at),
+            updated_at: target_time(share.updated_at),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +535,27 @@ mod tests {
             recycle_options: None,
             storage_policy_entities: 7,
             created_by: Some(9),
+        }
+    }
+
+    fn share(
+        id: i64,
+        target_id: Option<i64>,
+        owner_id: Option<i64>,
+    ) -> cloudreve_schema::shares::Model {
+        cloudreve_schema::shares::Model {
+            id,
+            created_at: now(),
+            updated_at: now(),
+            deleted_at: None,
+            password: Some("secret".to_string()),
+            views: 5,
+            downloads: 7,
+            expires: Some(now() + chrono::TimeDelta::days(1)),
+            remain_downloads: Some(3),
+            props: Some(json!({"show_readme": true})),
+            file_shares: target_id,
+            user_shares: owner_id,
         }
     }
 
@@ -708,6 +826,120 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("negative size")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn converts_file_and_folder_shares_with_download_semantics() -> Result<()> {
+        for (target_type, expected_target) in [
+            (0, MigrationShareTarget::File { source_id: 10 }),
+            (1, MigrationShareTarget::Folder { source_id: 10 }),
+        ] {
+            let converted = ready(CloudreveConverter.convert(
+                CloudreveShareRecord {
+                    share: share(30, Some(10), Some(9)),
+                    target: Some(folder(target_type)),
+                },
+                &ConversionContext,
+            )?);
+            assert_eq!(converted.source_id, 30);
+            assert_eq!(converted.owner_source_id, 9);
+            assert_eq!(converted.target, expected_target);
+            assert_eq!(converted.plain_password.as_deref(), Some("secret"));
+            assert_eq!(converted.max_downloads, 10);
+            assert_eq!(converted.download_count, 7);
+            assert_eq!(converted.view_count, 5);
+        }
+
+        let mut unlimited = share(31, Some(10), Some(9));
+        unlimited.password = Some(String::new());
+        unlimited.remain_downloads = None;
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveShareRecord {
+                share: unlimited,
+                target: Some(folder(0)),
+            },
+            &ConversionContext,
+        )?);
+        assert_eq!(converted.plain_password, None);
+        assert_eq!(converted.max_downloads, 0);
+        assert_eq!(converted.download_count, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn handles_share_boundaries_without_reactivating_deleted_rows() -> Result<()> {
+        let mut deleted = share(30, Some(10), Some(9));
+        deleted.deleted_at = Some(now());
+        let conversion = CloudreveConverter.convert(
+            CloudreveShareRecord {
+                share: deleted,
+                target: Some(folder(0)),
+            },
+            &ConversionContext,
+        )?;
+        assert!(
+            matches!(conversion, Conversion::Skipped(reason) if reason.code == "deleted_share")
+        );
+
+        for (source, target, expected_code) in [
+            (
+                share(30, Some(10), None),
+                Some(folder(0)),
+                "missing_share_owner",
+            ),
+            (share(30, None, Some(9)), None, "missing_share_target"),
+            (share(30, Some(10), Some(9)), None, "missing_share_target"),
+            (
+                share(30, Some(10), Some(9)),
+                Some(folder(2)),
+                "unsupported_share_target",
+            ),
+        ] {
+            let conversion = CloudreveConverter.convert(
+                CloudreveShareRecord {
+                    share: source,
+                    target,
+                },
+                &ConversionContext,
+            )?;
+            assert!(
+                matches!(conversion, Conversion::Skipped(reason) if reason.code == expected_code)
+            );
+        }
+
+        let mut negative = share(30, Some(10), Some(9));
+        negative.remain_downloads = Some(-1);
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveShareRecord {
+                        share: negative,
+                        target: Some(folder(0)),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("negative remaining downloads")
+        );
+
+        let mut overflow = share(30, Some(10), Some(9));
+        overflow.downloads = i64::MAX;
+        overflow.remain_downloads = Some(1);
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveShareRecord {
+                        share: overflow,
+                        target: Some(folder(0)),
+                    },
+                    &ConversionContext,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("download limit exceeds i64")
         );
         Ok(())
     }

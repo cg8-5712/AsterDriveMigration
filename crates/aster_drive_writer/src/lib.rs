@@ -66,6 +66,24 @@ pub struct ResolvedFile {
     pub historical_versions: Vec<ResolvedFileVersion>,
 }
 
+pub enum ResolvedShareTarget {
+    File { target_id: i64 },
+    Folder { target_id: i64 },
+}
+
+pub struct ResolvedShare {
+    pub source_id: i64,
+    pub owner_id: i64,
+    pub target: ResolvedShareTarget,
+    pub password_hash: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub max_downloads: i64,
+    pub download_count: i64,
+    pub view_count: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WrittenFile {
     pub target_id: i64,
@@ -332,6 +350,44 @@ impl<'a> AsterDriveWriter<'a> {
             version_count,
         })
     }
+
+    pub async fn write_share(&self, resolved: ResolvedShare) -> Result<i64> {
+        let ResolvedShare {
+            source_id,
+            owner_id,
+            target,
+            password_hash,
+            expires_at,
+            max_downloads,
+            download_count,
+            view_count,
+            created_at,
+            updated_at,
+        } = resolved;
+        let (file_id, folder_id) = match target {
+            ResolvedShareTarget::File { target_id } => (Some(target_id), None),
+            ResolvedShareTarget::Folder { target_id } => (None, Some(target_id)),
+        };
+        let target = aster_drive_schema::entities::share::ActiveModel {
+            token: Set(uuid::Uuid::new_v4().simple().to_string()),
+            user_id: Set(owner_id),
+            team_id: Set(None),
+            file_id: Set(file_id),
+            folder_id: Set(folder_id),
+            password: Set(password_hash),
+            expires_at: Set(expires_at),
+            max_downloads: Set(max_downloads),
+            download_count: Set(download_count),
+            view_count: Set(view_count),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
+            ..Default::default()
+        }
+        .insert(self.transaction)
+        .await
+        .wrap_err_with(|| format!("migrate Cloudreve share {source_id}"))?;
+        Ok(target.id)
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +522,22 @@ mod tests {
         }
     }
 
+    fn share(source_id: i64) -> ResolvedShare {
+        let now = chrono::Utc::now();
+        ResolvedShare {
+            source_id,
+            owner_id: 0,
+            target: ResolvedShareTarget::Folder { target_id: 0 },
+            password_hash: Some("$argon2id$test-hash".to_string()),
+            expires_at: Some(now + chrono::Duration::days(1)),
+            max_downloads: 10,
+            download_count: 7,
+            view_count: 5,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     #[tokio::test]
     async fn writes_blob_file_and_versions_with_asterdrive_semantics() -> Result<()> {
         let database = database().await?;
@@ -580,6 +652,95 @@ mod tests {
         );
         assert_eq!(
             aster_drive_schema::entities::file_version::Entity::find()
+                .count(&database)
+                .await?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_share_with_exact_target_and_counters() -> Result<()> {
+        let database = database().await?;
+        let transaction = database.begin().await?;
+        let (_, user_id, folder_id) = write_prerequisites(&transaction).await?;
+        let target_id = AsterDriveWriter::new(&transaction)
+            .write_share(ResolvedShare {
+                owner_id: user_id,
+                target: ResolvedShareTarget::Folder {
+                    target_id: folder_id,
+                },
+                ..share(30)
+            })
+            .await?;
+        let duplicate_target_id = AsterDriveWriter::new(&transaction)
+            .write_share(ResolvedShare {
+                owner_id: user_id,
+                target: ResolvedShareTarget::Folder {
+                    target_id: folder_id,
+                },
+                ..share(31)
+            })
+            .await?;
+        transaction.commit().await?;
+
+        let stored = aster_drive_schema::entities::share::Entity::find_by_id(target_id)
+            .one(&database)
+            .await?
+            .expect("written share");
+        assert_eq!(stored.token.len(), 32);
+        assert!(
+            stored
+                .token
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+        assert_eq!(stored.user_id, user_id);
+        assert_eq!(stored.team_id, None);
+        assert_eq!(stored.file_id, None);
+        assert_eq!(stored.folder_id, Some(folder_id));
+        assert_eq!(stored.password.as_deref(), Some("$argon2id$test-hash"));
+        assert_eq!(stored.max_downloads, 10);
+        assert_eq!(stored.download_count, 7);
+        assert_eq!(stored.view_count, 5);
+        let duplicate =
+            aster_drive_schema::entities::share::Entity::find_by_id(duplicate_target_id)
+                .one(&database)
+                .await?
+                .expect("duplicate target share");
+        assert_ne!(stored.token, duplicate.token);
+        assert_eq!(duplicate.folder_id, Some(folder_id));
+        assert_eq!(
+            aster_drive_schema::entities::share::Entity::find()
+                .count(&database)
+                .await?,
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_share_owner_rolls_back_without_partial_rows() -> Result<()> {
+        let database = database().await?;
+        let setup = database.begin().await?;
+        let (_, _, folder_id) = write_prerequisites(&setup).await?;
+        setup.commit().await?;
+
+        let transaction = database.begin().await?;
+        let result = AsterDriveWriter::new(&transaction)
+            .write_share(ResolvedShare {
+                owner_id: i64::MAX,
+                target: ResolvedShareTarget::Folder {
+                    target_id: folder_id,
+                },
+                password_hash: None,
+                ..share(31)
+            })
+            .await;
+        assert!(result.is_err());
+        transaction.rollback().await?;
+        assert_eq!(
+            aster_drive_schema::entities::share::Entity::find()
                 .count(&database)
                 .await?,
             0

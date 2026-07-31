@@ -459,6 +459,9 @@ pub(super) async fn run_preflight(
                 || share.views < 0
                 || share.downloads < 0
                 || share.remain_downloads.is_some_and(|value| value < 0)
+                || share
+                    .remain_downloads
+                    .is_some_and(|remaining| share.downloads.checked_add(remaining).is_none())
         })
         .count();
     let invalid_direct_links = source

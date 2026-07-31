@@ -1,12 +1,12 @@
 use super::*;
 
-pub(super) fn hash_password(password: &str) -> Result<String> {
+pub(super) fn hash_argon2_password(password: &str) -> Result<String> {
     let salt = SaltString::encode_b64(uuid::Uuid::new_v4().as_bytes())
         .map_err(|error| color_eyre::eyre::eyre!("create password salt: {error}"))?;
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
-        .map_err(|error| color_eyre::eyre::eyre!("hash temporary AD password: {error}"))
+        .map_err(|error| color_eyre::eyre::eyre!("hash password for AD: {error}"))
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -181,8 +181,36 @@ impl SourceData {
         if !self.direct_links.is_empty() {
             warnings.push("Cloudreve direct links require --direct-link-secret to regenerate AD v2 URLs; old /f/... URLs, per-link counters, speed limits and revocation semantics cannot be preserved".to_string());
         }
+        let duplicate_active_share_targets =
+            duplicate_active_share_targets(&self.shares, chrono::Utc::now().fixed_offset());
+        if duplicate_active_share_targets > 0 {
+            warnings.push(format!(
+                "{duplicate_active_share_targets} owner/target pairs have multiple active Cloudreve shares; all links are preserved, but AD's share-management UI only creates one active share per resource going forward"
+            ));
+        }
         warnings
     }
+}
+
+pub(super) fn duplicate_active_share_targets(
+    shares: &[cloudreve_schema::shares::Model],
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> usize {
+    shares
+        .iter()
+        .filter(|share| {
+            share.deleted_at.is_none()
+                && share.expires.is_none_or(|expires| expires >= now)
+                && share.remain_downloads.is_none_or(|remaining| remaining > 0)
+        })
+        .filter_map(|share| Some((share.user_shares?, share.file_shares?)))
+        .fold(HashMap::new(), |mut counts, target| {
+            *counts.entry(target).or_insert(0_usize) += 1;
+            counts
+        })
+        .values()
+        .filter(|count| **count > 1)
+        .count()
 }
 
 pub(super) fn filter_deleted<T, F>(items: Vec<T>, include_deleted: bool, deleted: F) -> Vec<T>
@@ -223,11 +251,6 @@ pub(super) fn unsupported_policy_reason(
 
 pub(super) fn source_settings(value: &Option<Value>) -> Value {
     value.clone().unwrap_or_else(|| json!({}))
-}
-
-pub(super) fn share_token(share_id: i64) -> String {
-    let digest = Sha256::digest(format!("cloudreve-share-{share_id}").as_bytes());
-    format!("cr-{share_id}-{}", &format!("{digest:x}")[..16])
 }
 
 pub(super) fn tag_name(metadata_name: &str) -> Option<&str> {
@@ -350,6 +373,30 @@ mod tests {
     use super::*;
     use aster_drive_model::types::DriverType;
 
+    fn share(
+        id: i64,
+        owner_id: i64,
+        target_id: i64,
+        remaining: Option<i64>,
+        expires: Option<chrono::DateTime<chrono::FixedOffset>>,
+    ) -> cloudreve_schema::shares::Model {
+        let now = chrono::Utc::now().fixed_offset();
+        cloudreve_schema::shares::Model {
+            id,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            password: None,
+            views: 0,
+            downloads: 0,
+            expires,
+            remain_downloads: remaining,
+            props: None,
+            file_shares: Some(target_id),
+            user_shares: Some(owner_id),
+        }
+    }
+
     #[test]
     fn maps_supported_storage_drivers_conservatively() {
         assert_eq!(map_driver_type("local"), Some(DriverType::Local));
@@ -397,5 +444,19 @@ mod tests {
             assert_eq!(archived_task_status(status), "canceled");
         }
         assert_eq!(archived_task_status("unknown"), "canceled");
+    }
+
+    #[test]
+    fn counts_only_duplicate_active_share_targets() {
+        let now = chrono::Utc::now().fixed_offset();
+        let shares = vec![
+            share(1, 7, 9, None, None),
+            share(2, 7, 9, Some(3), None),
+            share(3, 7, 10, None, None),
+            share(4, 7, 10, Some(0), None),
+            share(5, 7, 11, None, Some(now - chrono::TimeDelta::seconds(1))),
+            share(6, 7, 11, None, None),
+        ];
+        assert_eq!(duplicate_active_share_targets(&shares, now), 1);
     }
 }

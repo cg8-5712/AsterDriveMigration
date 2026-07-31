@@ -270,7 +270,7 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
         );
     }
 
-    let password_hash = hash_password(&options.default_password)?;
+    let password_hash = hash_argon2_password(&options.default_password)?;
 
     let stage_plan = MigrationStage::plan()?;
     for (stage_index, stage) in MigrationStage::ALL.into_iter().enumerate() {

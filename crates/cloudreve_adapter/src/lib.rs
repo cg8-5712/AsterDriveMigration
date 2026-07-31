@@ -17,5 +17,5 @@ mod record;
 pub use converter::CloudreveConverter;
 pub use record::{
     CloudreveBlobRecord, CloudreveFileRecord, CloudreveFolderRecord, CloudrevePolicyGroupRecord,
-    CloudreveStoragePolicyRecord, CloudreveUserRecord,
+    CloudreveShareRecord, CloudreveStoragePolicyRecord, CloudreveUserRecord,
 };

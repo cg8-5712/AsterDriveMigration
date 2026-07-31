@@ -119,3 +119,23 @@ pub struct MigrationFile {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationShareTarget {
+    File { source_id: i64 },
+    Folder { source_id: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationShare {
+    pub source_id: i64,
+    pub owner_source_id: i64,
+    pub target: MigrationShareTarget,
+    pub plain_password: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub max_downloads: i64,
+    pub download_count: i64,
+    pub view_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

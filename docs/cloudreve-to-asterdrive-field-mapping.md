@@ -326,7 +326,7 @@ Cloudreve `files.props` 是另一组 JSON 属性，不在 `metadata` 表中。�
 | Cloudreve 字段 | AD 字段 | 状态 | 规则或差异 |
 |---|---|---|---|
 | `id` | 新生成 `id` | 转换 | 保存旧 ID仅用于报告 |
-| 无持久化 token | `token` | 生成 | 生成新唯一 token，旧 URL 会失效 |
+| 无持久化 token | `token` | 生成 | Writer 使用随机 UUID simple token 生成新的 32 字符 capability；旧 URL 会失效，不从可预测的源 ID 派生 |
 | `user_shares` | `user_id` | 转换 | 使用用户 ID 映射 |
 | `file_shares` 指向文件 | `file_id` | 转换 | 根据源 `files.type=0` 判断 |
 | `file_shares` 指向目录 | `folder_id` | 转换 | 根据源 `files.type=1` 判断 |
@@ -340,6 +340,8 @@ Cloudreve `files.props` 是另一组 JSON 属性，不在 `metadata` 表中。�
 | `updated_at` | `updated_at` | 直接 | 保留 |
 | `deleted_at` | 无 | 转换 | 默认跳过已删除分享 |
 | 无 | `team_id` | 生成 | 个人分享为 `NULL` |
+
+Cloudreve 允许同一 owner 对同一资源创建多条分享；AD 的表结构也能保存这些历史链接，但当前创建服务只允许同一资源存在一条未过期且未耗尽的活跃分享。迁移保留每一条未删除的 Cloudreve share，并在发现重复活跃 owner/target 组合时给出兼容性警告，不擅自合并或丢弃 capability。
 
 ### `direct_links` -> AD v2 直链 + 迁移映射属性
 
