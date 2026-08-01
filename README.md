@@ -11,7 +11,7 @@ Database migration tool for moving a Cloudreve v4 installation to AsterDrive (AD
 
 - Cloudreve groups to AD storage policy groups
 - users and profiles, including quotas and disabled status
-- local, S3, OSS, KS3, OBS and Tencent COS storage policies
+- local, S3, KS3 and standard-endpoint Tencent COS storage policies
 - folders, files, physical entities/blobs and version history
 - file/folder metadata, including Cloudreve v4 `tag:*` metadata as AD tags
 - public shares and regenerated AD v2 direct-link mappings
@@ -20,7 +20,7 @@ Cloudreve password hashes are not compatible with AD. The migration assigns the 
 
 Cloudreve tasks are runtime state rather than portable business data. The migration reports their source count and intentionally leaves AD `background_tasks` empty so AD can create its own runtime tasks.
 
-By default the tool reuses existing storage objects. For local storage, pass the directory from which Cloudreve entity paths should be resolved. Object-storage policies keep their existing bucket, endpoint, credentials and object keys. This is a zero-copy migration and is the preferred choice when AD can safely access the same storage backend.
+By default the tool reuses existing storage objects. For local storage, pass the directory from which Cloudreve entity paths should be resolved. Compatible object-storage policies keep their existing bucket, endpoint, credentials and object keys. This is a zero-copy migration and is the preferred choice when AD can safely access the same storage backend.
 
 ## Prerequisites
 
@@ -59,11 +59,11 @@ cargo run -- migrate `
 
 Use `--dry-run` to perform preflight checks without writing the target. The target core tables must be empty by default. `--allow-non-empty-target` disables that guard but may still fail on unique values or conflicting data.
 
-Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files. Independently encrypted entities, identified by `entities.recycle_options.encrypt_metadata`, are always skipped together with files whose current entity is encrypted. Both blob and file source IDs and their fixed skip reasons are included in terminal and JSON migration reports; encryption keys and IVs are never copied into the report.
+Cloudreve native Alibaba OSS, Huawei OBS, Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. Tencent COS policies using a custom domain or a bucket-mismatched endpoint are also unsupported. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files. Independently encrypted entities, identified by `entities.recycle_options.encrypt_metadata`, are always skipped together with files whose current entity is encrypted. Both blob and file source IDs and their fixed skip reasons are included in terminal and JSON migration reports; encryption keys and IVs are never copied into the report.
 
 ## Reuse local storage
 
-For compatible Cloudreve local storage, migration keeps each `entities.source` path unchanged and configures AD to read the same files through the target policy base path. This avoids copying object bytes and therefore does not require a second full data volume.
+For compatible Cloudreve local storage, migration configures AD to read the same files through the target policy base path. Relative `entities.source` values are preserved after rejecting unsafe parent-directory segments. Absolute values must be inside the configured local root and are converted to relative AD `storage_path` values. This avoids copying object bytes and prevents AD from joining a base path with a second absolute-path prefix.
 
 `--local-base-path` is the fallback root for every local policy. When policies use different volumes, pass one or more explicit source-policy mappings:
 
@@ -80,7 +80,7 @@ cargo run -- migrate `
 
 `--verify-local-storage` checks each compatible local policy root and every migrated local blob's resolved path, regular-file status, open permission and byte length. With `--dry-run`, it scans all eligible local blobs before any target writes. It does not verify S3-compatible buckets or prove that a running AD instance can access a Docker mount; validate those separately before cutover.
 
-`--verify-remote-storage` enables provider-level verification for Cloudreve `s3`, `oss`, `ks3` and `obs` policies before each migrated blob is committed. It performs an authenticated `HeadObject` and validates the reported size, then performs an authenticated `bytes=0-0` range read for non-empty objects. With `--dry-run`, the full eligible remote-object set is verified before target writes begin. This verifies the source provider credentials, endpoint, bucket, object key and read path; it does not copy remote bytes or validate a running AD HTTP service. Cloudreve Tencent COS uses a distinct signing protocol and is deliberately rejected by this verification mode until native COS support is implemented.
+`--verify-remote-storage` enables provider-level verification for compatible Cloudreve `s3`, `ks3` and standard-endpoint `cos` policies before each migrated blob is committed. It performs an authenticated `HeadObject` and validates the reported size, then performs an authenticated `bytes=0-0` range read for non-empty objects. With `--dry-run`, the full eligible remote-object set is verified before target writes begin. This verifies the source credentials, endpoint, bucket, object key and read path; it does not copy remote bytes or validate a running AD HTTP service. Until [AsterDrive#452](https://github.com/AsterCommunity/AsterDrive/issues/452) and [AsterDriveMigration#3](https://github.com/AsterCommunity/AsterDriveMigration/issues/3) are implemented, a successful S3/KS3 source check does not prove that AsterDrive's current fixed signing region can read the object after cutover.
 
 ## Object storage boundary
 

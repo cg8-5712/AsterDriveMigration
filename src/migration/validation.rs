@@ -991,3 +991,83 @@ pub(super) fn verify_local_runtime_readability(
         message: (failed > 0).then(|| failures.join("; ")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn folder(id: i64, parent_id: Option<i64>) -> aster_drive_schema::entities::folder::Model {
+        let now = chrono::Utc::now();
+        aster_drive_schema::entities::folder::Model {
+            id,
+            name: format!("folder-{id}"),
+            parent_id,
+            team_id: None,
+            owner_user_id: Some(1),
+            created_by_user_id: Some(1),
+            created_by_username: "owner".to_string(),
+            policy_id: None,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            is_locked: false,
+        }
+    }
+
+    #[test]
+    fn folder_cycle_detection_handles_roots_missing_parents_self_and_multi_node_cycles() {
+        let root = folder(1, None);
+        let child = folder(2, Some(1));
+        let missing_parent = folder(3, Some(99));
+        let self_cycle = folder(4, Some(4));
+        let cycle_a = folder(5, Some(6));
+        let cycle_b = folder(6, Some(5));
+        let folders = [
+            &root,
+            &child,
+            &missing_parent,
+            &self_cycle,
+            &cycle_a,
+            &cycle_b,
+        ]
+        .into_iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+
+        assert!(!folder_has_cycle(1, &folders));
+        assert!(!folder_has_cycle(2, &folders));
+        assert!(!folder_has_cycle(3, &folders));
+        assert!(folder_has_cycle(4, &folders));
+        assert!(folder_has_cycle(5, &folders));
+        assert!(folder_has_cycle(6, &folders));
+    }
+
+    #[test]
+    fn storage_usage_accumulation_covers_zero_negative_and_overflow_values() -> Result<()> {
+        let owner = StorageOwner::User(1);
+        let mut totals = HashMap::new();
+        add_storage_usage(&mut totals, owner, 0)?;
+        add_storage_usage(&mut totals, owner, 5)?;
+        add_storage_usage(&mut totals, owner, -2)?;
+        assert_eq!(totals[&owner], 3);
+
+        totals.insert(owner, i64::MAX);
+        let error =
+            add_storage_usage(&mut totals, owner, 1).expect_err("i64 overflow must be rejected");
+        assert!(error.to_string().contains("storage usage overflow"));
+        Ok(())
+    }
+
+    #[test]
+    fn invariant_check_reports_exact_expected_and_actual_values() {
+        let passed = invariant_check("check", 0, 0, "drift");
+        assert!(passed.passed);
+        assert_eq!(passed.expected, "0");
+        assert_eq!(passed.actual, "0");
+        assert_eq!(passed.message, None);
+
+        let failed = invariant_check("check", 0, 2, "drift");
+        assert!(!failed.passed);
+        assert_eq!(failed.message.as_deref(), Some("drift"));
+    }
+}

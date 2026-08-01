@@ -413,3 +413,187 @@ pub(super) async fn mark_failed<C: ConnectionTrait>(
     .wrap_err_with(|| format!("mark migration run {run_id} failed"))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+    use serde_json::json;
+
+    async fn database() -> Result<DatabaseConnection> {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let database = Database::connect(options).await?;
+        ensure_table(&database).await?;
+        Ok(database)
+    }
+
+    fn baseline() -> TargetCounts {
+        serde_json::from_value(json!({
+            "policies": 1,
+            "policy_groups": 2,
+            "users": 3,
+            "user_profiles": 4,
+            "folders": 5,
+            "blobs": 6,
+            "files": 7,
+            "versions": 8,
+            "shares": 9,
+            "properties": 10,
+            "tags": 11
+        }))
+        .expect("valid target counts")
+    }
+
+    async fn create_run(
+        database: &DatabaseConnection,
+        run_id: &str,
+        context: &MigrationContext,
+        report: &MigrationReport,
+        baseline: &TargetCounts,
+    ) -> Result<()> {
+        create(
+            database,
+            NewCheckpoint {
+                run_id,
+                source_fingerprint: "source",
+                target_fingerprint: "target",
+                plan_fingerprint: "plan",
+                context,
+                report,
+                baseline,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn checkpoint_round_trip_rejects_duplicate_and_mismatched_fingerprints() -> Result<()> {
+        let database = database().await?;
+        let mut context = MigrationContext::default();
+        context.policies.insert(10, 100);
+        let report = MigrationReport {
+            run_id: Some("run-1".to_string()),
+            ..Default::default()
+        };
+        let baseline = baseline();
+        create_run(&database, "run-1", &context, &report, &baseline).await?;
+
+        let loaded = load(&database, "run-1", "source", "target", "plan").await?;
+        assert_eq!(loaded.status, RunStatus::Running.as_str());
+        assert_eq!(loaded.last_completed_stage, None);
+        assert_eq!(loaded.context.policies.get(&10), Some(&100));
+        assert_eq!(loaded.report.run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            serde_json::to_value(loaded.baseline)?,
+            serde_json::to_value(&baseline)?
+        );
+
+        let duplicate = create_run(&database, "run-1", &context, &report, &baseline)
+            .await
+            .expect_err("duplicate run IDs must be rejected");
+        assert!(duplicate.to_string().contains("already exists"));
+        for (source, target, plan, expected) in [
+            ("other", "target", "plan", "different Cloudreve source"),
+            ("source", "other", "plan", "different AD target"),
+            ("source", "target", "other", "options differ"),
+        ] {
+            let error = match load(&database, "run-1", source, target, plan).await {
+                Ok(_) => panic!("fingerprint mismatch must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(expected));
+        }
+        assert!(load_any(&database, "missing").await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_persists_stage_progress_cursors_and_object_mappings() -> Result<()> {
+        let database = database().await?;
+        let mut context = MigrationContext::default();
+        let mut report = MigrationReport::default();
+        let baseline = baseline();
+        create_run(&database, "run-2", &context, &report, &baseline).await?;
+
+        context.users.insert(1, 11);
+        report.migrated_users = 1;
+        save_stage(&database, "run-2", "users", &context, &report).await?;
+        let loaded = load(&database, "run-2", "source", "target", "plan").await?;
+        assert_eq!(loaded.last_completed_stage.as_deref(), Some("users"));
+        assert_eq!(loaded.context.users.get(&1), Some(&11));
+        assert_eq!(loaded.report.migrated_users, 1);
+
+        save_stage_cursor(&database, "run-2", "blobs", 10, 2).await?;
+        save_stage_cursor(&database, "run-2", "blobs", 20, 4).await?;
+        let cursor = load_stage_cursor(&database, "run-2", "blobs")
+            .await?
+            .expect("saved stage cursor");
+        assert_eq!(cursor.cursor_value, 20);
+        assert_eq!(cursor.processed_count, 4);
+        assert!(
+            load_stage_cursor(&database, "run-2", "files")
+                .await?
+                .is_none()
+        );
+
+        save_object_mappings(&database, "run-2", "blob", &[]).await?;
+        save_object_mappings(&database, "run-2", "blob", &[(1, 101), (2, 102)]).await?;
+        assert_eq!(
+            load_object_mappings(&database, "run-2", "blob").await?,
+            std::collections::HashMap::from([(1, 101), (2, 102)])
+        );
+        assert!(
+            load_object_mappings(&database, "run-2", "file")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_enforces_terminal_status_and_cleans_completed_metadata() -> Result<()> {
+        let database = database().await?;
+        let context = MigrationContext::default();
+        let report = MigrationReport::default();
+        let baseline = baseline();
+        create_run(&database, "aborted", &context, &report, &baseline).await?;
+        abort(&database, "aborted").await?;
+        let aborted = load_any(&database, "aborted").await?;
+        assert_eq!(aborted.status, RunStatus::Aborted.as_str());
+        assert_eq!(aborted.last_error.as_deref(), Some("aborted by operator"));
+        assert!(abort(&database, "aborted").await.is_err());
+        assert!(delete_completed(&database, "aborted").await.is_err());
+
+        create_run(&database, "completed", &context, &report, &baseline).await?;
+        save_stage_cursor(&database, "completed", "files", 9, 9).await?;
+        save_object_mappings(&database, "completed", "file", &[(9, 99)]).await?;
+        finish(
+            &database,
+            "completed",
+            RunStatus::Completed.as_str(),
+            &context,
+            &report,
+        )
+        .await?;
+        delete_completed(&database, "completed").await?;
+        assert!(load_any(&database, "completed").await.is_err());
+        assert!(
+            load_stage_cursor(&database, "completed", "files")
+                .await?
+                .is_none()
+        );
+        assert!(
+            load_object_mappings(&database, "completed", "file")
+                .await?
+                .is_empty()
+        );
+
+        create_run(&database, "failed", &context, &report, &baseline).await?;
+        mark_failed(&database, "failed", &"x".repeat(3_000)).await?;
+        let failed = load_any(&database, "failed").await?;
+        assert_eq!(failed.status, RunStatus::Failed.as_str());
+        assert_eq!(failed.last_error.as_deref().map(str::len), Some(2_048));
+        Ok(())
+    }
+}

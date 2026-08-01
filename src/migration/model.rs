@@ -156,7 +156,7 @@ impl SourceData {
         }
     }
 
-    pub(super) fn unsupported_policy_types(&self) -> Vec<String> {
+    pub(super) fn unsupported_policies(&self) -> Vec<String> {
         let mut values: Vec<String> = self
             .policies
             .iter()
@@ -180,10 +180,10 @@ impl SourceData {
                 "{symbolic} symbolic/placeholder Cloudreve files cannot be represented in AD and will be skipped"
             ));
         }
-        let unsupported = self.unsupported_policy_types();
+        let unsupported = self.unsupported_policies();
         if !unsupported.is_empty() {
             warnings.push(format!(
-                "unsupported storage policy types detected: {}",
+                "unsupported storage policies detected: {}",
                 unsupported.join(", ")
             ));
         }
@@ -239,29 +239,10 @@ where
     }
 }
 
-pub(super) fn map_driver_type(source: &str) -> Option<DriverType> {
-    match source {
-        "local" => Some(DriverType::Local),
-        "s3" | "oss" | "ks3" | "obs" => Some(DriverType::S3),
-        "cos" => Some(DriverType::TencentCos),
-        _ => None,
-    }
-}
-
 pub(super) fn unsupported_policy_reason(
     policy: &cloudreve_schema::storage_policies::Model,
 ) -> Option<String> {
-    if map_driver_type(&policy.r#type).is_none() {
-        return Some(policy.r#type.clone());
-    }
-    if source_settings(&policy.settings)
-        .get("encryption")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Some(format!("{} (Cloudreve encryption enabled)", policy.r#type));
-    }
-    None
+    storage_policy_skip_reason(policy).map(|reason| reason.message)
 }
 
 pub(super) fn source_settings(value: &Option<Value>) -> Value {
@@ -299,7 +280,6 @@ pub(super) fn unique_username(source: &str, source_id: i64, used: &mut HashSet<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aster_drive_model::types::DriverType;
 
     fn share(
         id: i64,
@@ -326,12 +306,42 @@ mod tests {
     }
 
     #[test]
-    fn maps_supported_storage_drivers_conservatively() {
-        assert_eq!(map_driver_type("local"), Some(DriverType::Local));
-        assert_eq!(map_driver_type("oss"), Some(DriverType::S3));
-        assert_eq!(map_driver_type("cos"), Some(DriverType::TencentCos));
-        assert_eq!(map_driver_type("onedrive"), None);
-        assert_eq!(map_driver_type("qiniu"), None);
+    fn reports_unsupported_storage_policies_from_the_adapter_contract() {
+        let now = chrono::Utc::now().fixed_offset();
+        let policy = |policy_type: &str, server: &str, bucket: &str| {
+            cloudreve_schema::storage_policies::Model {
+                id: 1,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                name: policy_type.to_string(),
+                r#type: policy_type.to_string(),
+                server: Some(server.to_string()),
+                bucket_name: Some(bucket.to_string()),
+                is_private: Some(true),
+                access_key: Some("access".to_string()),
+                secret_key: Some("secret".to_string()),
+                max_size: None,
+                dir_name_rule: None,
+                file_name_rule: None,
+                settings: Some(json!({})),
+                node_id: None,
+            }
+        };
+
+        assert!(unsupported_policy_reason(&policy("local", "", "")).is_none());
+        assert!(unsupported_policy_reason(&policy("s3", "https://s3.test", "bucket")).is_none());
+        assert!(
+            unsupported_policy_reason(&policy(
+                "cos",
+                "https://bucket.cos.ap-guangzhou.myqcloud.com",
+                "bucket",
+            ))
+            .is_none()
+        );
+        assert!(unsupported_policy_reason(&policy("oss", "https://oss.test", "bucket")).is_some());
+        assert!(unsupported_policy_reason(&policy("obs", "https://obs.test", "bucket")).is_some());
+        assert!(unsupported_policy_reason(&policy("onedrive", "", "")).is_some());
     }
 
     #[test]

@@ -1,10 +1,13 @@
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde_json::Value;
 
-const S3_COMPATIBLE_DRIVERS: &[&str] = &["s3", "oss", "ks3", "obs", "cos"];
+const S3_COMPATIBLE_DRIVERS: &[&str] = &["s3", "ks3", "cos"];
 
-pub(super) fn supports_s3_validation(policy: &cloudreve_schema::storage_policies::Model) -> bool {
-    S3_COMPATIBLE_DRIVERS.contains(&policy.r#type.as_str()) && !encryption_enabled(policy)
+pub(super) fn supports_remote_validation(
+    policy: &cloudreve_schema::storage_policies::Model,
+) -> bool {
+    S3_COMPATIBLE_DRIVERS.contains(&policy.r#type.as_str())
+        && cloudreve_adapter::storage_policy_skip_reason(policy).is_none()
 }
 
 pub(super) async fn verify_object(
@@ -13,7 +16,7 @@ pub(super) async fn verify_object(
     expected_size: i64,
     entity_id: i64,
 ) -> Result<()> {
-    if !supports_s3_validation(policy) {
+    if !supports_remote_validation(policy) {
         bail!(
             "Cloudreve storage policy {} ({}) is not an S3-compatible remote policy",
             policy.id,
@@ -93,9 +96,14 @@ fn storage_region(
 ) -> Result<String> {
     if let Some(region) = settings
         .get("region")
-        .or_else(|| settings.get("s3_region"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            settings
+                .get("s3_region")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
     {
         return Ok(region.trim().to_string());
     }
@@ -139,15 +147,6 @@ fn cos_region_from_endpoint(endpoint: &str) -> Option<String> {
     (suffix == ["myqcloud", "com"] && !region.is_empty()).then(|| region.to_string())
 }
 
-fn encryption_enabled(policy: &cloudreve_schema::storage_policies::Model) -> bool {
-    policy
-        .settings
-        .as_ref()
-        .and_then(|settings| settings.get("encryption"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn required<'a>(value: &'a Option<String>, name: &str, policy_id: i64) -> Result<&'a str> {
     value
         .as_deref()
@@ -159,67 +158,146 @@ fn required<'a>(value: &'a Option<String>, name: &str, policy_id: i64) -> Result
 mod tests {
     use super::*;
 
-    #[test]
-    fn only_allows_supported_s3_compatible_drivers() {
-        let mut policy = cloudreve_schema::storage_policies::Model {
+    fn policy(policy_type: &str) -> cloudreve_schema::storage_policies::Model {
+        cloudreve_schema::storage_policies::Model {
             id: 1,
             created_at: chrono::Utc::now().fixed_offset(),
             updated_at: chrono::Utc::now().fixed_offset(),
             deleted_at: None,
             name: "test".to_string(),
-            r#type: "s3".to_string(),
-            server: None,
-            bucket_name: None,
+            r#type: policy_type.to_string(),
+            server: Some("https://s3.example.test".to_string()),
+            bucket_name: Some("bucket".to_string()),
             is_private: None,
-            access_key: None,
-            secret_key: None,
+            access_key: Some("access".to_string()),
+            secret_key: Some("secret".to_string()),
             max_size: None,
             dir_name_rule: None,
             file_name_rule: None,
             settings: None,
             node_id: None,
-        };
-        assert!(supports_s3_validation(&policy));
-        policy.r#type = "cos".to_string();
-        assert!(supports_s3_validation(&policy));
-        policy.r#type = "qiniu".to_string();
-        assert!(!supports_s3_validation(&policy));
-        policy.r#type = "oss".to_string();
-        policy.settings = Some(serde_json::json!({"encryption": true}));
-        assert!(!supports_s3_validation(&policy));
+        }
     }
 
     #[test]
-    fn derives_cos_region_and_uses_virtual_hosted_style() -> Result<()> {
-        let policy = cloudreve_schema::storage_policies::Model {
-            id: 7,
-            created_at: chrono::Utc::now().fixed_offset(),
-            updated_at: chrono::Utc::now().fixed_offset(),
-            deleted_at: None,
-            name: "COS".to_string(),
-            r#type: "cos".to_string(),
-            server: Some("https://example-1250000000.cos.ap-guangzhou.myqcloud.com".to_string()),
-            bucket_name: Some("example-1250000000".to_string()),
-            is_private: Some(true),
-            access_key: Some("secret-id".to_string()),
-            secret_key: Some("secret-key".to_string()),
-            max_size: None,
-            dir_name_rule: None,
-            file_name_rule: None,
-            settings: None,
-            node_id: None,
-        };
+    fn remote_validation_support_matches_the_adapter_contract() {
+        for policy_type in ["s3", "ks3"] {
+            assert!(supports_remote_validation(&policy(policy_type)));
+        }
 
+        let mut cos = policy("cos");
+        cos.server = Some("https://bucket.cos.ap-guangzhou.myqcloud.com".to_string());
+        assert!(supports_remote_validation(&cos));
+
+        for policy_type in [
+            "local", "oss", "obs", "qiniu", "upyun", "onedrive", "remote",
+        ] {
+            assert!(!supports_remote_validation(&policy(policy_type)));
+        }
+
+        let mut encrypted = policy("s3");
+        encrypted.settings = Some(serde_json::json!({"encryption": true}));
+        assert!(!supports_remote_validation(&encrypted));
+
+        let mut incomplete = policy("s3");
+        incomplete.secret_key = None;
+        assert!(!supports_remote_validation(&incomplete));
+
+        let mut custom_domain_cos = policy("cos");
+        custom_domain_cos.server = Some("https://cdn.example.test".to_string());
+        assert!(!supports_remote_validation(&custom_domain_cos));
+    }
+
+    #[test]
+    fn resolves_explicit_alias_default_and_cos_regions() -> Result<()> {
+        let s3 = policy("s3");
         assert_eq!(
             storage_region(
-                &policy,
-                policy.server.as_deref().expect("COS endpoint"),
+                &s3,
+                "https://s3.example.test",
+                &serde_json::json!({
+                    "region": "  ap-shanghai  "
+                })
+            )?,
+            "ap-shanghai"
+        );
+        assert_eq!(
+            storage_region(
+                &s3,
+                "https://s3.example.test",
+                &serde_json::json!({
+                    "region": "",
+                    "s3_region": "eu-central-1"
+                })
+            )?,
+            "eu-central-1"
+        );
+        assert_eq!(
+            storage_region(&s3, "https://s3.example.test", &Value::Null)?,
+            "us-east-1"
+        );
+
+        let cos = policy("cos");
+        assert_eq!(
+            storage_region(
+                &cos,
+                "https://bucket.cos.ap-guangzhou.myqcloud.com/path",
                 &Value::Null,
             )?,
             "ap-guangzhou"
         );
-        assert!(!force_path_style(&policy, &Value::Null));
-        assert!(storage_region(&policy, "https://cos.invalid.example", &Value::Null).is_err());
+        assert!(storage_region(&cos, "https://cos.invalid.example", &Value::Null).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn derives_cos_region_only_from_standard_endpoint_hosts() {
+        for (endpoint, expected) in [
+            (
+                "https://bucket.cos.ap-guangzhou.myqcloud.com",
+                Some("ap-guangzhou"),
+            ),
+            (
+                "bucket.cos.ap-shanghai.myqcloud.com:443/path",
+                Some("ap-shanghai"),
+            ),
+            ("https://bucket.cos..myqcloud.com", None),
+            ("https://bucket.cos.ap-guangzhou.example.com", None),
+            ("https://cdn.example.test", None),
+            ("", None),
+        ] {
+            assert_eq!(cos_region_from_endpoint(endpoint).as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn resolves_path_style_for_s3_and_forces_cos_virtual_hosting() {
+        let s3 = policy("s3");
+        assert!(force_path_style(&s3, &Value::Null));
+        assert!(!force_path_style(
+            &s3,
+            &serde_json::json!({"s3_path_style": false})
+        ));
+        assert!(force_path_style(
+            &s3,
+            &serde_json::json!({"s3_path_style": true})
+        ));
+
+        let cos = policy("cos");
+        assert!(!force_path_style(
+            &cos,
+            &serde_json::json!({"s3_path_style": true})
+        ));
+    }
+
+    #[test]
+    fn required_rejects_missing_empty_and_whitespace_values() {
+        assert_eq!(
+            required(&Some(" value ".to_string()), "field", 1).expect("value"),
+            " value "
+        );
+        for value in [None, Some(String::new()), Some("   ".to_string())] {
+            assert!(required(&value, "field", 7).is_err());
+        }
     }
 }

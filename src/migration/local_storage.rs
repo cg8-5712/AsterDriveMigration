@@ -47,7 +47,7 @@ pub(super) fn verify_local_storage_roots(
 ) -> Result<()> {
     for policy in source.policies.iter().filter(|policy| {
         policy.r#type == "local"
-            && map_driver_type(&policy.r#type).is_some()
+            && storage_policy_skip_reason(policy).is_none()
             && !source_settings(&policy.settings)
                 .get("encryption")
                 .and_then(Value::as_bool)
@@ -70,10 +70,11 @@ pub(super) fn verify_local_storage_roots(
     Ok(())
 }
 
-pub(super) async fn verify_all_local_source_objects(
+pub(super) async fn validate_all_local_source_objects(
     source_db: &DatabaseConnection,
     source: &SourceData,
     options: &MigrationOptions,
+    verify_storage: bool,
 ) -> Result<()> {
     const VERIFY_BATCH_SIZE: u64 = 500;
 
@@ -104,13 +105,23 @@ pub(super) async fn verify_all_local_source_objects(
                 continue;
             };
             if policy.r#type == "local"
-                && map_driver_type(&policy.r#type).is_some()
+                && storage_policy_skip_reason(policy).is_none()
                 && !source_settings(&policy.settings)
                     .get("encryption")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
             {
-                verify_local_entity(entity, policy, options)?;
+                let root = local_policy_root(options, policy.id);
+                cloudreve_adapter::normalize_local_storage_path(root, &entity.source)
+                    .wrap_err_with(|| {
+                        format!(
+                            "validate Cloudreve local entity {} storage path against policy {} root",
+                            entity.id, policy.id
+                        )
+                    })?;
+                if verify_storage {
+                    verify_local_entity(entity, policy, options)?;
+                }
             }
         }
         cursor_value = last_entity.id;
@@ -182,7 +193,7 @@ pub(super) async fn verify_all_remote_source_objects(
             let Some(policy) = policies.get(&entity.storage_policy_entities) else {
                 continue;
             };
-            if policy.r#type != "local" && map_driver_type(&policy.r#type).is_some() {
+            if remote::supports_remote_validation(policy) {
                 remote::verify_object(policy, &entity.source, entity.size, entity.id).await?;
             }
         }
@@ -214,7 +225,7 @@ pub(super) async fn verify_remote_blob_batch(
         let Some(policy) = policies.get(&entity.storage_policy_entities) else {
             continue;
         };
-        if policy.r#type != "local" && map_driver_type(&policy.r#type).is_some() {
+        if remote::supports_remote_validation(policy) {
             remote::verify_object(policy, &entity.source, entity.size, entity.id).await?;
         }
     }

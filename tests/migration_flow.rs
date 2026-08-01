@@ -136,9 +136,15 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
     assert!(policy.is_default);
     assert_eq!(policy.chunk_size, 0);
     let policy_options: serde_json::Value = serde_json::from_str(policy.options.as_ref())?;
-    assert_eq!(
-        policy_options["object_storage_upload_strategy"],
-        "relay_stream"
+    assert!(
+        policy_options
+            .get("object_storage_upload_strategy")
+            .is_none()
+    );
+    assert!(
+        policy_options
+            .get("object_storage_download_strategy")
+            .is_none()
     );
 
     let policy_group = aster_drive_schema::entities::storage_policy_group::Entity::find()
@@ -365,6 +371,114 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
 
     let _ = std::fs::remove_file(source_path);
     let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
+async fn assert_unsupported_policy_is_rejected_or_skipped(
+    policy_type: &str,
+    endpoint: &str,
+    expected_reason: &str,
+) -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let source_path = std::env::temp_dir().join(format!("cloudreve-{policy_type}-{suffix}.db"));
+    let target_path = std::env::temp_dir().join(format!("asterdrive-{policy_type}-{suffix}.db"));
+    let source_url = sqlite_url(&source_path);
+    let target_url = sqlite_url(&target_path);
+
+    let source = Database::connect(&source_url).await?;
+    create_source_schema(&source).await?;
+    seed_source(&source).await?;
+    let policy = cloudreve_schema::storage_policies::Entity::find()
+        .one(&source)
+        .await?
+        .expect("seeded storage policy");
+    let mut policy = policy.into_active_model();
+    policy.r#type = Set(policy_type.to_string());
+    policy.server = Set(Some(endpoint.to_string()));
+    policy.bucket_name = Set(Some("bucket".to_string()));
+    policy.access_key = Set(Some("access".to_string()));
+    policy.secret_key = Set(Some("secret".to_string()));
+    policy.update(&source).await?;
+    source.close().await?;
+
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let options = MigrationOptions {
+        source_url: source_url.clone(),
+        target_url: target_url.clone(),
+        default_password: "temporary-password".to_string(),
+        local_base_path: "unused-local-root".to_string(),
+        local_policy_roots: std::collections::BTreeMap::new(),
+        verify_local_storage: false,
+        verify_remote_storage: false,
+        direct_link_secret: Some("test-direct-link-secret".to_string()),
+        include_deleted: false,
+        allow_non_empty_target: false,
+        skip_unsupported_policies: false,
+        dry_run: false,
+        run_id: None,
+        resume: false,
+        blob_batch_size: 500,
+        file_batch_size: 500,
+    };
+
+    let error = migrate(options.clone()).await.unwrap_err();
+    assert!(format!("{error:?}").contains(expected_reason));
+
+    let target = Database::connect(&target_url).await?;
+    assert_eq!(
+        aster_drive_schema::entities::storage_policy::Entity::find()
+            .count(&target)
+            .await?,
+        0
+    );
+    target.close().await?;
+
+    let report = migrate(MigrationOptions {
+        skip_unsupported_policies: true,
+        ..options
+    })
+    .await?;
+    assert_eq!(report.migrated_policies, 0);
+    assert_eq!(report.migrated_blobs, 0);
+    assert_eq!(report.migrated_files, 0);
+    assert!(report.skipped_objects.iter().any(|skipped| {
+        skipped.object_type == "storage_policy" && skipped.reason.contains(expected_reason)
+    }));
+    assert!(report.skipped_objects.iter().any(|skipped| {
+        skipped.object_type == "blob" && skipped.reason.contains("storage policy")
+    }));
+    assert!(report.validation.passed);
+
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_or_explicitly_skips_unsupported_policies_and_their_dependents() -> Result<()> {
+    for (policy_type, endpoint, expected_reason) in [
+        (
+            "oss",
+            "https://oss.example.test",
+            "native Alibaba OSS signing",
+        ),
+        (
+            "obs",
+            "https://obs.example.test",
+            "native Huawei OBS signing",
+        ),
+        (
+            "cos",
+            "https://cdn.example.test",
+            "Tencent COS myqcloud.com host",
+        ),
+    ] {
+        assert_unsupported_policy_is_rejected_or_skipped(policy_type, endpoint, expected_reason)
+            .await?;
+    }
     Ok(())
 }
 

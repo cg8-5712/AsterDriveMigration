@@ -10,20 +10,13 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
         _: &ConversionContext,
     ) -> Result<Conversion<Self::Output>> {
         let policy = source.policy;
-        let policy_settings = settings(&policy.settings);
-        if policy_settings
-            .get("encryption")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(Conversion::Skipped(SkipReason {
-                code: "cloudreve_storage_encryption",
-                message: format!("{} (Cloudreve encryption enabled)", policy.r#type),
-            }));
+        if let Some(reason) = storage_policy_skip_reason(&policy) {
+            return Ok(Conversion::Skipped(reason));
         }
+        let policy_settings = settings(&policy.settings);
         let driver = match policy.r#type.as_str() {
             "local" => MigrationStorageDriver::Local,
-            "s3" | "oss" | "ks3" | "obs" => MigrationStorageDriver::S3,
+            "s3" | "ks3" => MigrationStorageDriver::S3,
             "cos" => MigrationStorageDriver::TencentCos,
             unsupported => {
                 return Ok(Conversion::Skipped(SkipReason {
@@ -76,6 +69,33 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
             .get("s3_path_style")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let (object_storage_upload_strategy, object_storage_download_strategy) = match driver {
+            MigrationStorageDriver::Local => (None, None),
+            MigrationStorageDriver::S3 | MigrationStorageDriver::TencentCos => (
+                Some(
+                    if policy_settings
+                        .get("relay")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        MigrationObjectStorageUploadStrategy::RelayStream
+                    } else {
+                        MigrationObjectStorageUploadStrategy::Presigned
+                    },
+                ),
+                Some(
+                    if policy_settings
+                        .get("internal_proxy")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        MigrationObjectStorageDownloadStrategy::RelayStream
+                    } else {
+                        MigrationObjectStorageDownloadStrategy::Presigned
+                    },
+                ),
+            ),
+        };
         let extensions = BTreeMap::from([
             ("cloudreve_source".to_string(), policy_settings),
             ("cloudreve_policy_type".to_string(), json!(policy.r#type)),
@@ -92,6 +112,8 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
             max_file_size: policy.max_size.unwrap_or(0),
             allowed_types,
             s3_path_style: path_style,
+            object_storage_upload_strategy,
+            object_storage_download_strategy,
             extensions,
             chunk_size,
             created_at: target_time(policy.created_at),

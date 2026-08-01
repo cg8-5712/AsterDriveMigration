@@ -291,4 +291,92 @@ mod tests {
         assert!(matches!(cleanup.command, Command::Cleanup(_)));
         Ok(())
     }
+
+    #[test]
+    fn parses_check_and_complete_migration_flags() -> Result<()> {
+        let check = Cli::try_parse_from([
+            "aster-drive-migration",
+            "check",
+            "--source-url",
+            "sqlite://source.db",
+            "--target-url",
+            "sqlite://target.db",
+            "--include-deleted",
+            "--report-path",
+            "report.json",
+        ])?;
+        let Command::Check(check) = check.command else {
+            panic!("expected check command");
+        };
+        assert!(check.include_deleted);
+        assert_eq!(check.report_path.as_deref(), Some(Path::new("report.json")));
+
+        let migrate = Cli::try_parse_from([
+            "aster-drive-migration",
+            "migrate",
+            "--source-url",
+            "sqlite://source.db",
+            "--target-url",
+            "sqlite://target.db",
+            "--default-password",
+            "temporary-password",
+            "--direct-link-secret",
+            "direct-link-secret",
+            "--local-policy-root",
+            "3=/storage",
+            "--verify-local-storage",
+            "--verify-remote-storage",
+            "--allow-non-empty-target",
+            "--skip-unsupported-policies",
+            "--include-deleted",
+            "--dry-run",
+            "--blob-batch-size",
+            "1",
+            "--file-batch-size",
+            "10000",
+        ])?;
+        let Command::Migrate(migrate) = migrate.command else {
+            panic!("expected migrate command");
+        };
+        assert!(migrate.verify_local_storage);
+        assert!(migrate.verify_remote_storage);
+        assert!(migrate.allow_non_empty_target);
+        assert!(migrate.skip_unsupported_policies);
+        assert!(migrate.connection.include_deleted);
+        assert!(migrate.dry_run);
+        assert_eq!(migrate.local_policy_roots, ["3=/storage"]);
+        assert_eq!(migrate.blob_batch_size, 1);
+        assert_eq!(migrate.file_batch_size, 10_000);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_rejects_missing_required_values_and_resume_without_run_id() {
+        assert!(Cli::try_parse_from(["aster-drive-migration", "check"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "aster-drive-migration",
+                "migrate",
+                "--source-url",
+                "sqlite://source.db",
+                "--target-url",
+                "sqlite://target.db",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "aster-drive-migration",
+                "migrate",
+                "--source-url",
+                "sqlite://source.db",
+                "--target-url",
+                "sqlite://target.db",
+                "--default-password",
+                "temporary-password",
+                "--resume",
+            ])
+            .is_err()
+        );
+    }
 }

@@ -12,9 +12,12 @@
 )]
 
 mod converter;
+mod local_path;
 mod record;
 
 pub use converter::CloudreveConverter;
+pub use converter::storage_policy_skip_reason;
+pub use local_path::normalize_local_storage_path;
 pub use record::{
     CloudreveBlobRecord, CloudreveDirectLinkRecord, CloudreveFileRecord, CloudreveFolderRecord,
     CloudreveMetadataRecord, CloudrevePolicyGroupRecord, CloudreveShareRecord,

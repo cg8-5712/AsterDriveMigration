@@ -112,6 +112,27 @@ impl MigrationStage {
 }
 
 pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
+    validate_migration_options(&options)?;
+
+    let source = connect(&options.source_url, "Cloudreve").await?;
+    let target = connect(&options.target_url, "AsterDrive").await?;
+    let source_data = SourceData::load(&source, options.include_deleted).await?;
+    validate_target_schema(&target).await?;
+    let preflight = run_preflight(&source, &source_data).await?;
+    if !preflight.passed {
+        bail!(
+            "Cloudreve preflight failed ({} checks); run `check --report-path` for details and repair source data before migration",
+            preflight
+                .checks
+                .iter()
+                .filter(|check| !check.passed)
+                .count()
+        );
+    }
+    migrate_validated(options, source, target, source_data, preflight).await
+}
+
+fn validate_migration_options(options: &MigrationOptions) -> Result<()> {
     if options.default_password.chars().count() < 8 {
         bail!("--default-password must contain at least 8 characters");
     }
@@ -137,27 +158,20 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     if !(1..=10_000).contains(&options.file_batch_size) {
         bail!("--file-batch-size must be between 1 and 10000");
     }
+    Ok(())
+}
 
-    let source = connect(&options.source_url, "Cloudreve").await?;
-    let target = connect(&options.target_url, "AsterDrive").await?;
-    let source_data = SourceData::load(&source, options.include_deleted).await?;
-    validate_target_schema(&target).await?;
-    let preflight = run_preflight(&source, &source_data).await?;
-    if !preflight.passed {
-        bail!(
-            "Cloudreve preflight failed ({} checks); run `check --report-path` for details and repair source data before migration",
-            preflight
-                .checks
-                .iter()
-                .filter(|check| !check.passed)
-                .count()
-        );
-    }
-
-    let unsupported = source_data.unsupported_policy_types();
+async fn migrate_validated(
+    options: MigrationOptions,
+    source: DatabaseConnection,
+    target: DatabaseConnection,
+    source_data: SourceData,
+    preflight: MigrationPreflight,
+) -> Result<MigrationReport> {
+    let unsupported = source_data.unsupported_policies();
     if !unsupported.is_empty() && !options.skip_unsupported_policies {
         bail!(
-            "unsupported Cloudreve storage policy types: {}; rerun with --skip-unsupported-policies to omit their files",
+            "unsupported Cloudreve storage policies: {}; rerun with --skip-unsupported-policies to omit their files",
             unsupported.join(", ")
         );
     }
@@ -165,9 +179,13 @@ pub async fn migrate(options: MigrationOptions) -> Result<MigrationReport> {
     if options.verify_local_storage {
         verify_local_storage_roots(&source_data, &options)?;
     }
-    if options.dry_run && options.verify_local_storage {
-        verify_all_local_source_objects(&source, &source_data, &options).await?;
-    }
+    validate_all_local_source_objects(
+        &source,
+        &source_data,
+        &options,
+        options.dry_run && options.verify_local_storage,
+    )
+    .await?;
     if options.dry_run && options.verify_remote_storage {
         verify_all_remote_source_objects(&source, &source_data, &options).await?;
     }
@@ -596,6 +614,8 @@ pub(super) async fn migrate_blobs_batched(
                 &transaction,
                 &entities,
                 &association_info.reference_counts,
+                inputs.source_data,
+                inputs.options,
                 inputs.context,
                 report,
             )
@@ -933,7 +953,88 @@ pub(super) fn plan_fingerprint(options: &MigrationOptions) -> String {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, DbBackend, Schema};
+    use std::collections::BTreeMap;
     use std::time::Instant;
+
+    fn migration_options() -> MigrationOptions {
+        MigrationOptions {
+            source_url: "sqlite::memory:".to_string(),
+            target_url: "sqlite::memory:".to_string(),
+            default_password: "12345678".to_string(),
+            local_base_path: ".".to_string(),
+            local_policy_roots: BTreeMap::new(),
+            verify_local_storage: false,
+            verify_remote_storage: false,
+            direct_link_secret: Some("1234567890123456".to_string()),
+            include_deleted: false,
+            allow_non_empty_target: false,
+            skip_unsupported_policies: false,
+            dry_run: false,
+            run_id: Some("run".to_string()),
+            resume: false,
+            blob_batch_size: 1,
+            file_batch_size: 10_000,
+        }
+    }
+
+    #[test]
+    fn migration_option_validation_accepts_exact_boundaries() -> Result<()> {
+        let options = migration_options();
+        validate_migration_options(&options)?;
+        let mut no_optional_secret = options;
+        no_optional_secret.direct_link_secret = None;
+        validate_migration_options(&no_optional_secret)
+    }
+
+    #[test]
+    fn migration_option_validation_rejects_password_and_secret_below_minimum() {
+        let mut options = migration_options();
+        options.default_password = "1234567".to_string();
+        assert!(
+            validate_migration_options(&options)
+                .expect_err("short password must fail")
+                .to_string()
+                .contains("at least 8")
+        );
+
+        let mut options = migration_options();
+        options.direct_link_secret = Some("123456789012345".to_string());
+        assert!(
+            validate_migration_options(&options)
+                .expect_err("short direct-link secret must fail")
+                .to_string()
+                .contains("at least 16")
+        );
+    }
+
+    #[test]
+    fn migration_option_validation_rejects_invalid_resume_and_run_ids() {
+        let mut options = migration_options();
+        options.resume = true;
+        options.run_id = None;
+        assert!(validate_migration_options(&options).is_err());
+
+        let mut options = migration_options();
+        options.resume = true;
+        options.dry_run = true;
+        assert!(validate_migration_options(&options).is_err());
+
+        for run_id in [String::new(), "x".repeat(129), "run\n1".to_string()] {
+            let mut options = migration_options();
+            options.run_id = Some(run_id);
+            assert!(validate_migration_options(&options).is_err());
+        }
+    }
+
+    #[test]
+    fn migration_option_validation_rejects_batch_sizes_outside_closed_range() {
+        for (blob_batch_size, file_batch_size) in [(0, 1), (10_001, 1), (1, 0), (1, 10_001)] {
+            let mut options = migration_options();
+            options.blob_batch_size = blob_batch_size;
+            options.file_batch_size = file_batch_size;
+            assert!(validate_migration_options(&options).is_err());
+        }
+    }
 
     #[test]
     fn progress_timing_includes_rate_and_eta() {

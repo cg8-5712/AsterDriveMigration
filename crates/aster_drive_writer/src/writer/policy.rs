@@ -7,17 +7,26 @@ impl AsterDriveWriter<'_> {
         is_default: bool,
     ) -> Result<i64> {
         let source_id = policy.source_id;
-        let mut options = Map::from_iter([
-            ("s3_path_style".to_string(), json!(policy.s3_path_style)),
-            (
+        let mut options =
+            Map::from_iter([("s3_path_style".to_string(), json!(policy.s3_path_style))]);
+        if let Some(strategy) = policy.object_storage_upload_strategy {
+            options.insert(
                 "object_storage_upload_strategy".to_string(),
-                json!("relay_stream"),
-            ),
-            (
+                json!(match strategy {
+                    MigrationObjectStorageUploadStrategy::RelayStream => "relay_stream",
+                    MigrationObjectStorageUploadStrategy::Presigned => "presigned",
+                }),
+            );
+        }
+        if let Some(strategy) = policy.object_storage_download_strategy {
+            options.insert(
                 "object_storage_download_strategy".to_string(),
-                json!("relay_stream"),
-            ),
-        ]);
+                json!(match strategy {
+                    MigrationObjectStorageDownloadStrategy::RelayStream => "relay_stream",
+                    MigrationObjectStorageDownloadStrategy::Presigned => "presigned",
+                }),
+            );
+        }
         options.extend(policy.extensions);
         let target = aster_drive_schema::entities::storage_policy::ActiveModel {
             name: Set(policy.name),

@@ -234,6 +234,8 @@ pub(super) async fn migrate_blob_batch(
     transaction: &DatabaseTransaction,
     entities: &[cloudreve_schema::entities::Model],
     reference_counts: &HashMap<i64, i64>,
+    source: &SourceData,
+    options: &MigrationOptions,
     context: &MigrationContext,
     report: &mut MigrationReport,
 ) -> Result<Vec<(i64, i64)>> {
@@ -242,10 +244,24 @@ pub(super) async fn migrate_blob_batch(
     let conversion_context = ConversionContext;
     let writer = AsterDriveWriter::new(transaction);
     for entity in entities {
+        let local_root = context
+            .policies
+            .contains_key(&entity.storage_policy_entities)
+            .then(|| {
+                source
+                    .policies
+                    .iter()
+                    .find(|policy| {
+                        policy.id == entity.storage_policy_entities && policy.r#type == "local"
+                    })
+                    .map(|policy| local_policy_root(options, policy.id).to_string())
+            })
+            .flatten();
         let conversion = converter.convert(
             CloudreveBlobRecord {
                 entity: entity.clone(),
                 reference_count: reference_counts.get(&entity.id).copied().unwrap_or(0),
+                local_root,
             },
             &conversion_context,
         )?;

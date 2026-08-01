@@ -1303,6 +1303,7 @@ dependencies = [
  "cloudreve_schema",
  "color-eyre",
  "serde_json",
+ "url",
 ]
 
 [[package]]

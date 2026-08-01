@@ -40,11 +40,22 @@ impl SourceConverter<CloudreveBlobRecord> for CloudreveConverter {
                 entity.id
             );
         }
+        let storage_path = match source.local_root {
+            Some(root) => {
+                crate::normalize_local_storage_path(&root, &entity.source).map_err(|error| {
+                    color_eyre::eyre::eyre!(
+                        "Cloudreve local entity {} has an invalid storage path: {error}",
+                        entity.id
+                    )
+                })?
+            }
+            None => entity.source,
+        };
         Ok(Conversion::Ready(MigrationBlob {
             source_id: entity.id,
             policy_source_id: entity.storage_policy_entities,
             opaque_key: format!("cloudreve-{:016x}", entity.id),
-            storage_path: entity.source,
+            storage_path,
             size: entity.size,
             reference_count,
             created_at: target_time(entity.created_at),

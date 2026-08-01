@@ -129,12 +129,12 @@ Cloudreve 一条 `users` 记录需要拆成 AD 的 `users` 和 `user_profiles`�
 
 | Cloudreve `type` | AD `driver_type` | 状态 | 说明 |
 |---|---|---|---|
-| `local` | `local` | 可迁移 | `entity.source` 作为 `storage_path`，需指定正确 AD `base_path` |
-| `s3` | `s3` | 可迁移 | 复用 endpoint、bucket、key 和 secret |
-| `oss` | `s3` | 需验证 | 通过 S3 兼容接口接入；需验证 endpoint 和 path-style |
-| `ks3` | `s3` | 需验证 | 通过 S3 兼容接口接入 |
-| `obs` | `s3` | 需验证 | 通过 S3 兼容接口接入；签名/endpoint 兼容性需实测 |
-| `cos` | `tencent_cos` | 可迁移 | 使用 AD 原生腾讯 COS 驱动 |
+| `local` | `local` | 条件迁移 | 相对 source 拒绝 `..` 后保留；绝对 source 必须位于配置 root 内并转换为相对 `storage_path` |
+| `s3` | `s3` | 条件迁移 | endpoint、bucket、key 和 path-style 可复用；region 契约等待 AD #452 与 ADM #3 |
+| `oss` | 无 | 不兼容 | Cloudreve 使用阿里 OSS 原生 SDK、endpoint/CNAME 语义和签名；等待 AD #450 |
+| `ks3` | `s3` | 条件迁移 | 接口接近 S3，但必须保留 region 并完成目标运行时验证 |
+| `obs` | 无 | 不兼容 | Cloudreve 明确使用华为 OBS `SignatureObs`；等待 AD #451 |
+| `cos` | `tencent_cos` | 条件迁移 | 仅接受 `https://<bucket>.cos.<region>.myqcloud.com` 且 endpoint bucket 与 `bucket_name` 一致 |
 | `qiniu` | 无 | 不兼容 | AD 当前没有七牛驱动，也不能保证 S3 兼容 |
 | `upyun` | 无 | 不兼容 | AD 当前没有又拍云驱动 |
 | `onedrive` | `onedrive` 但凭据结构不同 | 不兼容 | AD 将 OAuth token 拆到 credential/config 表，不能只复制策略字段 |
@@ -149,7 +149,7 @@ Cloudreve 一条 `users` 记录需要拆成 AD 的 `users` 和 `user_profiles`�
 | `id` | 新生成 `id` | 转换 | 保存策略 ID 映射 |
 | `name` | `name` | 直接 | 保留名称 |
 | `type` | `driver_type` | 转换 | 按上表映射 |
-| `server` | `endpoint` | 转换 | `NULL` 转为空字符串；不同驱动 endpoint 语义需核实 |
+| `server` | `endpoint` | 转换 | 仅对兼容驱动复制；COS 必须通过标准 endpoint 校验 |
 | `bucket_name` | `bucket` | 转换 | `NULL` 转为空字符串 |
 | `access_key` | `access_key` | 直接/敏感 | 仅对兼容驱动复制；不得写日志 |
 | `secret_key` | `secret_key` | 直接/敏感 | 仅对兼容驱动复制；不得写日志 |
@@ -157,9 +157,11 @@ Cloudreve 一条 `users` 记录需要拆成 AD 的 `users` 和 `user_profiles`�
 | `settings.file_type` | `allowed_types` | 转换 | 保存为 JSON 数组；还需处理 deny-list 语义 |
 | `settings.chunk_size` | `chunk_size` | 转换 | 保留字节数；`0` 表示单次上传 |
 | `settings.s3_path_style` | `options.s3_path_style` | 转换 | 保留布尔值 |
-| `settings.relay` | `options.object_storage_upload_strategy` | 转换 | `true` 倾向 `relay_stream`；否则可考虑 `presigned` |
+| `settings.region` | `options.s3_region` | 待实现 | AD 当前运行时固定使用 `auto`；由 AD #452 与 ADM #3 跟踪 |
+| `settings.relay` | `options.object_storage_upload_strategy` | 转换 | `true` -> `relay_stream`；`false` 或缺省 -> `presigned` |
+| `settings.internal_proxy` | `options.object_storage_download_strategy` | 转换 | `true` -> `relay_stream`；`false` 或缺省 -> `presigned`；`custom_proxy/proxy_server` 的自定义代理域名不在此字段中表达 |
 | `is_private` | 无单独字段 | 合并 | AD 下载策略由 `options` 控制，不应机械复制 |
-| `dir_name_rule` | 无直接字段 | 决策 | AD 对象 key 规则不同；旧对象迁移时保留现有 `entity.source` |
+| `dir_name_rule` | 无直接字段 | 决策 | 不迁移生成规则；已有对象使用规格化后的 `entity.source` |
 | `file_name_rule` | 无直接字段 | 决策 | 同上 |
 | `settings` 其他键 | `options.cloudreve_source` 或忽略 | 决策 | 可存档原 JSON，但 AD 不会自动使用未知键 |
 | `node_id` | `remote_node_id` | 不兼容 | Cloudreve node 不能直接变成 AD managed follower |

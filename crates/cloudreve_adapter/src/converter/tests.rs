@@ -148,21 +148,23 @@ fn converts_every_supported_storage_driver() -> Result<()> {
     for (source, expected) in [
         ("local", MigrationStorageDriver::Local),
         ("s3", MigrationStorageDriver::S3),
-        ("oss", MigrationStorageDriver::S3),
         ("ks3", MigrationStorageDriver::S3),
-        ("obs", MigrationStorageDriver::S3),
         ("cos", MigrationStorageDriver::TencentCos),
     ] {
+        let mut source_policy = policy(
+            source,
+            json!({
+                "chunk_size": 128,
+                "file_type": ["jpg", "png"],
+                "s3_path_style": false
+            }),
+        );
+        if source == "cos" {
+            source_policy.server = Some("https://bucket.cos.ap-guangzhou.myqcloud.com".to_string());
+        }
         let converted = ready(CloudreveConverter.convert(
             CloudreveStoragePolicyRecord {
-                policy: policy(
-                    source,
-                    json!({
-                        "chunk_size": 128,
-                        "file_type": ["jpg", "png"],
-                        "s3_path_style": false
-                    }),
-                ),
+                policy: source_policy,
                 local_root: (source == "local").then(|| "/source".to_string()),
             },
             &ConversionContext,
@@ -171,6 +173,19 @@ fn converts_every_supported_storage_driver() -> Result<()> {
         assert_eq!(converted.chunk_size, 128);
         assert_eq!(converted.allowed_types, ["jpg", "png"]);
         assert!(!converted.s3_path_style);
+        if source == "local" {
+            assert_eq!(converted.object_storage_upload_strategy, None);
+            assert_eq!(converted.object_storage_download_strategy, None);
+        } else {
+            assert_eq!(
+                converted.object_storage_upload_strategy,
+                Some(MigrationObjectStorageUploadStrategy::Presigned)
+            );
+            assert_eq!(
+                converted.object_storage_download_strategy,
+                Some(MigrationObjectStorageDownloadStrategy::Presigned)
+            );
+        }
         assert_eq!(converted.extensions["cloudreve_policy_type"], source);
         assert_eq!(
             converted.base_path,
@@ -181,18 +196,73 @@ fn converts_every_supported_storage_driver() -> Result<()> {
 }
 
 #[test]
-fn skips_unsupported_or_encrypted_storage_policies() -> Result<()> {
-    for (source, settings, expected_code) in [
-        ("onedrive", json!({}), "unsupported_storage_driver"),
+fn preserves_cloudreve_object_storage_upload_and_download_topology() -> Result<()> {
+    for (relay, internal_proxy, expected_upload, expected_download) in [
         (
-            "s3",
-            json!({"encryption": true}),
-            "cloudreve_storage_encryption",
+            false,
+            false,
+            MigrationObjectStorageUploadStrategy::Presigned,
+            MigrationObjectStorageDownloadStrategy::Presigned,
         ),
+        (
+            true,
+            false,
+            MigrationObjectStorageUploadStrategy::RelayStream,
+            MigrationObjectStorageDownloadStrategy::Presigned,
+        ),
+        (
+            false,
+            true,
+            MigrationObjectStorageUploadStrategy::Presigned,
+            MigrationObjectStorageDownloadStrategy::RelayStream,
+        ),
+        (
+            true,
+            true,
+            MigrationObjectStorageUploadStrategy::RelayStream,
+            MigrationObjectStorageDownloadStrategy::RelayStream,
+        ),
+    ] {
+        for source in ["s3", "cos"] {
+            let mut source_policy = policy(
+                source,
+                json!({
+                    "relay": relay,
+                    "internal_proxy": internal_proxy
+                }),
+            );
+            if source == "cos" {
+                source_policy.server =
+                    Some("https://bucket.cos.ap-guangzhou.myqcloud.com".to_string());
+            }
+            let converted = ready(CloudreveConverter.convert(
+                CloudreveStoragePolicyRecord {
+                    policy: source_policy,
+                    local_root: None,
+                },
+                &ConversionContext,
+            )?);
+            assert_eq!(
+                converted.object_storage_upload_strategy,
+                Some(expected_upload)
+            );
+            assert_eq!(
+                converted.object_storage_download_strategy,
+                Some(expected_download)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn skips_unsupported_or_encrypted_storage_policies() -> Result<()> {
+    for source in [
+        "oss", "obs", "qiniu", "upyun", "onedrive", "remote", "unknown",
     ] {
         let converted = CloudreveConverter.convert(
             CloudreveStoragePolicyRecord {
-                policy: policy(source, settings),
+                policy: policy(source, json!({})),
                 local_root: None,
             },
             &ConversionContext,
@@ -200,10 +270,177 @@ fn skips_unsupported_or_encrypted_storage_policies() -> Result<()> {
         let Conversion::Skipped(reason) = converted else {
             panic!("expected skipped conversion");
         };
-        assert_eq!(reason.code, expected_code);
+        assert_eq!(reason.code, "unsupported_storage_driver");
         assert!(!reason.message.is_empty());
     }
     Ok(())
+}
+
+#[test]
+fn storage_encryption_takes_precedence_for_every_policy_type() -> Result<()> {
+    for source in ["local", "s3", "ks3", "cos", "oss", "obs"] {
+        let mut encrypted = policy(source, json!({"encryption": true}));
+        if source == "cos" {
+            encrypted.server = Some("https://bucket.cos.ap-guangzhou.myqcloud.com".to_string());
+        }
+        let conversion = CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: encrypted,
+                local_root: (source == "local").then(|| "/source".to_string()),
+            },
+            &ConversionContext,
+        )?;
+        let Conversion::Skipped(reason) = conversion else {
+            panic!("expected encrypted policy to be skipped");
+        };
+        assert_eq!(reason.code, "cloudreve_storage_encryption");
+        assert!(reason.message.contains(source));
+    }
+    Ok(())
+}
+
+#[test]
+fn accepts_only_standard_tencent_cos_policy_endpoints() -> Result<()> {
+    for (endpoint, bucket) in [
+        ("https://bucket.cos.ap-guangzhou.myqcloud.com", "bucket"),
+        ("http://bucket.cos.ap-shanghai.myqcloud.com", "bucket"),
+        ("https://bucket.cos.ap-guangzhou.myqcloud.com/", "Bucket"),
+    ] {
+        let mut valid = policy("cos", json!({}));
+        valid.server = Some(endpoint.to_string());
+        valid.bucket_name = Some(bucket.to_string());
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveStoragePolicyRecord {
+                        policy: valid,
+                        local_root: None,
+                    },
+                    &ConversionContext,
+                )?
+                .into_ready()
+                .is_some()
+        );
+    }
+
+    for (endpoint, bucket, expected_message) in [
+        ("https://www.example.test", "bucket", "myqcloud.com host"),
+        (
+            "https://bucket.cos.ap-guangzhou.myqcloud.com.evil.test",
+            "bucket",
+            "myqcloud.com host",
+        ),
+        (
+            "https://other.cos.ap-guangzhou.myqcloud.com",
+            "bucket",
+            "does not match bucket",
+        ),
+        ("not a URL", "bucket", "not a valid URL"),
+        (
+            "https://bucket.cos..myqcloud.com",
+            "bucket",
+            "invalid region",
+        ),
+        (
+            "https://bucket.cos.ap.guangzhou.myqcloud.com",
+            "bucket",
+            "invalid region",
+        ),
+        (
+            "ftp://bucket.cos.ap-guangzhou.myqcloud.com",
+            "bucket",
+            "http or https",
+        ),
+        (
+            "https://bucket.cos.ap-guangzhou.myqcloud.com",
+            "",
+            "bucket is required",
+        ),
+    ] {
+        let mut invalid = policy("cos", json!({}));
+        invalid.server = Some(endpoint.to_string());
+        invalid.bucket_name = Some(bucket.to_string());
+        let conversion = CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: invalid,
+                local_root: None,
+            },
+            &ConversionContext,
+        )?;
+        let Conversion::Skipped(reason) = conversion else {
+            panic!("expected incompatible COS policy to be skipped");
+        };
+        assert_eq!(reason.code, "unsupported_storage_configuration");
+        assert!(
+            reason.message.contains(expected_message),
+            "expected {expected_message:?} in {:?}",
+            reason.message
+        );
+    }
+
+    let mut missing_endpoint = policy("cos", json!({}));
+    missing_endpoint.server = None;
+    let conversion = CloudreveConverter.convert(
+        CloudreveStoragePolicyRecord {
+            policy: missing_endpoint,
+            local_root: None,
+        },
+        &ConversionContext,
+    )?;
+    assert!(matches!(
+        conversion,
+        Conversion::Skipped(reason)
+            if reason.code == "unsupported_storage_configuration"
+                && reason.message.contains("endpoint is required")
+    ));
+    Ok(())
+}
+
+#[test]
+fn skips_object_storage_policies_missing_runtime_credentials() -> Result<()> {
+    for policy_type in ["s3", "ks3", "cos"] {
+        for (field, expected_message) in [
+            ("bucket", "bucket is required"),
+            ("access_key", "access key is required"),
+            ("secret_key", "secret key is required"),
+        ] {
+            let mut invalid = policy(policy_type, json!({}));
+            if policy_type == "cos" {
+                invalid.server = Some("https://bucket.cos.ap-guangzhou.myqcloud.com".to_string());
+            }
+            match field {
+                "bucket" => invalid.bucket_name = Some(" ".to_string()),
+                "access_key" => invalid.access_key = None,
+                "secret_key" => invalid.secret_key = Some(String::new()),
+                _ => panic!("unexpected test field"),
+            }
+            let conversion = CloudreveConverter.convert(
+                CloudreveStoragePolicyRecord {
+                    policy: invalid,
+                    local_root: None,
+                },
+                &ConversionContext,
+            )?;
+            let Conversion::Skipped(reason) = conversion else {
+                panic!("expected incomplete object-storage policy to be skipped");
+            };
+            assert_eq!(reason.code, "unsupported_storage_configuration");
+            assert!(reason.message.contains(expected_message));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_policy_reasons_never_include_credentials() {
+    for policy_type in ["oss", "obs"] {
+        let mut unsupported = policy(policy_type, json!({}));
+        unsupported.access_key = Some("sensitive-access".to_string());
+        unsupported.secret_key = Some("sensitive-secret".to_string());
+        let reason = storage_policy_skip_reason(&unsupported).expect("unsupported policy");
+        assert!(!reason.message.contains("sensitive-access"));
+        assert!(!reason.message.contains("sensitive-secret"));
+    }
 }
 
 #[test]
@@ -309,6 +546,7 @@ fn converts_blob_and_orders_file_versions() -> Result<()> {
         CloudreveBlobRecord {
             entity: entity(12, 0, 512),
             reference_count: 3,
+            local_root: None,
         },
         &ConversionContext,
     )?);
@@ -342,11 +580,83 @@ fn converts_blob_and_orders_file_versions() -> Result<()> {
 }
 
 #[test]
+fn normalizes_local_blob_paths_relative_to_the_configured_root() -> Result<()> {
+    for (root, source, expected) in [
+        ("/srv/cloudreve", "uploads/object.bin", "uploads/object.bin"),
+        (
+            "/srv/cloudreve",
+            "/srv/cloudreve/data/uploads/object.bin",
+            "data/uploads/object.bin",
+        ),
+        (
+            "C:\\Cloudreve",
+            "c:\\cloudreve\\data\\object.bin",
+            "data/object.bin",
+        ),
+        (
+            "\\\\server\\share\\cloudreve",
+            "\\\\SERVER\\SHARE\\Cloudreve\\uploads\\object.bin",
+            "uploads/object.bin",
+        ),
+    ] {
+        let mut local_entity = entity(12, 0, 512);
+        local_entity.source = source.to_string();
+        let blob = ready(CloudreveConverter.convert(
+            CloudreveBlobRecord {
+                entity: local_entity,
+                reference_count: 1,
+                local_root: Some(root.to_string()),
+            },
+            &ConversionContext,
+        )?);
+        assert_eq!(blob.storage_path, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_unsafe_or_unrelated_local_blob_paths() {
+    for (root, source, expected_message) in [
+        (
+            "/srv/cloudreve",
+            "/srv/other/object.bin",
+            "outside the configured local root",
+        ),
+        ("C:/cloudreve", "D:/cloudreve/object.bin", "different root"),
+        (
+            "/srv/cloudreve",
+            "uploads/../secret.bin",
+            "parent-directory segments",
+        ),
+        (
+            "/srv/cloudreve",
+            "/srv/cloudreve",
+            "resolves to the local storage root",
+        ),
+    ] {
+        let mut local_entity = entity(12, 0, 512);
+        local_entity.source = source.to_string();
+        let error = CloudreveConverter
+            .convert(
+                CloudreveBlobRecord {
+                    entity: local_entity,
+                    reference_count: 1,
+                    local_root: Some(root.to_string()),
+                },
+                &ConversionContext,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains(expected_message));
+    }
+}
+
+#[test]
 fn handles_blob_and_file_boundaries() -> Result<()> {
     let conversion = CloudreveConverter.convert(
         CloudreveBlobRecord {
             entity: entity(12, 1, 512),
             reference_count: 1,
+            local_root: None,
         },
         &ConversionContext,
     )?;
@@ -364,6 +674,7 @@ fn handles_blob_and_file_boundaries() -> Result<()> {
                     CloudreveBlobRecord {
                         entity: plain_blob,
                         reference_count: 1,
+                        local_root: None,
                     },
                     &ConversionContext,
                 )?
@@ -384,6 +695,7 @@ fn handles_blob_and_file_boundaries() -> Result<()> {
         CloudreveBlobRecord {
             entity: encrypted_blob,
             reference_count: 1,
+            local_root: None,
         },
         &ConversionContext,
     )?;
@@ -405,6 +717,7 @@ fn handles_blob_and_file_boundaries() -> Result<()> {
                 CloudreveBlobRecord {
                     entity: invalid_blob,
                     reference_count: 1,
+                    local_root: None,
                 },
                 &ConversionContext,
             )

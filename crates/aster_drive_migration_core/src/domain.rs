@@ -12,6 +12,18 @@ pub enum MigrationStorageDriver {
     TencentCos,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationObjectStorageUploadStrategy {
+    RelayStream,
+    Presigned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationObjectStorageDownloadStrategy {
+    RelayStream,
+    Presigned,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MigrationStoragePolicy {
     pub source_id: i64,
@@ -25,6 +37,8 @@ pub struct MigrationStoragePolicy {
     pub max_file_size: i64,
     pub allowed_types: Vec<String>,
     pub s3_path_style: bool,
+    pub object_storage_upload_strategy: Option<MigrationObjectStorageUploadStrategy>,
+    pub object_storage_download_strategy: Option<MigrationObjectStorageDownloadStrategy>,
     pub extensions: BTreeMap<String, Value>,
     pub chunk_size: i64,
     pub created_at: DateTime<Utc>,
@@ -188,4 +202,72 @@ pub struct MigrationDirectLink {
     pub source_name: String,
     pub source_downloads: i64,
     pub source_speed_limit: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_driver_enum_covers_all_target_drivers() {
+        assert_eq!(
+            [
+                MigrationStorageDriver::Local,
+                MigrationStorageDriver::S3,
+                MigrationStorageDriver::TencentCos,
+            ]
+            .len(),
+            3
+        );
+        assert_ne!(
+            MigrationStorageDriver::S3,
+            MigrationStorageDriver::TencentCos
+        );
+        assert_ne!(
+            MigrationObjectStorageUploadStrategy::RelayStream,
+            MigrationObjectStorageUploadStrategy::Presigned
+        );
+        assert_ne!(
+            MigrationObjectStorageDownloadStrategy::RelayStream,
+            MigrationObjectStorageDownloadStrategy::Presigned
+        );
+    }
+
+    #[test]
+    fn entity_refs_and_share_targets_are_structural() {
+        let file = MigrationEntityRef {
+            kind: MigrationEntityKind::File,
+            source_id: 0,
+        };
+        let folder = MigrationEntityRef {
+            kind: MigrationEntityKind::Folder,
+            source_id: -1,
+        };
+        assert_ne!(file, folder);
+        assert_eq!(
+            MigrationShareTarget::File { source_id: 7 },
+            MigrationShareTarget::File { source_id: 7 }
+        );
+        assert_ne!(
+            MigrationShareTarget::File { source_id: 7 },
+            MigrationShareTarget::Folder { source_id: 7 }
+        );
+    }
+
+    #[test]
+    fn domain_values_allow_source_statistics_without_implicit_validation() {
+        let now = DateTime::<Utc>::UNIX_EPOCH;
+        let blob = MigrationBlob {
+            source_id: 1,
+            policy_source_id: 2,
+            opaque_key: String::new(),
+            storage_path: String::new(),
+            size: -1,
+            reference_count: -1,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(blob.size, -1);
+        assert_eq!(blob.reference_count, -1);
+    }
 }

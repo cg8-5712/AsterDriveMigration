@@ -25,6 +25,7 @@ pub struct CloudreveFolderRecord {
 pub struct CloudreveBlobRecord {
     pub entity: cloudreve_schema::entities::Model,
     pub reference_count: i64,
+    pub local_root: Option<String>,
 }
 
 #[derive(Debug, Clone)]

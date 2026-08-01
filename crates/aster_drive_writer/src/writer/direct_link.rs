@@ -78,3 +78,37 @@ fn encode_base62(mut value: u64) -> Result<String> {
     }
     Ok(encoded.iter().rev().collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base62_encodes_zero_digit_boundaries_and_u64_max() -> Result<()> {
+        assert_eq!(encode_base62(0)?, "a");
+        assert_eq!(encode_base62(1)?, "b");
+        assert_eq!(encode_base62(61)?, "9");
+        assert_eq!(encode_base62(62)?, "ba");
+        assert_eq!(encode_base62(u64::MAX)?, "v8QrKbgkrIp");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_link_url_accepts_zero_and_encodes_empty_or_reserved_names() -> Result<()> {
+        let empty = direct_link_url(0, 0, "", "secret")?;
+        assert!(empty.starts_with("/d/v2.a."));
+        assert!(empty.ends_with('/'));
+
+        let reserved = direct_link_url(1, -1, "a/b c?.txt", "secret")?;
+        assert!(reserved.ends_with("/a%2Fb%20c%3F.txt"));
+        assert_eq!(reserved, direct_link_url(1, -1, "a/b c?.txt", "secret")?);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_link_url_rejects_negative_file_ids() {
+        let error = direct_link_url(-1, 1, "file.txt", "secret")
+            .expect_err("negative file ID must be rejected");
+        assert!(error.to_string().contains("must be non-negative"));
+    }
+}
