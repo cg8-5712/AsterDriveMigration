@@ -13,9 +13,11 @@ use aster_drive_model::types::{
 
 use aster_drive_migration_core::{
     MigrationAvatarSource, MigrationBlob, MigrationDirectLink, MigrationFile, MigrationFolder,
-    MigrationObjectStorageDownloadStrategy, MigrationObjectStorageUploadStrategy,
-    MigrationPolicyGroup, MigrationStorageDriver, MigrationStoragePolicy, MigrationUser,
-    MigrationUserRole, MigrationUserStatus,
+    MigrationMicrosoftGraphCloud, MigrationObjectStorageDownloadStrategy,
+    MigrationObjectStorageUploadStrategy, MigrationOneDriveAccountMode, MigrationPolicyGroup,
+    MigrationProviderDownloadFilenameMode, MigrationProviderDownloadStrategy,
+    MigrationProviderResumableUploadStrategy, MigrationStorageDriver, MigrationStoragePolicy,
+    MigrationUser, MigrationUserRole, MigrationUserStatus,
 };
 
 pub struct ResolvedPolicyGroup {

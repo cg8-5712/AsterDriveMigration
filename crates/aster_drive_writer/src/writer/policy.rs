@@ -7,8 +7,13 @@ impl AsterDriveWriter<'_> {
         is_default: bool,
     ) -> Result<i64> {
         let source_id = policy.source_id;
-        let mut options =
-            Map::from_iter([("s3_path_style".to_string(), json!(policy.s3_path_style))]);
+        let mut options = Map::new();
+        if matches!(
+            policy.driver,
+            MigrationStorageDriver::S3 | MigrationStorageDriver::TencentCos
+        ) {
+            options.insert("s3_path_style".to_string(), json!(policy.s3_path_style));
+        }
         if let Some(strategy) = policy.object_storage_upload_strategy {
             options.insert(
                 "object_storage_upload_strategy".to_string(),
@@ -27,6 +32,56 @@ impl AsterDriveWriter<'_> {
                 }),
             );
         }
+        if let Some(onedrive) = policy.onedrive {
+            options.insert(
+                "onedrive_cloud".to_string(),
+                json!(match onedrive.cloud {
+                    MigrationMicrosoftGraphCloud::Global => "global",
+                    MigrationMicrosoftGraphCloud::China => "china",
+                }),
+            );
+            options.insert(
+                "onedrive_account_mode".to_string(),
+                json!(match onedrive.account_mode {
+                    MigrationOneDriveAccountMode::WorkOrSchool => "work_or_school",
+                    MigrationOneDriveAccountMode::SharepointSite => "sharepoint_site",
+                    MigrationOneDriveAccountMode::GroupDrive => "group_drive",
+                }),
+            );
+            options.insert("onedrive_tenant".to_string(), json!(onedrive.tenant));
+            if let Some(value) = onedrive.drive_id {
+                options.insert("onedrive_drive_id".to_string(), json!(value));
+            }
+            if let Some(value) = onedrive.root_item_id {
+                options.insert("onedrive_root_item_id".to_string(), json!(value));
+            }
+            if let Some(value) = onedrive.site_id {
+                options.insert("onedrive_site_id".to_string(), json!(value));
+            }
+            if let Some(value) = onedrive.group_id {
+                options.insert("onedrive_group_id".to_string(), json!(value));
+            }
+            options.insert(
+                "provider_resumable_upload_strategy".to_string(),
+                json!(match onedrive.upload_strategy {
+                    MigrationProviderResumableUploadStrategy::ServerRelay => "server_relay",
+                    MigrationProviderResumableUploadStrategy::FrontendDirect => "frontend_direct",
+                }),
+            );
+            options.insert(
+                "provider_download_strategy".to_string(),
+                json!(match onedrive.download_strategy {
+                    MigrationProviderDownloadStrategy::ServerRelay => "server_relay",
+                    MigrationProviderDownloadStrategy::FrontendDirect => "frontend_direct",
+                }),
+            );
+            options.insert(
+                "provider_download_filename_mode".to_string(),
+                json!(match onedrive.download_filename_mode {
+                    MigrationProviderDownloadFilenameMode::ProviderNative => "provider_native",
+                }),
+            );
+        }
         options.extend(policy.extensions);
         let target = aster_drive_schema::entities::storage_policy::ActiveModel {
             name: Set(policy.name),
@@ -34,6 +89,7 @@ impl AsterDriveWriter<'_> {
                 MigrationStorageDriver::Local => DriverType::Local,
                 MigrationStorageDriver::S3 => DriverType::S3,
                 MigrationStorageDriver::TencentCos => DriverType::TencentCos,
+                MigrationStorageDriver::OneDrive => DriverType::OneDrive,
             }),
             endpoint: Set(policy.endpoint),
             bucket: Set(policy.bucket),

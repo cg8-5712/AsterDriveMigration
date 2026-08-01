@@ -483,6 +483,139 @@ async fn rejects_or_explicitly_skips_unsupported_policies_and_their_dependents()
 }
 
 #[tokio::test]
+async fn migrates_onedrive_policy_and_objects_pending_asterdrive_authorization() -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let source_path = std::env::temp_dir().join(format!("cloudreve-onedrive-{suffix}.db"));
+    let target_path = std::env::temp_dir().join(format!("asterdrive-onedrive-{suffix}.db"));
+    let source_url = sqlite_url(&source_path);
+    let target_url = sqlite_url(&target_path);
+
+    let source = Database::connect(&source_url).await?;
+    create_source_schema(&source).await?;
+    seed_source(&source).await?;
+    let source_policy = cloudreve_schema::storage_policies::Entity::find()
+        .one(&source)
+        .await?
+        .expect("seeded storage policy");
+    let source_policy_id = source_policy.id;
+    let mut source_policy = source_policy.into_active_model();
+    source_policy.r#type = Set("onedrive".to_string());
+    source_policy.server = Set(Some(
+        "https://microsoftgraph.chinacloudapi.cn/v1.0".to_string(),
+    ));
+    source_policy.bucket_name = Set(Some("legacy-client-id".to_string()));
+    source_policy.access_key = Set(Some("legacy-refresh-token".to_string()));
+    source_policy.secret_key = Set(Some("legacy-client-secret".to_string()));
+    source_policy.settings = Set(Some(serde_json::json!({
+        "od_driver": "sites/site-id/drives/drive-id",
+        "relay": false,
+        "internal_proxy": true,
+        "chunk_size": 0
+    })));
+    source_policy.update(&source).await?;
+    source.close().await?;
+
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let report = migrate(MigrationOptions {
+        source_url: source_url.clone(),
+        target_url: target_url.clone(),
+        default_password: "temporary-password".to_string(),
+        local_base_path: "unused-local-root".to_string(),
+        local_policy_roots: std::collections::BTreeMap::new(),
+        verify_local_storage: false,
+        verify_remote_storage: true,
+        direct_link_secret: Some("test-direct-link-secret".to_string()),
+        include_deleted: false,
+        allow_non_empty_target: false,
+        skip_unsupported_policies: false,
+        dry_run: false,
+        run_id: None,
+        resume: false,
+        blob_batch_size: 500,
+        file_batch_size: 500,
+    })
+    .await?;
+
+    assert_eq!(report.migrated_policies, 1);
+    assert_eq!(report.migrated_blobs, 1);
+    assert_eq!(report.migrated_files, 1);
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains(&format!("OneDrive policies {source_policy_id}"))
+            && warning.contains("authorize each target policy")
+    }));
+    let report_json = serde_json::to_string(&report)?;
+    for legacy_credential in [
+        "legacy-client-id",
+        "legacy-refresh-token",
+        "legacy-client-secret",
+    ] {
+        assert!(!report_json.contains(legacy_credential));
+    }
+
+    let target = Database::connect(&target_url).await?;
+    let policy = aster_drive_schema::entities::storage_policy::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated OneDrive policy");
+    assert_eq!(policy.driver_type, DriverType::OneDrive);
+    assert!(policy.endpoint.is_empty());
+    assert!(policy.bucket.is_empty());
+    assert!(policy.access_key.is_empty());
+    assert!(policy.secret_key.is_empty());
+    for legacy_credential in [
+        "legacy-client-id",
+        "legacy-refresh-token",
+        "legacy-client-secret",
+    ] {
+        assert!(!policy.options.as_ref().contains(legacy_credential));
+    }
+    assert_eq!(policy.chunk_size, 50 * 1024 * 1024);
+    let options: serde_json::Value = serde_json::from_str(policy.options.as_ref())?;
+    assert_eq!(options["onedrive_cloud"], "china");
+    assert_eq!(options["onedrive_account_mode"], "sharepoint_site");
+    assert_eq!(options["onedrive_drive_id"], "drive-id");
+    assert_eq!(options["onedrive_site_id"], "site-id");
+    assert_eq!(options["onedrive_root_item_id"], "root");
+    assert_eq!(
+        options["provider_resumable_upload_strategy"],
+        "frontend_direct"
+    );
+    assert_eq!(options["provider_download_strategy"], "server_relay");
+    let blob = aster_drive_schema::entities::file_blob::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated OneDrive blob");
+    assert_eq!(blob.storage_path, "uploads/object.bin");
+    assert_eq!(blob.policy_id, policy.id);
+    assert_eq!(
+        aster_drive_schema::entities::storage_policy_credential::Entity::find()
+            .count(&target)
+            .await?,
+        0
+    );
+    assert_eq!(
+        aster_drive_schema::entities::storage_connector_application_config::Entity::find()
+            .count(&target)
+            .await?,
+        0
+    );
+    assert_eq!(
+        aster_drive_schema::entities::storage_policy_authorization_flow::Entity::find()
+            .count(&target)
+            .await?,
+        0
+    );
+    target.close().await?;
+
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn skips_only_cloudreve_encrypted_entities_and_reports_affected_files() -> Result<()> {
     let suffix = uuid::Uuid::new_v4();
     let source_path = std::env::temp_dir().join(format!("cloudreve-encrypted-{suffix}.db"));

@@ -187,6 +187,20 @@ impl SourceData {
                 unsupported.join(", ")
             ));
         }
+        let onedrive_policy_ids = self
+            .policies
+            .iter()
+            .filter(|policy| {
+                policy.r#type == "onedrive" && storage_policy_skip_reason(policy).is_none()
+            })
+            .map(|policy| policy.id.to_string())
+            .collect::<Vec<_>>();
+        if !onedrive_policy_ids.is_empty() {
+            warnings.push(format!(
+                "Cloudreve OneDrive policies {} were migrated without OAuth tokens or Microsoft application secrets; configure the Microsoft Graph application and authorize each target policy in AsterDrive before cutover",
+                onedrive_policy_ids.join(", ")
+            ));
+        }
         if !self.direct_links.is_empty() {
             warnings.push("Cloudreve direct links require --direct-link-secret to regenerate AD v2 URLs; old /f/... URLs, per-link counters, speed limits and revocation semantics cannot be preserved".to_string());
         }
@@ -341,7 +355,13 @@ mod tests {
         );
         assert!(unsupported_policy_reason(&policy("oss", "https://oss.test", "bucket")).is_some());
         assert!(unsupported_policy_reason(&policy("obs", "https://obs.test", "bucket")).is_some());
-        assert!(unsupported_policy_reason(&policy("onedrive", "", "")).is_some());
+        let mut onedrive = policy(
+            "onedrive",
+            "https://graph.microsoft.com/v1.0",
+            "legacy-client-id",
+        );
+        onedrive.settings = Some(json!({"od_driver": "me/drive"}));
+        assert!(unsupported_policy_reason(&onedrive).is_none());
     }
 
     #[test]

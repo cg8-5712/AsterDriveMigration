@@ -12,8 +12,10 @@ use super::{
 use aster_drive_migration_core::{
     Conversion, ConversionContext, MigrationAvatarSource, MigrationBlob, MigrationDirectLink,
     MigrationEntityKind, MigrationEntityRef, MigrationFile, MigrationFileVersion, MigrationFolder,
-    MigrationMetadata, MigrationObjectStorageDownloadStrategy,
-    MigrationObjectStorageUploadStrategy, MigrationPolicyGroup, MigrationProperty, MigrationShare,
+    MigrationMetadata, MigrationMicrosoftGraphCloud, MigrationObjectStorageDownloadStrategy,
+    MigrationObjectStorageUploadStrategy, MigrationOneDriveAccountMode, MigrationOneDriveOptions,
+    MigrationPolicyGroup, MigrationProperty, MigrationProviderDownloadFilenameMode,
+    MigrationProviderDownloadStrategy, MigrationProviderResumableUploadStrategy, MigrationShare,
     MigrationShareTarget, MigrationStorageDriver, MigrationStoragePolicy, MigrationTagAssignment,
     MigrationUser, MigrationUserRole, MigrationUserStatus, SkipReason, SourceConverter,
 };
@@ -47,6 +49,10 @@ pub fn storage_policy_skip_reason(
         "local" => None,
         "s3" | "ks3" => static_object_storage_skip_reason(policy),
         "cos" => cos_policy_skip_reason(policy),
+        "onedrive" => one_drive_options(policy).err().map(|message| SkipReason {
+            code: "unsupported_storage_configuration",
+            message: format!("onedrive ({message})"),
+        }),
         "oss" => Some(SkipReason {
             code: "unsupported_storage_driver",
             message: "oss (native Alibaba OSS signing is not supported by AsterDrive)".to_string(),
@@ -60,6 +66,122 @@ pub fn storage_policy_skip_reason(
             message: unsupported.to_string(),
         }),
     }
+}
+
+fn one_drive_options(
+    policy: &cloudreve_schema::storage_policies::Model,
+) -> std::result::Result<MigrationOneDriveOptions, String> {
+    let endpoint = policy
+        .server
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Microsoft Graph endpoint is required".to_string())?;
+    let endpoint = Url::parse(endpoint)
+        .map_err(|error| format!("invalid Microsoft Graph endpoint: {error}"))?;
+    if endpoint.scheme() != "https" {
+        return Err("Microsoft Graph endpoint must use https".to_string());
+    }
+    let cloud = match endpoint.host_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("graph.microsoft.com") => MigrationMicrosoftGraphCloud::Global,
+        Some("microsoftgraph.chinacloudapi.cn") => MigrationMicrosoftGraphCloud::China,
+        _ => return Err("unsupported Microsoft Graph endpoint host".to_string()),
+    };
+
+    let policy_settings = settings(&policy.settings);
+    let driver_resource = match policy_settings.get("od_driver") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value.trim(),
+        Some(_) => return Err("settings.od_driver must be a string".to_string()),
+    };
+    let driver_resource = driver_resource.trim_matches('/');
+    let segments = if driver_resource.is_empty() {
+        Vec::new()
+    } else {
+        driver_resource.split('/').collect::<Vec<_>>()
+    };
+    let mut drive_id = None;
+    let mut site_id = None;
+    let mut group_id = None;
+    let account_mode = match segments.as_slice() {
+        [] => MigrationOneDriveAccountMode::WorkOrSchool,
+        [me, drive] if me.eq_ignore_ascii_case("me") && drive.eq_ignore_ascii_case("drive") => {
+            MigrationOneDriveAccountMode::WorkOrSchool
+        }
+        [drives, id] if drives.eq_ignore_ascii_case("drives") && !id.trim().is_empty() => {
+            drive_id = Some((*id).to_string());
+            MigrationOneDriveAccountMode::WorkOrSchool
+        }
+        [sites, id, drive]
+            if sites.eq_ignore_ascii_case("sites")
+                && drive.eq_ignore_ascii_case("drive")
+                && !id.trim().is_empty() =>
+        {
+            site_id = Some((*id).to_string());
+            MigrationOneDriveAccountMode::SharepointSite
+        }
+        [sites, site, drives, drive]
+            if sites.eq_ignore_ascii_case("sites")
+                && drives.eq_ignore_ascii_case("drives")
+                && !site.trim().is_empty()
+                && !drive.trim().is_empty() =>
+        {
+            site_id = Some((*site).to_string());
+            drive_id = Some((*drive).to_string());
+            MigrationOneDriveAccountMode::SharepointSite
+        }
+        [groups, id, drive]
+            if groups.eq_ignore_ascii_case("groups")
+                && drive.eq_ignore_ascii_case("drive")
+                && !id.trim().is_empty() =>
+        {
+            group_id = Some((*id).to_string());
+            MigrationOneDriveAccountMode::GroupDrive
+        }
+        [groups, group, drives, drive]
+            if groups.eq_ignore_ascii_case("groups")
+                && drives.eq_ignore_ascii_case("drives")
+                && !group.trim().is_empty()
+                && !drive.trim().is_empty() =>
+        {
+            group_id = Some((*group).to_string());
+            drive_id = Some((*drive).to_string());
+            MigrationOneDriveAccountMode::GroupDrive
+        }
+        _ => {
+            return Err(format!(
+                "unsupported settings.od_driver {driver_resource:?}"
+            ));
+        }
+    };
+
+    Ok(MigrationOneDriveOptions {
+        cloud,
+        account_mode,
+        tenant: "common".to_string(),
+        drive_id,
+        root_item_id: Some("root".to_string()),
+        site_id,
+        group_id,
+        upload_strategy: if policy_settings
+            .get("relay")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            MigrationProviderResumableUploadStrategy::ServerRelay
+        } else {
+            MigrationProviderResumableUploadStrategy::FrontendDirect
+        },
+        download_strategy: if policy_settings
+            .get("internal_proxy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            MigrationProviderDownloadStrategy::ServerRelay
+        } else {
+            MigrationProviderDownloadStrategy::FrontendDirect
+        },
+        download_filename_mode: MigrationProviderDownloadFilenameMode::ProviderNative,
+    })
 }
 
 fn static_object_storage_skip_reason(

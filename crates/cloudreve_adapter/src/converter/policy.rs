@@ -18,6 +18,7 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
             "local" => MigrationStorageDriver::Local,
             "s3" | "ks3" => MigrationStorageDriver::S3,
             "cos" => MigrationStorageDriver::TencentCos,
+            "onedrive" => MigrationStorageDriver::OneDrive,
             unsupported => {
                 return Ok(Conversion::Skipped(SkipReason {
                     code: "unsupported_storage_driver",
@@ -32,7 +33,9 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
                     policy.id
                 )
             })?,
-            MigrationStorageDriver::S3 | MigrationStorageDriver::TencentCos => String::new(),
+            MigrationStorageDriver::S3
+            | MigrationStorageDriver::TencentCos
+            | MigrationStorageDriver::OneDrive => String::new(),
         };
         let allowed_types = policy_settings
             .get("file_type")
@@ -55,7 +58,7 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let chunk_size = policy_settings
+        let mut chunk_size = policy_settings
             .get("chunk_size")
             .and_then(Value::as_i64)
             .unwrap_or(0);
@@ -70,7 +73,7 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let (object_storage_upload_strategy, object_storage_download_strategy) = match driver {
-            MigrationStorageDriver::Local => (None, None),
+            MigrationStorageDriver::Local | MigrationStorageDriver::OneDrive => (None, None),
             MigrationStorageDriver::S3 | MigrationStorageDriver::TencentCos => (
                 Some(
                     if policy_settings
@@ -96,24 +99,46 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
                 ),
             ),
         };
+        let onedrive = if driver == MigrationStorageDriver::OneDrive {
+            if chunk_size == 0 {
+                chunk_size = 50 * 1024 * 1024;
+            }
+            Some(one_drive_options(&policy).map_err(|message| {
+                color_eyre::eyre::eyre!("Cloudreve OneDrive policy {}: {message}", policy.id)
+            })?)
+        } else {
+            None
+        };
         let extensions = BTreeMap::from([
             ("cloudreve_source".to_string(), policy_settings),
             ("cloudreve_policy_type".to_string(), json!(policy.r#type)),
         ]);
+        let (endpoint, bucket, access_key, secret_key) =
+            if driver == MigrationStorageDriver::OneDrive {
+                (String::new(), String::new(), String::new(), String::new())
+            } else {
+                (
+                    policy.server.unwrap_or_default(),
+                    policy.bucket_name.unwrap_or_default(),
+                    policy.access_key.unwrap_or_default(),
+                    policy.secret_key.unwrap_or_default(),
+                )
+            };
         Ok(Conversion::Ready(MigrationStoragePolicy {
             source_id: policy.id,
             name: policy.name,
             driver,
-            endpoint: policy.server.unwrap_or_default(),
-            bucket: policy.bucket_name.unwrap_or_default(),
-            access_key: policy.access_key.unwrap_or_default(),
-            secret_key: policy.secret_key.unwrap_or_default(),
+            endpoint,
+            bucket,
+            access_key,
+            secret_key,
             base_path,
             max_file_size: policy.max_size.unwrap_or(0),
             allowed_types,
             s3_path_style: path_style,
             object_storage_upload_strategy,
             object_storage_download_strategy,
+            onedrive,
             extensions,
             chunk_size,
             created_at: target_time(policy.created_at),

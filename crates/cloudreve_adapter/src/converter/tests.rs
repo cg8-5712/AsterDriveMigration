@@ -150,6 +150,7 @@ fn converts_every_supported_storage_driver() -> Result<()> {
         ("s3", MigrationStorageDriver::S3),
         ("ks3", MigrationStorageDriver::S3),
         ("cos", MigrationStorageDriver::TencentCos),
+        ("onedrive", MigrationStorageDriver::OneDrive),
     ] {
         let mut source_policy = policy(
             source,
@@ -161,6 +162,8 @@ fn converts_every_supported_storage_driver() -> Result<()> {
         );
         if source == "cos" {
             source_policy.server = Some("https://bucket.cos.ap-guangzhou.myqcloud.com".to_string());
+        } else if source == "onedrive" {
+            source_policy.server = Some("https://graph.microsoft.com/v1.0".to_string());
         }
         let converted = ready(CloudreveConverter.convert(
             CloudreveStoragePolicyRecord {
@@ -173,7 +176,7 @@ fn converts_every_supported_storage_driver() -> Result<()> {
         assert_eq!(converted.chunk_size, 128);
         assert_eq!(converted.allowed_types, ["jpg", "png"]);
         assert!(!converted.s3_path_style);
-        if source == "local" {
+        if matches!(source, "local" | "onedrive") {
             assert_eq!(converted.object_storage_upload_strategy, None);
             assert_eq!(converted.object_storage_download_strategy, None);
         } else {
@@ -186,12 +189,241 @@ fn converts_every_supported_storage_driver() -> Result<()> {
                 Some(MigrationObjectStorageDownloadStrategy::Presigned)
             );
         }
+        assert_eq!(converted.onedrive.is_some(), source == "onedrive");
         assert_eq!(converted.extensions["cloudreve_policy_type"], source);
         assert_eq!(
             converted.base_path,
             if source == "local" { "/source" } else { "" }
         );
     }
+    Ok(())
+}
+
+#[test]
+fn converts_onedrive_cloud_locations_and_strips_legacy_credentials() -> Result<()> {
+    for (endpoint, driver_resource, expected_cloud, expected_mode, drive, site, group) in [
+        (
+            "https://graph.microsoft.com/v1.0",
+            "",
+            MigrationMicrosoftGraphCloud::Global,
+            MigrationOneDriveAccountMode::WorkOrSchool,
+            None,
+            None,
+            None,
+        ),
+        (
+            "https://microsoftgraph.chinacloudapi.cn/v1.0",
+            "me/drive",
+            MigrationMicrosoftGraphCloud::China,
+            MigrationOneDriveAccountMode::WorkOrSchool,
+            None,
+            None,
+            None,
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "drives/drive-id",
+            MigrationMicrosoftGraphCloud::Global,
+            MigrationOneDriveAccountMode::WorkOrSchool,
+            Some("drive-id"),
+            None,
+            None,
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "sites/site-id/drive",
+            MigrationMicrosoftGraphCloud::Global,
+            MigrationOneDriveAccountMode::SharepointSite,
+            None,
+            Some("site-id"),
+            None,
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "sites/site-id/drives/drive-id",
+            MigrationMicrosoftGraphCloud::Global,
+            MigrationOneDriveAccountMode::SharepointSite,
+            Some("drive-id"),
+            Some("site-id"),
+            None,
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "groups/group-id/drive",
+            MigrationMicrosoftGraphCloud::Global,
+            MigrationOneDriveAccountMode::GroupDrive,
+            None,
+            None,
+            Some("group-id"),
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "/groups/group-id/drives/drive-id/",
+            MigrationMicrosoftGraphCloud::Global,
+            MigrationOneDriveAccountMode::GroupDrive,
+            Some("drive-id"),
+            None,
+            Some("group-id"),
+        ),
+    ] {
+        let mut source = policy(
+            "onedrive",
+            json!({
+                "od_driver": driver_resource,
+                "relay": true,
+                "internal_proxy": false,
+                "chunk_size": 0
+            }),
+        );
+        source.server = Some(endpoint.to_string());
+        source.bucket_name = Some("legacy-client-id".to_string());
+        source.access_key = Some("legacy-refresh-token".to_string());
+        source.secret_key = Some("legacy-client-secret".to_string());
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: source,
+                local_root: None,
+            },
+            &ConversionContext,
+        )?);
+        let onedrive = converted.onedrive.expect("OneDrive options");
+        assert_eq!(onedrive.cloud, expected_cloud);
+        assert_eq!(onedrive.account_mode, expected_mode);
+        assert_eq!(onedrive.drive_id.as_deref(), drive);
+        assert_eq!(onedrive.site_id.as_deref(), site);
+        assert_eq!(onedrive.group_id.as_deref(), group);
+        assert_eq!(onedrive.root_item_id.as_deref(), Some("root"));
+        assert_eq!(onedrive.tenant, "common");
+        assert_eq!(
+            onedrive.upload_strategy,
+            MigrationProviderResumableUploadStrategy::ServerRelay
+        );
+        assert_eq!(
+            onedrive.download_strategy,
+            MigrationProviderDownloadStrategy::FrontendDirect
+        );
+        assert_eq!(converted.chunk_size, 50 * 1024 * 1024);
+        assert!(converted.endpoint.is_empty());
+        assert!(converted.bucket.is_empty());
+        assert!(converted.access_key.is_empty());
+        assert!(converted.secret_key.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn preserves_onedrive_relay_topology_for_every_boolean_combination() -> Result<()> {
+    for (relay, internal_proxy, expected_upload, expected_download) in [
+        (
+            false,
+            false,
+            MigrationProviderResumableUploadStrategy::FrontendDirect,
+            MigrationProviderDownloadStrategy::FrontendDirect,
+        ),
+        (
+            true,
+            false,
+            MigrationProviderResumableUploadStrategy::ServerRelay,
+            MigrationProviderDownloadStrategy::FrontendDirect,
+        ),
+        (
+            false,
+            true,
+            MigrationProviderResumableUploadStrategy::FrontendDirect,
+            MigrationProviderDownloadStrategy::ServerRelay,
+        ),
+        (
+            true,
+            true,
+            MigrationProviderResumableUploadStrategy::ServerRelay,
+            MigrationProviderDownloadStrategy::ServerRelay,
+        ),
+    ] {
+        let mut source = policy(
+            "onedrive",
+            json!({"relay": relay, "internal_proxy": internal_proxy}),
+        );
+        source.server = Some("https://graph.microsoft.com/v1.0".to_string());
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: source,
+                local_root: None,
+            },
+            &ConversionContext,
+        )?);
+        let onedrive = converted.onedrive.expect("OneDrive options");
+        assert_eq!(onedrive.upload_strategy, expected_upload);
+        assert_eq!(onedrive.download_strategy, expected_download);
+    }
+    Ok(())
+}
+
+#[test]
+fn skips_onedrive_endpoints_and_driver_resources_outside_ad_contract() -> Result<()> {
+    for (endpoint, driver_resource, expected) in [
+        ("", "me/drive", "endpoint is required"),
+        ("not a URL", "me/drive", "invalid Microsoft Graph endpoint"),
+        ("http://graph.microsoft.com/v1.0", "me/drive", "https"),
+        (
+            "https://graph.example.test/v1.0",
+            "me/drive",
+            "endpoint host",
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "users/user-id/drive",
+            "od_driver",
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "drives//drive-id",
+            "od_driver",
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "sites/site-id//drive",
+            "od_driver",
+        ),
+        (
+            "https://graph.microsoft.com/v1.0",
+            "groups//drives/drive-id",
+            "od_driver",
+        ),
+    ] {
+        let mut source = policy("onedrive", json!({"od_driver": driver_resource}));
+        source.server = Some(endpoint.to_string());
+        let conversion = CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: source,
+                local_root: None,
+            },
+            &ConversionContext,
+        )?;
+        let Conversion::Skipped(reason) = conversion else {
+            panic!("expected unsupported OneDrive policy");
+        };
+        assert_eq!(reason.code, "unsupported_storage_configuration");
+        assert!(reason.message.contains(expected));
+    }
+    Ok(())
+}
+
+#[test]
+fn skips_onedrive_non_string_driver_resource() -> Result<()> {
+    let mut source = policy("onedrive", json!({"od_driver": 42}));
+    source.server = Some("https://graph.microsoft.com/v1.0".to_string());
+    let conversion = CloudreveConverter.convert(
+        CloudreveStoragePolicyRecord {
+            policy: source,
+            local_root: None,
+        },
+        &ConversionContext,
+    )?;
+    let Conversion::Skipped(reason) = conversion else {
+        panic!("expected unsupported OneDrive policy");
+    };
+    assert_eq!(reason.code, "unsupported_storage_configuration");
+    assert!(reason.message.contains("must be a string"));
     Ok(())
 }
 
@@ -257,9 +489,7 @@ fn preserves_cloudreve_object_storage_upload_and_download_topology() -> Result<(
 
 #[test]
 fn skips_unsupported_or_encrypted_storage_policies() -> Result<()> {
-    for source in [
-        "oss", "obs", "qiniu", "upyun", "onedrive", "remote", "unknown",
-    ] {
+    for source in ["oss", "obs", "qiniu", "upyun", "remote", "unknown"] {
         let converted = CloudreveConverter.convert(
             CloudreveStoragePolicyRecord {
                 policy: policy(source, json!({})),
@@ -278,7 +508,7 @@ fn skips_unsupported_or_encrypted_storage_policies() -> Result<()> {
 
 #[test]
 fn storage_encryption_takes_precedence_for_every_policy_type() -> Result<()> {
-    for source in ["local", "s3", "ks3", "cos", "oss", "obs"] {
+    for source in ["local", "s3", "ks3", "cos", "onedrive", "oss", "obs"] {
         let mut encrypted = policy(source, json!({"encryption": true}));
         if source == "cos" {
             encrypted.server = Some("https://bucket.cos.ap-guangzhou.myqcloud.com".to_string());

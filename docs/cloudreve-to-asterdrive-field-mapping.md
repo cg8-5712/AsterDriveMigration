@@ -137,7 +137,7 @@ Cloudreve 一条 `users` 记录需要拆成 AD 的 `users` 和 `user_profiles`�
 | `cos` | `tencent_cos` | 条件迁移 | 仅接受 `https://<bucket>.cos.<region>.myqcloud.com` 且 endpoint bucket 与 `bucket_name` 一致 |
 | `qiniu` | 无 | 不兼容 | AD 当前没有七牛驱动，也不能保证 S3 兼容 |
 | `upyun` | 无 | 不兼容 | AD 当前没有又拍云驱动 |
-| `onedrive` | `onedrive` 但凭据结构不同 | 不兼容 | AD 将 OAuth token 拆到 credential/config 表，不能只复制策略字段 |
+| `onedrive` | `onedrive` | 条件迁移 | 保留 Graph cloud、drive 定位、对象路径和传输拓扑；OAuth token 与应用 secret 不迁移，切换前必须在 AD 中重新授权 |
 | `remote` | `remote` 但节点协议不同 | 不兼容 | Cloudreve Slave 与 AD follower 协议完全不同 |
 
 启用了 Cloudreve `settings.encryption=true` 的策略不能只迁移数据库元数据。Cloudreve 对象内容仍是 Cloudreve 加密格式，AD 无法直接读取，必须先通过 Cloudreve 解密导出再上传到 AD。
@@ -149,17 +149,20 @@ Cloudreve 一条 `users` 记录需要拆成 AD 的 `users` 和 `user_profiles`�
 | `id` | 新生成 `id` | 转换 | 保存策略 ID 映射 |
 | `name` | `name` | 直接 | 保留名称 |
 | `type` | `driver_type` | 转换 | 按上表映射 |
-| `server` | `endpoint` | 转换 | 仅对兼容驱动复制；COS 必须通过标准 endpoint 校验 |
-| `bucket_name` | `bucket` | 转换 | `NULL` 转为空字符串 |
-| `access_key` | `access_key` | 直接/敏感 | 仅对兼容驱动复制；不得写日志 |
-| `secret_key` | `secret_key` | 直接/敏感 | 仅对兼容驱动复制；不得写日志 |
+| `server` | `endpoint` / `options.onedrive_cloud` | 转换 | 对象存储复制 endpoint；OneDrive 仅接受 Global/China 标准 Graph host，并转换为 cloud 枚举，目标 endpoint 留空 |
+| `bucket_name` | `bucket` | 转换 | 对象存储 `NULL` 转为空字符串；Cloudreve OneDrive 中该字段是 Client ID，目标 policy bucket 留空 |
+| `access_key` | `access_key` | 直接/敏感 | 对象存储复制；Cloudreve OneDrive 中该字段是 refresh token，不写入目标 policy 或 report |
+| `secret_key` | `secret_key` | 直接/敏感 | 对象存储复制；Cloudreve OneDrive Client Secret 不写入目标 policy 或 report |
 | `max_size` | `max_file_size` | 转换 | Cloudreve `NULL` -> AD `0`，两边都表示无限制时才成立 |
 | `settings.file_type` | `allowed_types` | 转换 | 保存为 JSON 数组；还需处理 deny-list 语义 |
-| `settings.chunk_size` | `chunk_size` | 转换 | 保留字节数；`0` 表示单次上传 |
+| `settings.chunk_size` | `chunk_size` | 转换 | 保留正数字节数；OneDrive 的 `0` 按 Cloudreve 运行时缺省值转换为 50 MiB，其他驱动保留 `0` 的单次上传语义 |
 | `settings.s3_path_style` | `options.s3_path_style` | 转换 | 保留布尔值 |
 | `settings.region` | `options.s3_region` | 待实现 | AD 当前运行时固定使用 `auto`；由 AD #452 与 ADM #3 跟踪 |
 | `settings.relay` | `options.object_storage_upload_strategy` | 转换 | `true` -> `relay_stream`；`false` 或缺省 -> `presigned` |
 | `settings.internal_proxy` | `options.object_storage_download_strategy` | 转换 | `true` -> `relay_stream`；`false` 或缺省 -> `presigned`；`custom_proxy/proxy_server` 的自定义代理域名不在此字段中表达 |
+| OneDrive `settings.relay` | `options.provider_resumable_upload_strategy` | 转换 | `true` -> `server_relay`；`false` 或缺省 -> `frontend_direct` |
+| OneDrive `settings.internal_proxy` | `options.provider_download_strategy` | 转换 | `true` -> `server_relay`；`false` 或缺省 -> `frontend_direct` |
+| OneDrive `settings.od_driver` | `options.onedrive_*` | 转换 | 支持空值/`me/drive`、`drives/{id}`、`sites/{id}/drive`、`sites/{id}/drives/{drive}`、`groups/{id}/drive`、`groups/{id}/drives/{drive}` |
 | `is_private` | 无单独字段 | 合并 | AD 下载策略由 `options` 控制，不应机械复制 |
 | `dir_name_rule` | 无直接字段 | 决策 | 不迁移生成规则；已有对象使用规格化后的 `entity.source` |
 | `file_name_rule` | 无直接字段 | 决策 | 同上 |
@@ -397,7 +400,7 @@ Cloudreve 直链并非“完全不能迁移”，但不能原样复制。Cloudre
 | 上传 | `upload_sessions`、`upload_session_parts` | 不迁移未完成上传 |
 | 用户邀请 | `user_invitations` | 不迁移 |
 | 远端节点 | `managed_followers`、`follower_enrollment_sessions`、`master_bindings`、`remote_storage_targets` | 重新注册 AD follower |
-| 存储 OAuth | `storage_policy_credentials`、`storage_policy_authorization_flows`、`storage_connector_application_configs` | OneDrive 等策略必须在 AD 中重新授权 |
+| 存储 OAuth | `storage_policy_credentials`、`storage_policy_authorization_flows`、`storage_connector_application_configs` | OneDrive policy 和对象路径会迁移；Cloudreve token/secret 不进入 AD 加密凭据表，必须在 AD 中配置应用并重新授权 |
 | 媒体解析 | `blob_media_metadata` | 可在迁移后由 AD 重新扫描生成 |
 
 ## 12. 完整 Cloudreve 表与字段清单

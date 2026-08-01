@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 
 use aster_drive_migration_core::{
     MigrationAvatarSource, MigrationBlob, MigrationDirectLink, MigrationFile, MigrationFileVersion,
-    MigrationFolder, MigrationObjectStorageDownloadStrategy, MigrationObjectStorageUploadStrategy,
-    MigrationPolicyGroup, MigrationStorageDriver, MigrationStoragePolicy, MigrationUser,
-    MigrationUserRole, MigrationUserStatus,
+    MigrationFolder, MigrationMicrosoftGraphCloud, MigrationObjectStorageDownloadStrategy,
+    MigrationObjectStorageUploadStrategy, MigrationOneDriveAccountMode, MigrationOneDriveOptions,
+    MigrationPolicyGroup, MigrationProviderDownloadFilenameMode, MigrationProviderDownloadStrategy,
+    MigrationProviderResumableUploadStrategy, MigrationStorageDriver, MigrationStoragePolicy,
+    MigrationUser, MigrationUserRole, MigrationUserStatus,
 };
 use aster_drive_model as aster_drive_schema;
 use aster_drive_model::types::{EntityType, TagScopeType};
@@ -51,6 +53,7 @@ async fn write_prerequisites(transaction: &DatabaseTransaction) -> Result<(i64, 
                 s3_path_style: true,
                 object_storage_upload_strategy: None,
                 object_storage_download_strategy: None,
+                onedrive: None,
                 extensions: BTreeMap::new(),
                 chunk_size: 0,
                 created_at: now,
@@ -217,6 +220,7 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
                 object_storage_download_strategy: Some(
                     MigrationObjectStorageDownloadStrategy::RelayStream,
                 ),
+                onedrive: None,
                 extensions,
                 chunk_size: 456,
                 created_at: now,
@@ -245,8 +249,45 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
                 object_storage_download_strategy: Some(
                     MigrationObjectStorageDownloadStrategy::Presigned,
                 ),
+                onedrive: None,
                 extensions: BTreeMap::new(),
                 chunk_size: 0,
+                created_at: now,
+                updated_at: now,
+            },
+            false,
+        )
+        .await?;
+    let onedrive_target_id = AsterDriveWriter::new(&transaction)
+        .write_policy(
+            MigrationStoragePolicy {
+                source_id: 12,
+                name: "OneDrive policy".to_string(),
+                driver: MigrationStorageDriver::OneDrive,
+                endpoint: String::new(),
+                bucket: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+                base_path: String::new(),
+                max_file_size: 0,
+                allowed_types: Vec::new(),
+                s3_path_style: false,
+                object_storage_upload_strategy: None,
+                object_storage_download_strategy: None,
+                onedrive: Some(MigrationOneDriveOptions {
+                    cloud: MigrationMicrosoftGraphCloud::China,
+                    account_mode: MigrationOneDriveAccountMode::SharepointSite,
+                    tenant: "common".to_string(),
+                    drive_id: Some("drive-id".to_string()),
+                    root_item_id: Some("root".to_string()),
+                    site_id: Some("site-id".to_string()),
+                    group_id: None,
+                    upload_strategy: MigrationProviderResumableUploadStrategy::ServerRelay,
+                    download_strategy: MigrationProviderDownloadStrategy::FrontendDirect,
+                    download_filename_mode: MigrationProviderDownloadFilenameMode::ProviderNative,
+                }),
+                extensions: BTreeMap::new(),
+                chunk_size: 50 * 1024 * 1024,
                 created_at: now,
                 updated_at: now,
             },
@@ -288,6 +329,40 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
         "relay_stream"
     );
     assert_eq!(cos_options["object_storage_download_strategy"], "presigned");
+
+    let onedrive_policy =
+        aster_drive_schema::entities::storage_policy::Entity::find_by_id(onedrive_target_id)
+            .one(&database)
+            .await?
+            .expect("written OneDrive policy");
+    assert_eq!(
+        onedrive_policy.driver_type,
+        aster_drive_schema::types::DriverType::OneDrive
+    );
+    assert!(onedrive_policy.endpoint.is_empty());
+    assert!(onedrive_policy.bucket.is_empty());
+    assert!(onedrive_policy.access_key.is_empty());
+    assert!(onedrive_policy.secret_key.is_empty());
+    assert_eq!(onedrive_policy.chunk_size, 50 * 1024 * 1024);
+    let onedrive_options: Value = serde_json::from_str(onedrive_policy.options.as_ref())?;
+    assert_eq!(onedrive_options["onedrive_cloud"], "china");
+    assert_eq!(onedrive_options["onedrive_account_mode"], "sharepoint_site");
+    assert_eq!(onedrive_options["onedrive_drive_id"], "drive-id");
+    assert_eq!(onedrive_options["onedrive_root_item_id"], "root");
+    assert_eq!(onedrive_options["onedrive_site_id"], "site-id");
+    assert_eq!(
+        onedrive_options["provider_resumable_upload_strategy"],
+        "server_relay"
+    );
+    assert_eq!(
+        onedrive_options["provider_download_strategy"],
+        "frontend_direct"
+    );
+    assert_eq!(
+        onedrive_options["provider_download_filename_mode"],
+        "provider_native"
+    );
+    assert!(onedrive_options.get("s3_path_style").is_none());
     Ok(())
 }
 
@@ -313,6 +388,7 @@ async fn writes_policy_groups_with_and_without_policy_items() -> Result<()> {
                 s3_path_style: true,
                 object_storage_upload_strategy: None,
                 object_storage_download_strategy: None,
+                onedrive: None,
                 extensions: BTreeMap::new(),
                 chunk_size: 0,
                 created_at: now,

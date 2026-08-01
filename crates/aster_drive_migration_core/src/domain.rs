@@ -10,6 +10,7 @@ pub enum MigrationStorageDriver {
     Local,
     S3,
     TencentCos,
+    OneDrive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,50 @@ pub enum MigrationObjectStorageUploadStrategy {
 pub enum MigrationObjectStorageDownloadStrategy {
     RelayStream,
     Presigned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationMicrosoftGraphCloud {
+    Global,
+    China,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOneDriveAccountMode {
+    WorkOrSchool,
+    SharepointSite,
+    GroupDrive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationProviderResumableUploadStrategy {
+    ServerRelay,
+    FrontendDirect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationProviderDownloadStrategy {
+    ServerRelay,
+    FrontendDirect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationProviderDownloadFilenameMode {
+    ProviderNative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationOneDriveOptions {
+    pub cloud: MigrationMicrosoftGraphCloud,
+    pub account_mode: MigrationOneDriveAccountMode,
+    pub tenant: String,
+    pub drive_id: Option<String>,
+    pub root_item_id: Option<String>,
+    pub site_id: Option<String>,
+    pub group_id: Option<String>,
+    pub upload_strategy: MigrationProviderResumableUploadStrategy,
+    pub download_strategy: MigrationProviderDownloadStrategy,
+    pub download_filename_mode: MigrationProviderDownloadFilenameMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +84,7 @@ pub struct MigrationStoragePolicy {
     pub s3_path_style: bool,
     pub object_storage_upload_strategy: Option<MigrationObjectStorageUploadStrategy>,
     pub object_storage_download_strategy: Option<MigrationObjectStorageDownloadStrategy>,
+    pub onedrive: Option<MigrationOneDriveOptions>,
     pub extensions: BTreeMap<String, Value>,
     pub chunk_size: i64,
     pub created_at: DateTime<Utc>,
@@ -215,9 +261,10 @@ mod tests {
                 MigrationStorageDriver::Local,
                 MigrationStorageDriver::S3,
                 MigrationStorageDriver::TencentCos,
+                MigrationStorageDriver::OneDrive,
             ]
             .len(),
-            3
+            4
         );
         assert_ne!(
             MigrationStorageDriver::S3,
