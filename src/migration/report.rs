@@ -297,6 +297,19 @@ impl fmt::Display for MigrationReport {
                     .join(", ");
                 writeln!(output, "skipped_by_type: {categories}")?;
             }
+            if !self.skipped_objects.is_empty() {
+                writeln!(output, "skipped_objects:")?;
+                for skipped in &self.skipped_objects {
+                    let source_id = skipped
+                        .source_id
+                        .map_or_else(|| "-".to_string(), |source_id| source_id.to_string());
+                    writeln!(
+                        output,
+                        "- {} {}: {}",
+                        skipped.object_type, source_id, skipped.reason
+                    )?;
+                }
+            }
             if self.validation.performed {
                 writeln!(
                     output,
@@ -401,6 +414,23 @@ mod tests {
         assert_eq!(report.skipped_by_type.get("share"), Some(&1));
         assert_eq!(report.skipped_objects[0].source_id, Some(42));
         assert_eq!(report.skipped_objects[0].reason, "missing blob");
+    }
+
+    #[test]
+    fn displays_skipped_object_type_id_and_reason() {
+        let mut report = MigrationReport {
+            dry_run: false,
+            ..Default::default()
+        };
+        report.record_skip(
+            "blob",
+            Some(42),
+            "Cloudreve encrypted entity is not supported",
+        );
+
+        let output = report.to_string();
+        assert!(output.contains("skipped_by_type: blob=1"));
+        assert!(output.contains("- blob 42: Cloudreve encrypted entity is not supported"));
     }
 
     #[test]

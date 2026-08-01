@@ -261,7 +261,7 @@ AD 使用：
 | `updated_at` | `updated_at` | 直接 | 保留 |
 | `deleted_at` | 无直接字段 | 决策 | 默认跳过已删除实体 |
 | `upload_session_id` | 无 | 跳过 | 历史上传会话不应迁移 |
-| `recycle_options` | 无直接字段 | 决策 | 回收/恢复信息可归档到 property，但 AD 不会自动使用 |
+| `recycle_options` | 无直接字段 | 跳过/决策 | `encrypt_metadata` 非空表示对象由 Cloudreve 加密：跳过该 blob；若它是文件当前版本则同时跳过文件，并在迁移报告记录类型、源 ID 和固定原因，不输出 key/IV。其他回收属性不影响迁移 |
 | `created_by` | 无 blob 创建者字段 | 间接 | 文件记录仍保存 owner/creator |
 | 无 | `hash` | 生成 | Cloudreve 没有可靠内容 SHA256；应生成非 SHA256 形态的 opaque key，例如 `cloudreve-<entity-id>` |
 | 无 | `thumbnail_processor` | 生成 | `NULL`，等待 AD 重新处理 |

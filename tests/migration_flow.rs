@@ -9,7 +9,8 @@ use aster_drive_model::types::{
 use color_eyre::eyre::Result;
 use sea_orm::ConnectionTrait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, Database, EntityTrait, IntoActiveModel, PaginatorTrait,
+    QueryFilter, Set,
 };
 use support::{
     create_source_schema, create_target_schema, seed_extra_blob_entities, seed_extra_files,
@@ -359,6 +360,104 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
             .checks
             .iter()
             .any(|check| check.name == "storage_usage_recalculated" && check.passed)
+    );
+    target.close().await?;
+
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn skips_only_cloudreve_encrypted_entities_and_reports_affected_files() -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let source_path = std::env::temp_dir().join(format!("cloudreve-encrypted-{suffix}.db"));
+    let target_path = std::env::temp_dir().join(format!("asterdrive-encrypted-{suffix}.db"));
+    let source_url = sqlite_url(&source_path);
+    let target_url = sqlite_url(&target_path);
+
+    let source = Database::connect(&source_url).await?;
+    create_source_schema(&source).await?;
+    seed_source(&source).await?;
+    let encrypted_entity = cloudreve_schema::entities::Entity::find()
+        .one(&source)
+        .await?
+        .expect("seeded entity");
+    let encrypted_entity_id = encrypted_entity.id;
+    let mut encrypted_entity = encrypted_entity.into_active_model();
+    encrypted_entity.recycle_options = Set(Some(serde_json::json!({
+        "encrypt_metadata": {
+            "algorithm": "aes256ctr",
+            "key": "sensitive-key",
+            "iv": "sensitive-iv"
+        }
+    })));
+    encrypted_entity.update(&source).await?;
+    let plain_entity_ids = seed_extra_blob_entities(&source, 1).await?;
+    let plain_file_ids = seed_extra_files(&source, &plain_entity_ids).await?;
+    source.close().await?;
+
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let report = migrate(MigrationOptions {
+        source_url: source_url.clone(),
+        target_url: target_url.clone(),
+        default_password: "temporary-password".to_string(),
+        local_base_path: "C:/cloudreve".to_string(),
+        local_policy_roots: std::collections::BTreeMap::new(),
+        verify_local_storage: false,
+        verify_remote_storage: false,
+        direct_link_secret: Some("test-direct-link-secret".to_string()),
+        include_deleted: false,
+        allow_non_empty_target: false,
+        skip_unsupported_policies: false,
+        dry_run: false,
+        run_id: None,
+        resume: false,
+        blob_batch_size: 1,
+        file_batch_size: 1,
+    })
+    .await?;
+
+    assert_eq!(report.migrated_blobs, 1);
+    assert_eq!(report.migrated_files, 1);
+    assert_eq!(report.mappings.blobs[0].source_id, plain_entity_ids[0]);
+    assert_eq!(report.mappings.files[0].source_id, plain_file_ids[0]);
+    assert!(report.skipped_objects.iter().any(|skipped| {
+        skipped.object_type == "blob"
+            && skipped.source_id == Some(encrypted_entity_id)
+            && skipped.reason == "Cloudreve encrypted entity is not supported"
+    }));
+    assert!(report.skipped_objects.iter().any(|skipped| {
+        skipped.object_type == "file"
+            && skipped.reason
+                == format!("current entity {encrypted_entity_id} is encrypted by Cloudreve")
+    }));
+    let output = report.to_string();
+    assert!(output.contains(&format!(
+        "- blob {encrypted_entity_id}: Cloudreve encrypted entity is not supported"
+    )));
+    assert!(output.contains(&format!(
+        "current entity {encrypted_entity_id} is encrypted by Cloudreve"
+    )));
+    assert!(!output.contains("sensitive-key"));
+    assert!(!output.contains("sensitive-iv"));
+    assert!(report.validation.passed);
+
+    let target = Database::connect(&target_url).await?;
+    assert_eq!(
+        aster_drive_schema::entities::file_blob::Entity::find()
+            .count(&target)
+            .await?,
+        1
+    );
+    assert_eq!(
+        aster_drive_schema::entities::file::Entity::find()
+            .count(&target)
+            .await?,
+        1
     );
     target.close().await?;
 

@@ -59,7 +59,7 @@ cargo run -- migrate `
 
 Use `--dry-run` to perform preflight checks without writing the target. The target core tables must be empty by default. `--allow-non-empty-target` disables that guard but may still fail on unique values or conflicting data.
 
-Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files.
+Cloudreve Qiniu, Upyun, remote-node, OneDrive and encrypted storage policies cannot be reused safely by AD. The migration stops when they are present. `--skip-unsupported-policies` explicitly omits those policies and all dependent files. Independently encrypted entities, identified by `entities.recycle_options.encrypt_metadata`, are always skipped together with files whose current entity is encrypted. Both blob and file source IDs and their fixed skip reasons are included in terminal and JSON migration reports; encryption keys and IVs are never copied into the report.
 
 ## Reuse local storage
 

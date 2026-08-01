@@ -16,6 +16,12 @@ impl SourceConverter<CloudreveBlobRecord> for CloudreveConverter {
                 message: format!("Cloudreve entity {} is not an original object", entity.id),
             }));
         }
+        if crate::is_encrypted_entity(&entity) {
+            return Ok(Conversion::Skipped(SkipReason {
+                code: "cloudreve_encrypted_entity",
+                message: "Cloudreve encrypted entity is not supported".to_string(),
+            }));
+        }
         if entity.size < 0 {
             bail!(
                 "Cloudreve entity {} has negative size {}",

@@ -326,6 +326,17 @@ pub(super) async fn migrate_file_batch(
                 migrated_file.source_id
             );
         };
+        if entities
+            .get(&primary_entity_id)
+            .is_some_and(is_encrypted_entity)
+        {
+            report.record_skip(
+                "file",
+                Some(migrated_file.source_id),
+                format!("current entity {primary_entity_id} is encrypted by Cloudreve"),
+            );
+            continue;
+        }
         if !blob_mappings.contains_key(&primary_entity_id) {
             report.record_skip(
                 "file",

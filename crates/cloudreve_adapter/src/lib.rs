@@ -20,3 +20,11 @@ pub use record::{
     CloudreveMetadataRecord, CloudrevePolicyGroupRecord, CloudreveShareRecord,
     CloudreveStoragePolicyRecord, CloudreveUserRecord,
 };
+
+pub fn is_encrypted_entity(entity: &cloudreve_schema::entities::Model) -> bool {
+    entity
+        .recycle_options
+        .as_ref()
+        .and_then(|options| options.get("encrypt_metadata"))
+        .is_some_and(|metadata| !metadata.is_null())
+}

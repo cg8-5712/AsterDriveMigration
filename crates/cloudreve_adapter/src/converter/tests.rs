@@ -352,6 +352,51 @@ fn handles_blob_and_file_boundaries() -> Result<()> {
     )?;
     assert!(matches!(conversion, Conversion::Skipped(reason) if reason.code == "not_a_blob"));
 
+    for recycle_options in [
+        Some(json!({"unlink_only": true})),
+        Some(json!({"encrypt_metadata": null})),
+    ] {
+        let mut plain_blob = entity(12, 0, 512);
+        plain_blob.recycle_options = recycle_options;
+        assert!(
+            CloudreveConverter
+                .convert(
+                    CloudreveBlobRecord {
+                        entity: plain_blob,
+                        reference_count: 1,
+                    },
+                    &ConversionContext,
+                )?
+                .into_ready()
+                .is_some()
+        );
+    }
+
+    let mut encrypted_blob = entity(12, 0, 512);
+    encrypted_blob.recycle_options = Some(json!({
+        "encrypt_metadata": {
+            "algorithm": "aes256ctr",
+            "key": "sensitive-key",
+            "iv": "sensitive-iv"
+        }
+    }));
+    let conversion = CloudreveConverter.convert(
+        CloudreveBlobRecord {
+            entity: encrypted_blob,
+            reference_count: 1,
+        },
+        &ConversionContext,
+    )?;
+    let Conversion::Skipped(reason) = conversion else {
+        panic!("expected encrypted entity to be skipped");
+    };
+    assert_eq!(reason.code, "cloudreve_encrypted_entity");
+    assert_eq!(
+        reason.message,
+        "Cloudreve encrypted entity is not supported"
+    );
+    assert!(!reason.message.contains("sensitive"));
+
     let mut invalid_blob = entity(12, 0, 512);
     invalid_blob.source.clear();
     assert!(

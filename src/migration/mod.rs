@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use aster_drive_model as aster_drive_schema;
 use aster_drive_model::types::DriverType;
 use aster_drive_schema_migration::{MigrationTrack, inspect_migration_history};
+use cloudreve_adapter::is_encrypted_entity;
 
 mod checkpoint;
 mod engine;

@@ -97,6 +97,9 @@ pub(super) async fn verify_all_local_source_objects(
             return Ok(());
         };
         for entity in &entities {
+            if is_encrypted_entity(entity) {
+                continue;
+            }
             let Some(policy) = policies.get(&entity.storage_policy_entities) else {
                 continue;
             };
@@ -126,6 +129,9 @@ pub(super) fn verify_local_blob_batch(
         .map(|policy| (policy.id, policy))
         .collect::<HashMap<_, _>>();
     for entity in entities {
+        if is_encrypted_entity(entity) {
+            continue;
+        }
         if !context
             .policies
             .contains_key(&entity.storage_policy_entities)
@@ -170,6 +176,9 @@ pub(super) async fn verify_all_remote_source_objects(
             return Ok(());
         };
         for entity in &entities {
+            if is_encrypted_entity(entity) {
+                continue;
+            }
             let Some(policy) = policies.get(&entity.storage_policy_entities) else {
                 continue;
             };
@@ -193,6 +202,9 @@ pub(super) async fn verify_remote_blob_batch(
         .map(|policy| (policy.id, policy))
         .collect::<HashMap<_, _>>();
     for entity in entities {
+        if is_encrypted_entity(entity) {
+            continue;
+        }
         if !context
             .policies
             .contains_key(&entity.storage_policy_entities)
