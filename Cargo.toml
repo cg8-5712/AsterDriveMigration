@@ -16,7 +16,7 @@ authors = [
 repository = "https://github.com/AptS-1547/AsterDriveMigration"
 license = "MIT"
 edition = "2024"
-rust-version = "1.94.0"
+rust-version = "1.95.0"
 
 [workspace.dependencies]
 aster_drive_model = { git = "https://github.com/AsterCommunity/AsterDrive", package = "aster_drive_model" }

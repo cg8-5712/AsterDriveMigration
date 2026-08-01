@@ -17,6 +17,7 @@ mod record;
 
 pub use converter::CloudreveConverter;
 pub use converter::storage_policy_skip_reason;
+pub use converter::storage_region_setting;
 pub use local_path::normalize_local_storage_path;
 pub use record::{
     CloudreveBlobRecord, CloudreveDirectLinkRecord, CloudreveFileRecord, CloudreveFolderRecord,

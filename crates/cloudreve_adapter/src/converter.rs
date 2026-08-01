@@ -47,7 +47,7 @@ pub fn storage_policy_skip_reason(
 
     match policy.r#type.as_str() {
         "local" => None,
-        "s3" | "ks3" => static_object_storage_skip_reason(policy),
+        "s3" | "ks3" => s3_policy_skip_reason(policy),
         "cos" => cos_policy_skip_reason(policy),
         "onedrive" => one_drive_options(policy).err().map(|message| SkipReason {
             code: "unsupported_storage_configuration",
@@ -66,6 +66,43 @@ pub fn storage_policy_skip_reason(
             message: unsupported.to_string(),
         }),
     }
+}
+
+pub fn storage_region_setting(settings: &Value) -> std::result::Result<Option<String>, String> {
+    for key in ["region", "s3_region"] {
+        let value = match settings.get(key) {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(value)) => value.trim(),
+            Some(_) => return Err(format!("settings.{key} must be a string")),
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if value.len() > 128
+            || !value.is_ascii()
+            || value
+                .bytes()
+                .any(|byte| !(b'!'..=b'~').contains(&byte) || byte == b'/')
+        {
+            return Err(format!(
+                "settings.{key} must be 1-128 printable ASCII characters without whitespace or '/'"
+            ));
+        }
+        return Ok(Some(value.to_string()));
+    }
+    Ok(None)
+}
+
+fn s3_policy_skip_reason(policy: &cloudreve_schema::storage_policies::Model) -> Option<SkipReason> {
+    if let Some(reason) = static_object_storage_skip_reason(policy) {
+        return Some(reason);
+    }
+    storage_region_setting(&settings(&policy.settings))
+        .err()
+        .map(|message| SkipReason {
+            code: "unsupported_storage_configuration",
+            message: format!("{} ({message})", policy.r#type),
+        })
 }
 
 fn one_drive_options(

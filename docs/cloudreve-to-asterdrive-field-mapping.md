@@ -130,7 +130,7 @@ Cloudreve 一条 `users` 记录需要拆成 AD 的 `users` 和 `user_profiles`�
 | Cloudreve `type` | AD `driver_type` | 状态 | 说明 |
 |---|---|---|---|
 | `local` | `local` | 条件迁移 | 相对 source 拒绝 `..` 后保留；绝对 source 必须位于配置 root 内并转换为相对 `storage_path` |
-| `s3` | `s3` | 条件迁移 | endpoint、bucket、key 和 path-style 可复用；region 契约等待 AD #452 与 ADM #3 |
+| `s3` | `s3` | 条件迁移 | endpoint、bucket、key、path-style 和显式 region 可复用 |
 | `oss` | 无 | 不兼容 | Cloudreve 使用阿里 OSS 原生 SDK、endpoint/CNAME 语义和签名；等待 AD #450 |
 | `ks3` | `s3` | 条件迁移 | 接口接近 S3，但必须保留 region 并完成目标运行时验证 |
 | `obs` | 无 | 不兼容 | Cloudreve 明确使用华为 OBS `SignatureObs`；等待 AD #451 |
@@ -157,7 +157,7 @@ Cloudreve 一条 `users` 记录需要拆成 AD 的 `users` 和 `user_profiles`�
 | `settings.file_type` | `allowed_types` | 转换 | 保存为 JSON 数组；还需处理 deny-list 语义 |
 | `settings.chunk_size` | `chunk_size` | 转换 | 保留正数字节数；OneDrive 的 `0` 按 Cloudreve 运行时缺省值转换为 50 MiB，其他驱动保留 `0` 的单次上传语义 |
 | `settings.s3_path_style` | `options.s3_path_style` | 转换 | 保留布尔值 |
-| `settings.region` | `options.s3_region` | 待实现 | AD 当前运行时固定使用 `auto`；由 AD #452 与 ADM #3 跟踪 |
+| `settings.region` / `settings.s3_region` | `options.s3_region` | 转换 | S3/KS3 保留修剪后的显式 region；缺省时不写字段，由 AD 使用 `auto`；非法 region 会跳过策略并报告 |
 | `settings.relay` | `options.object_storage_upload_strategy` | 转换 | `true` -> `relay_stream`；`false` 或缺省 -> `presigned` |
 | `settings.internal_proxy` | `options.object_storage_download_strategy` | 转换 | `true` -> `relay_stream`；`false` 或缺省 -> `presigned`；`custom_proxy/proxy_server` 的自定义代理域名不在此字段中表达 |
 | OneDrive `settings.relay` | `options.provider_resumable_upload_strategy` | 转换 | `true` -> `server_relay`；`false` 或缺省 -> `frontend_direct` |

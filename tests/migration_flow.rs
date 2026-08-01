@@ -374,6 +374,80 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn migrates_s3_signing_region_into_asterdrive_policy_options() -> Result<()> {
+    let suffix = uuid::Uuid::new_v4();
+    let source_path = std::env::temp_dir().join(format!("cloudreve-s3-region-{suffix}.db"));
+    let target_path = std::env::temp_dir().join(format!("asterdrive-s3-region-{suffix}.db"));
+    let source_url = sqlite_url(&source_path);
+    let target_url = sqlite_url(&target_path);
+
+    let source = Database::connect(&source_url).await?;
+    create_source_schema(&source).await?;
+    seed_source(&source).await?;
+    let source_policy = cloudreve_schema::storage_policies::Entity::find()
+        .one(&source)
+        .await?
+        .expect("seeded storage policy");
+    let mut source_policy = source_policy.into_active_model();
+    source_policy.r#type = Set("s3".to_string());
+    source_policy.server = Set(Some("https://s3.example.test".to_string()));
+    source_policy.bucket_name = Set(Some("bucket".to_string()));
+    source_policy.access_key = Set(Some("access".to_string()));
+    source_policy.secret_key = Set(Some("secret".to_string()));
+    source_policy.settings = Set(Some(serde_json::json!({
+        "region": "  ap-southeast-1  ",
+        "s3_path_style": false,
+        "relay": false,
+        "internal_proxy": true
+    })));
+    source_policy.update(&source).await?;
+    source.close().await?;
+
+    let target = Database::connect(&target_url).await?;
+    create_target_schema(&target).await?;
+    target.close().await?;
+
+    let report = migrate(MigrationOptions {
+        source_url: source_url.clone(),
+        target_url: target_url.clone(),
+        default_password: "temporary-password".to_string(),
+        local_base_path: "unused-local-root".to_string(),
+        local_policy_roots: std::collections::BTreeMap::new(),
+        verify_local_storage: false,
+        verify_remote_storage: false,
+        direct_link_secret: Some("test-direct-link-secret".to_string()),
+        include_deleted: false,
+        allow_non_empty_target: false,
+        skip_unsupported_policies: false,
+        dry_run: false,
+        run_id: None,
+        resume: false,
+        blob_batch_size: 500,
+        file_batch_size: 500,
+    })
+    .await?;
+    assert_eq!(report.migrated_policies, 1);
+    assert_eq!(report.migrated_blobs, 1);
+
+    let target = Database::connect(&target_url).await?;
+    let policy = aster_drive_schema::entities::storage_policy::Entity::find()
+        .one(&target)
+        .await?
+        .expect("migrated S3 policy");
+    assert_eq!(policy.driver_type, DriverType::S3);
+    let options: serde_json::Value = serde_json::from_str(policy.options.as_ref())?;
+    assert_eq!(options["s3_region"], "ap-southeast-1");
+    assert_eq!(options["s3_path_style"], false);
+    assert_eq!(options["object_storage_upload_strategy"], "presigned");
+    assert_eq!(options["object_storage_download_strategy"], "relay_stream");
+    target.close().await?;
+
+    let _ = std::fs::remove_file(source_path);
+    let _ = std::fs::remove_file(target_path);
+    Ok(())
+}
+
 async fn assert_unsupported_policy_is_rejected_or_skipped(
     policy_type: &str,
     endpoint: &str,

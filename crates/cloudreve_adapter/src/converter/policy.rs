@@ -72,6 +72,13 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
             .get("s3_path_style")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let s3_region = if driver == MigrationStorageDriver::S3 {
+            storage_region_setting(&policy_settings).map_err(|message| {
+                color_eyre::eyre::eyre!("Cloudreve policy {}: {message}", policy.id)
+            })?
+        } else {
+            None
+        };
         let (object_storage_upload_strategy, object_storage_download_strategy) = match driver {
             MigrationStorageDriver::Local | MigrationStorageDriver::OneDrive => (None, None),
             MigrationStorageDriver::S3 | MigrationStorageDriver::TencentCos => (
@@ -136,6 +143,7 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
             max_file_size: policy.max_size.unwrap_or(0),
             allowed_types,
             s3_path_style: path_style,
+            s3_region,
             object_storage_upload_strategy,
             object_storage_download_strategy,
             onedrive,

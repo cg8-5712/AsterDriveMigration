@@ -51,6 +51,7 @@ async fn write_prerequisites(transaction: &DatabaseTransaction) -> Result<(i64, 
                 max_file_size: 0,
                 allowed_types: Vec::new(),
                 s3_path_style: true,
+                s3_region: None,
                 object_storage_upload_strategy: None,
                 object_storage_download_strategy: None,
                 onedrive: None,
@@ -214,6 +215,7 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
                 max_file_size: 123,
                 allowed_types: vec!["jpg".to_string(), "png".to_string()],
                 s3_path_style: false,
+                s3_region: Some("ap-southeast-1".to_string()),
                 object_storage_upload_strategy: Some(
                     MigrationObjectStorageUploadStrategy::Presigned,
                 ),
@@ -243,6 +245,7 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
                 max_file_size: 0,
                 allowed_types: Vec::new(),
                 s3_path_style: false,
+                s3_region: None,
                 object_storage_upload_strategy: Some(
                     MigrationObjectStorageUploadStrategy::RelayStream,
                 ),
@@ -272,6 +275,7 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
                 max_file_size: 0,
                 allowed_types: Vec::new(),
                 s3_path_style: false,
+                s3_region: None,
                 object_storage_upload_strategy: None,
                 object_storage_download_strategy: None,
                 onedrive: Some(MigrationOneDriveOptions {
@@ -310,6 +314,7 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
     assert_eq!(policy.allowed_types.as_ref(), r#"["jpg","png"]"#);
     let options: Value = serde_json::from_str(policy.options.as_ref())?;
     assert_eq!(options["s3_path_style"], false);
+    assert_eq!(options["s3_region"], "ap-southeast-1");
     assert_eq!(options["object_storage_upload_strategy"], "presigned");
     assert_eq!(options["object_storage_download_strategy"], "relay_stream");
     assert_eq!(options["custom_flag"], true);
@@ -329,6 +334,7 @@ async fn writes_policy_driver_options_allowed_types_and_extensions() -> Result<(
         "relay_stream"
     );
     assert_eq!(cos_options["object_storage_download_strategy"], "presigned");
+    assert!(cos_options.get("s3_region").is_none());
 
     let onedrive_policy =
         aster_drive_schema::entities::storage_policy::Entity::find_by_id(onedrive_target_id)
@@ -386,6 +392,7 @@ async fn writes_policy_groups_with_and_without_policy_items() -> Result<()> {
                 max_file_size: 0,
                 allowed_types: Vec::new(),
                 s3_path_style: true,
+                s3_region: None,
                 object_storage_upload_strategy: None,
                 object_storage_download_strategy: None,
                 onedrive: None,

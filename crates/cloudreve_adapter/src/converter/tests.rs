@@ -176,6 +176,7 @@ fn converts_every_supported_storage_driver() -> Result<()> {
         assert_eq!(converted.chunk_size, 128);
         assert_eq!(converted.allowed_types, ["jpg", "png"]);
         assert!(!converted.s3_path_style);
+        assert_eq!(converted.s3_region, None);
         if matches!(source, "local" | "onedrive") {
             assert_eq!(converted.object_storage_upload_strategy, None);
             assert_eq!(converted.object_storage_download_strategy, None);
@@ -195,6 +196,84 @@ fn converts_every_supported_storage_driver() -> Result<()> {
             converted.base_path,
             if source == "local" { "/source" } else { "" }
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn preserves_s3_and_ks3_regions_with_cloudreve_alias_precedence() -> Result<()> {
+    for (policy_type, policy_settings, expected_region) in [
+        (
+            "s3",
+            json!({"region": "  ap-southeast-1  ", "s3_region": "ignored"}),
+            "ap-southeast-1",
+        ),
+        (
+            "ks3",
+            json!({"region": "", "s3_region": "cn-beijing"}),
+            "cn-beijing",
+        ),
+    ] {
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: policy(policy_type, policy_settings),
+                local_root: None,
+            },
+            &ConversionContext,
+        )?);
+        assert_eq!(converted.driver, MigrationStorageDriver::S3);
+        assert_eq!(converted.s3_region.as_deref(), Some(expected_region));
+    }
+    Ok(())
+}
+
+#[test]
+fn validates_s3_region_full_and_boundary_values() -> Result<()> {
+    for (settings, expected) in [
+        (json!({}), None),
+        (json!({"region": null}), None),
+        (json!({"region": "   "}), None),
+        (json!({"region": " auto "}), Some("auto".to_string())),
+        (
+            json!({"region": "us-east-1"}),
+            Some("us-east-1".to_string()),
+        ),
+        (json!({"region": "r".repeat(128)}), Some("r".repeat(128))),
+    ] {
+        let region = storage_region_setting(&settings)
+            .map_err(|message| color_eyre::eyre::eyre!(message))?;
+        assert_eq!(region, expected);
+    }
+
+    for settings in [
+        json!({"region": 1}),
+        json!({"region": "us east 1"}),
+        json!({"region": "us-east-1/invalid"}),
+        json!({"region": "华东"}),
+        json!({"region": "r".repeat(129)}),
+        json!({"region": "us-\neast-1"}),
+    ] {
+        assert!(storage_region_setting(&settings).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn skips_s3_and_ks3_regions_rejected_by_asterdrive() -> Result<()> {
+    for policy_type in ["s3", "ks3"] {
+        let conversion = CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: policy(policy_type, json!({"region": "us-east-1/invalid"})),
+                local_root: None,
+            },
+            &ConversionContext,
+        )?;
+        let Conversion::Skipped(reason) = conversion else {
+            panic!("expected invalid region to skip policy");
+        };
+        assert_eq!(reason.code, "unsupported_storage_configuration");
+        assert!(reason.message.contains("settings.region"));
+        assert!(reason.message.contains(policy_type));
     }
     Ok(())
 }

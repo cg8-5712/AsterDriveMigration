@@ -82,6 +82,7 @@ pub struct MigrationStoragePolicy {
     pub max_file_size: i64,
     pub allowed_types: Vec<String>,
     pub s3_path_style: bool,
+    pub s3_region: Option<String>,
     pub object_storage_upload_strategy: Option<MigrationObjectStorageUploadStrategy>,
     pub object_storage_download_strategy: Option<MigrationObjectStorageDownloadStrategy>,
     pub onedrive: Option<MigrationOneDriveOptions>,

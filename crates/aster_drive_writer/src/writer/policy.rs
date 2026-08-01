@@ -14,6 +14,11 @@ impl AsterDriveWriter<'_> {
         ) {
             options.insert("s3_path_style".to_string(), json!(policy.s3_path_style));
         }
+        if policy.driver == MigrationStorageDriver::S3
+            && let Some(region) = policy.s3_region
+        {
+            options.insert("s3_region".to_string(), json!(region));
+        }
         if let Some(strategy) = policy.object_storage_upload_strategy {
             options.insert(
                 "object_storage_upload_strategy".to_string(),

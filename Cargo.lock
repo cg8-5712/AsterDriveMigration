@@ -334,7 +334,7 @@ dependencies = [
 [[package]]
 name = "aster_drive_migration"
 version = "0.4.0"
-source = "git+https://github.com/AsterCommunity/AsterDrive#c9efba0361962cc4d504f66763a1fda4fcbbdd78"
+source = "git+https://github.com/AsterCommunity/AsterDrive#ed7607ffd40eb460c11e983b8be754bf71aee60b"
 dependencies = [
  "aster_forge_db",
  "aster_forge_db_migration",
@@ -356,7 +356,7 @@ dependencies = [
 [[package]]
 name = "aster_drive_model"
 version = "0.4.0"
-source = "git+https://github.com/AsterCommunity/AsterDrive#c9efba0361962cc4d504f66763a1fda4fcbbdd78"
+source = "git+https://github.com/AsterCommunity/AsterDrive#ed7607ffd40eb460c11e983b8be754bf71aee60b"
 dependencies = [
  "aster_forge_api",
  "aster_forge_external_auth",
@@ -392,7 +392,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_api"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "chrono",
  "serde",
@@ -402,7 +402,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_config"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "aster_forge_events",
  "aster_forge_utils",
@@ -420,7 +420,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_crypto"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "argon2",
  "hmac 0.13.0",
@@ -432,7 +432,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_db"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "aster_forge_api",
  "aster_forge_config",
@@ -453,7 +453,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_db_migration"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "sea-orm-migration",
  "tracing",
@@ -462,7 +462,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_events"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "aster_forge_utils",
  "async-trait",
@@ -476,7 +476,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_external_auth"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "aster_forge_crypto",
  "aster_forge_utils",
@@ -498,7 +498,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_file_classification"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "sea-orm",
  "serde",
@@ -508,7 +508,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_mail"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "aster_forge_utils",
  "aster_forge_validation",
@@ -523,7 +523,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_metrics"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "thiserror 2.0.19",
  "tokio",
@@ -534,7 +534,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_runtime"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "aster_forge_utils",
  "async-trait",
@@ -550,7 +550,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_tasks"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "aster_forge_runtime",
  "aster_forge_utils",
@@ -569,7 +569,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_utils"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "headers",
  "http 1.5.0",
@@ -588,7 +588,7 @@ dependencies = [
 [[package]]
 name = "aster_forge_validation"
 version = "0.1.0"
-source = "git+https://github.com/AsterCommunity/AsterForge#84045b2c76e995f7d01d035a2715f1c25c0ace57"
+source = "git+https://github.com/AsterCommunity/AsterForge#54fc518973f8452dcddb4df06a368356168e5552"
 dependencies = [
  "thiserror 2.0.19",
  "unicode-normalization",
@@ -2459,7 +2459,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3457,7 +3457,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.43",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3496,7 +3496,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

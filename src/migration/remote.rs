@@ -94,18 +94,10 @@ fn storage_region(
     endpoint: &str,
     settings: &Value,
 ) -> Result<String> {
-    if let Some(region) = settings
-        .get("region")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            settings
-                .get("s3_region")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
+    if let Some(region) = cloudreve_adapter::storage_region_setting(settings)
+        .map_err(|message| color_eyre::eyre::eyre!(message))?
     {
-        return Ok(region.trim().to_string());
+        return Ok(region);
     }
     if policy.r#type == "cos" {
         return cos_region_from_endpoint(endpoint).ok_or_else(|| {
