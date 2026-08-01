@@ -244,6 +244,22 @@ pub(super) async fn migrate_blob_batch(
     let conversion_context = ConversionContext;
     let writer = AsterDriveWriter::new(transaction);
     for entity in entities {
+        if entity.upload_session_id.is_some() {
+            report.record_skip(
+                "blob",
+                Some(entity.id),
+                "incomplete Cloudreve upload has no committed file version",
+            );
+            continue;
+        }
+        let Some(reference_count) = reference_counts.get(&entity.id).copied() else {
+            report.record_skip(
+                "blob",
+                Some(entity.id),
+                "Cloudreve entity is not referenced by a migratable file",
+            );
+            continue;
+        };
         let local_root = context
             .policies
             .contains_key(&entity.storage_policy_entities)
@@ -260,7 +276,7 @@ pub(super) async fn migrate_blob_batch(
         let conversion = converter.convert(
             CloudreveBlobRecord {
                 entity: entity.clone(),
-                reference_count: reference_counts.get(&entity.id).copied().unwrap_or(0),
+                reference_count,
                 local_root,
             },
             &conversion_context,

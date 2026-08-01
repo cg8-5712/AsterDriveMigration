@@ -37,15 +37,15 @@ impl SourceConverter<CloudreveStoragePolicyRecord> for CloudreveConverter {
             | MigrationStorageDriver::TencentCos
             | MigrationStorageDriver::OneDrive => String::new(),
         };
-        let allowed_types = policy_settings
-            .get("file_type")
-            .cloned()
-            .unwrap_or_else(|| json!([]));
-        let Some(allowed_types) = allowed_types.as_array() else {
-            bail!(
-                "Cloudreve policy {} file_type setting must be an array",
-                policy.id
-            );
+        let allowed_types = match policy_settings.get("file_type") {
+            None | Some(Value::Null) => &[][..],
+            Some(Value::Array(values)) => values.as_slice(),
+            Some(_) => {
+                bail!(
+                    "Cloudreve policy {} file_type setting must be an array",
+                    policy.id
+                );
+            }
         };
         let allowed_types = allowed_types
             .iter()

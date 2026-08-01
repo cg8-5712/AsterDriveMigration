@@ -201,6 +201,21 @@ fn converts_every_supported_storage_driver() -> Result<()> {
 }
 
 #[test]
+fn treats_missing_and_null_file_type_as_cloudreve_empty_default() -> Result<()> {
+    for policy_settings in [json!({}), json!({"file_type": null})] {
+        let converted = ready(CloudreveConverter.convert(
+            CloudreveStoragePolicyRecord {
+                policy: policy("local", policy_settings),
+                local_root: Some("/source".to_string()),
+            },
+            &ConversionContext,
+        )?);
+        assert!(converted.allowed_types.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn preserves_s3_and_ks3_regions_with_cloudreve_alias_precedence() -> Result<()> {
     for (policy_type, policy_settings, expected_region) in [
         (

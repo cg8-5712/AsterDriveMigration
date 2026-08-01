@@ -66,6 +66,65 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
     let source = Database::connect(&source_url).await?;
     create_source_schema(&source).await?;
     seed_source(&source).await?;
+    let now = chrono::Utc::now().fixed_offset();
+    let policy = cloudreve_schema::storage_policies::Entity::find()
+        .one(&source)
+        .await?
+        .expect("seeded storage policy");
+    let user = cloudreve_schema::users::Entity::find()
+        .one(&source)
+        .await?
+        .expect("seeded user");
+    let placeholder_entity = cloudreve_schema::entities::ActiveModel {
+        created_at: Set(now),
+        updated_at: Set(now),
+        deleted_at: Set(None),
+        r#type: Set(0),
+        source: Set("uploads/incomplete.bin".to_string()),
+        size: Set(256),
+        reference_count: Set(1),
+        upload_session_id: Set(Some(uuid::Uuid::new_v4())),
+        recycle_options: Set(None),
+        storage_policy_entities: Set(policy.id),
+        created_by: Set(Some(user.id)),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await?;
+    let placeholder_file = cloudreve_schema::files::ActiveModel {
+        created_at: Set(now),
+        updated_at: Set(now),
+        r#type: Set(0),
+        name: Set("incomplete.bin".to_string()),
+        size: Set(0),
+        primary_entity: Set(None),
+        is_symbolic: Set(false),
+        props: Set(None),
+        file_children: Set(None),
+        storage_policy_files: Set(Some(policy.id)),
+        owner_id: Set(user.id),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await?;
+    let completed_file = cloudreve_schema::files::Entity::find()
+        .filter(cloudreve_schema::files::Column::Type.eq(0))
+        .filter(cloudreve_schema::files::Column::PrimaryEntity.is_not_null())
+        .one(&source)
+        .await?
+        .expect("seeded completed file");
+    cloudreve_schema::file_entities::ActiveModel {
+        file_id: Set(placeholder_file.id),
+        entity_id: Set(placeholder_entity.id),
+    }
+    .insert(&source)
+    .await?;
+    cloudreve_schema::file_entities::ActiveModel {
+        file_id: Set(completed_file.id),
+        entity_id: Set(placeholder_entity.id),
+    }
+    .insert(&source)
+    .await?;
     source.close().await?;
 
     let target = Database::connect(&target_url).await?;
@@ -101,6 +160,13 @@ async fn migrates_minimal_cloudreve_database() -> Result<()> {
     assert_eq!(report.migrated_tags, 1);
     assert_eq!(report.migrated_tag_assignments, 1);
     assert_eq!(report.migrated_direct_links, 1);
+    assert_eq!(report.skipped_by_type.get("blob"), Some(&1));
+    assert_eq!(report.skipped_by_type.get("file"), Some(&1));
+    assert!(report.skipped_objects.iter().any(|skipped| {
+        skipped.object_type == "blob"
+            && skipped.source_id == Some(placeholder_entity.id)
+            && skipped.reason.contains("incomplete Cloudreve upload")
+    }));
     assert_eq!(report.source_tasks, 2);
     assert!(report.validation.performed);
     assert!(report.validation.passed);
@@ -1186,6 +1252,7 @@ async fn resumes_blobs_from_last_committed_batch() -> Result<()> {
     create_source_schema(&source).await?;
     seed_source(&source).await?;
     let extra_blob_ids = seed_extra_blob_entities(&source, 3).await?;
+    let _extra_file_ids = seed_extra_files(&source, &extra_blob_ids).await?;
     source.close().await?;
 
     let failing_blob_id = extra_blob_ids[1];

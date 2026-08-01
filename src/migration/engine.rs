@@ -584,9 +584,20 @@ pub(super) async fn migrate_blobs_batched(
             return Ok(());
         }
 
+        let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
+        let association_info = load_blob_association_info(inputs.source, &entity_ids).await?;
+        let referenced_entities = entities
+            .iter()
+            .filter(|entity| {
+                entity.upload_session_id.is_none()
+                    && association_info.reference_counts.contains_key(&entity.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
         if inputs.options.verify_local_storage {
             verify_local_blob_batch(
-                &entities,
+                &referenced_entities,
                 inputs.source_data,
                 inputs.options,
                 inputs.context,
@@ -594,7 +605,7 @@ pub(super) async fn migrate_blobs_batched(
         }
         if inputs.options.verify_remote_storage {
             verify_remote_blob_batch(
-                &entities,
+                &referenced_entities,
                 inputs.source_data,
                 inputs.options,
                 inputs.context,
@@ -602,8 +613,6 @@ pub(super) async fn migrate_blobs_batched(
             .await?;
         }
 
-        let entity_ids = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
-        let association_info = load_blob_association_info(inputs.source, &entity_ids).await?;
         let Some(last_entity_id) = entities.last().map(|entity| entity.id) else {
             bail!("blob batch query returned no rows after the empty-batch check");
         };
@@ -848,6 +857,7 @@ pub(super) async fn load_blob_association_info(
                 .filter(cloudreve_schema::files::Column::Id.is_in(file_ids.iter().copied()))
                 .filter(cloudreve_schema::files::Column::Type.eq(0))
                 .filter(cloudreve_schema::files::Column::IsSymbolic.eq(false))
+                .filter(cloudreve_schema::files::Column::PrimaryEntity.is_not_null())
                 .all(source)
                 .await?
                 .into_iter()
@@ -1094,6 +1104,7 @@ mod tests {
             (20, Some(10), false),
             (21, Some(10), false),
             (22, Some(10), true),
+            (23, None, false),
         ] {
             cloudreve_schema::files::ActiveModel {
                 id: Set(id),
@@ -1112,7 +1123,7 @@ mod tests {
             .insert(&database)
             .await?;
         }
-        for (file_id, entity_id) in [(20, 10), (20, 11)] {
+        for (file_id, entity_id) in [(20, 10), (20, 11), (23, 12)] {
             cloudreve_schema::file_entities::ActiveModel {
                 file_id: Set(file_id),
                 entity_id: Set(entity_id),

@@ -68,11 +68,17 @@ pub(super) async fn verify_object(
 
 fn client(policy: &cloudreve_schema::storage_policies::Model) -> Result<aws_sdk_s3::Client> {
     let endpoint = required(&policy.server, "endpoint", policy.id)?;
+    let bucket = required(&policy.bucket_name, "bucket", policy.id)?;
     let access_key = required(&policy.access_key, "access key", policy.id)?;
     let secret_key = required(&policy.secret_key, "secret key", policy.id)?;
     let settings = policy.settings.as_ref().cloned().unwrap_or(Value::Null);
     let region = storage_region(policy, endpoint, &settings)?;
     let path_style = force_path_style(policy, &settings);
+    let endpoint = if policy.r#type == "cos" {
+        cos_s3_endpoint(endpoint, bucket)?
+    } else {
+        endpoint.to_string()
+    };
     let config = aws_sdk_s3::Config::builder()
         .behavior_version_latest()
         .region(aws_sdk_s3::config::Region::new(region.to_string()))
@@ -87,6 +93,26 @@ fn client(policy: &cloudreve_schema::storage_policies::Model) -> Result<aws_sdk_
         ))
         .build();
     Ok(aws_sdk_s3::Client::from_conf(config))
+}
+
+fn cos_s3_endpoint(endpoint: &str, bucket: &str) -> Result<String> {
+    let mut endpoint = url::Url::parse(endpoint).wrap_err("parse Cloudreve COS endpoint")?;
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("Cloudreve COS endpoint has no host"))?
+        .to_string();
+    let bucket_prefix = format!("{}.", bucket.trim());
+    if host
+        .get(..bucket_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&bucket_prefix))
+    {
+        endpoint
+            .set_host(Some(&host[bucket_prefix.len()..]))
+            .map_err(|_| color_eyre::eyre::eyre!("build Cloudreve COS S3 endpoint"))?;
+    }
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    Ok(String::from(endpoint).trim_end_matches('/').to_string())
 }
 
 fn storage_region(
@@ -260,6 +286,26 @@ mod tests {
         ] {
             assert_eq!(cos_region_from_endpoint(endpoint).as_deref(), expected);
         }
+    }
+
+    #[test]
+    fn normalizes_bucket_qualified_cos_endpoint_for_aws_sdk() -> Result<()> {
+        assert_eq!(
+            cos_s3_endpoint("https://bucket.cos.ap-guangzhou.myqcloud.com", "bucket")?,
+            "https://cos.ap-guangzhou.myqcloud.com"
+        );
+        assert_eq!(
+            cos_s3_endpoint(
+                "https://Bucket.cos.ap-guangzhou.myqcloud.com/prefix/?ignored=yes#fragment",
+                "bucket"
+            )?,
+            "https://cos.ap-guangzhou.myqcloud.com/prefix"
+        );
+        assert_eq!(
+            cos_s3_endpoint("https://cos.ap-guangzhou.myqcloud.com", "bucket")?,
+            "https://cos.ap-guangzhou.myqcloud.com"
+        );
+        Ok(())
     }
 
     #[test]
